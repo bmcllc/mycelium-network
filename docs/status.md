@@ -122,6 +122,7 @@ Testemunha: `docs/testes-realidade.md` (cenário 1A).
 3. **Validação multi-nó do Plasma reativo** — ciclo completo testemunhado entre 2 nós reais (gossip TCP local): `IonOffer desired_replicas=13` → `IonAccept` → `IonMigrate` automático (2 layers) → `ChamberProcess frutificada` no nó B → réplica servindo tráfego; ociosidade → recombine da origem com a réplica remota cobrindo (**o ion não morre**) ✅ · Reproduzível: `bash scripts/scaling-demo.sh`
 4. **Rate-limit configurável** — `MYCELIUM_RATE_MAX` / `MYCELIUM_RATE_WINDOW_SECS` na fronteira HTTP (default 120/min por IP); necessário para carga sintética local ✅
 5. **Liquidação com voucher assinado** — economia fecha o loop do scaling: origem debita ATP e emite `Voucher` ed25519 ao peer que frutificou réplica; beneficiário credita só com assinatura válida + guarda anti-replay (`ContentId`). Testemunhado entre 2 nós: birth `atp=5` + tip recorrente `atp=1` por janela com tráfego (`issue_hosting_voucher(motivo)`); ledger final fecha sem dupla-contagem ✅
+6. **Growth Zones com overlay XOR** — `Envelope::Direct{to,inner}` (entrega lacrada via gossip: trânsito replica, só o destinatário processa) + `request_layer` direcionado aos 2 custodianos mais próximos por distância Kademlia (`xor_closest`); broadcast segue como rede de pesca ✅
 
 ### O que ainda NÃO foi testado
 | Item | Status | Por que |
