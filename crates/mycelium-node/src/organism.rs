@@ -834,11 +834,55 @@ impl Organism {
     /// Se a layer falta, pede à rede (gossip + DHT).
     fn request_layer(&mut self, id: &ContentId) {
         tracing::info!(layer = %id.short(), "pedindo layer aos vizinhos");
+        // Overlay de zonas: custodianos mais próximos por XOR (Kademlia)
+        // recebem LayerNeed direcionado; broadcast segue como rede de pesca.
+        for custodian in self.xor_closest(&id.0) {
+            self.send_direct(
+                custodian,
+                Envelope::LayerNeed { id: *id },
+            );
+        }
         let env = Envelope::LayerNeed { id: *id };
         if let Ok(bytes) = env.encode() {
             let _ = self.hyphae.broadcast_lattice(bytes);
         }
         self.hyphae.dht_get(layer_dht_key(id));
+    }
+
+    /// Distância XOR entre duas chaves de 32 bytes (métrica Kademlia).
+    fn xor_key_distance(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for i in 0..32 {
+            out[i] = a[i] ^ b[i];
+        }
+        out
+    }
+
+    /// Custodianos de zonas ordenados por proximidade XOR à chave
+    /// (ContentId/NodeId) — os 2 primeiros recebem tráfego direcionado.
+    fn xor_closest(&self, key: &[u8; 32]) -> Vec<NodeId> {
+        let mut seen: Vec<NodeId> = self
+            .known_zones
+            .values()
+            .flatten()
+            .copied()
+            .collect();
+        seen.retain(|n| n != &self.gland.node_id());
+        seen.sort_by_key(|n| Self::xor_key_distance(&n.0, key));
+        seen.dedup();
+        seen.truncate(2);
+        seen
+    }
+
+    /// Envia um envelope direcionado via overlay de zonas (`Direct`).
+    fn send_direct(&mut self, to: NodeId, inner: Envelope) {
+        let env = Envelope::Direct {
+            to,
+            inner: Box::new(inner),
+        };
+        if let Ok(bytes) = env.encode() {
+            let _ = self.hyphae.broadcast_lattice(bytes);
+        }
     }
 
     fn serve_layer_if_present(&mut self, id: &ContentId) -> Result<(), OrganismError> {
@@ -1116,6 +1160,14 @@ impl Organism {
 
     fn handle_envelope(&mut self, env: Envelope) -> Result<(), OrganismError> {
         match env {
+            // Overlay de zonas: envelope lacrado — só o destinatário abre.
+            Envelope::Direct { to, inner } => {
+                if to != self.gland.node_id() {
+                    return Ok(()); // trânsito: replica no gossip, ignora conteúdo
+                }
+                tracing::debug!(from_overlay = true, "Direct aberto");
+                return self.handle_envelope(*inner);
+            }
             Envelope::SporePrint { plot } => {
                 let id = self.bank.deposit(plot)?;
                 let bytes = self.bank.spore_print(&id)?;
@@ -2748,4 +2800,34 @@ fn ghost_for_node(gland_seed: [u8; 32]) -> mycelium_ghostid::GhostId {
         .unwrap_or(gland_seed);
     mycelium_ghostid::GhostId::from_secret_bytes(seed, 60 * 60 * 24 * 365 * 100)
         .unwrap_or_else(|_| mycelium_ghostid::GhostId::spawn_quick(60 * 60 * 24 * 365).unwrap())
+}
+
+#[cfg(test)]
+mod xor_tests {
+    use super::*;
+
+    #[test]
+    fn xor_distance_is_symmetric_and_zero_for_self() {
+        let a = NodeId::derive(b"alpha");
+        let b = NodeId::derive(b"beta");
+        assert_eq!(
+            Organism::xor_key_distance(&a.0, &a.0),
+            [0u8; 32]
+        );
+        assert_eq!(
+            Organism::xor_key_distance(&a.0, &b.0),
+            Organism::xor_key_distance(&b.0, &a.0)
+        );
+    }
+
+    #[test]
+    fn xor_closest_orders_by_kademlia_distance() {
+        // Distância XOR: prefixo comum de bits decide o mais próximo.
+        let key = NodeId::derive(b"chave-alvo");
+        let near = NodeId::derive(b"chave-alfa"); // compartilha prefixo alto
+        let far = NodeId::derive(b"zzzzzzzz");
+        let d_near = Organism::xor_key_distance(&near.0, &key.0);
+        let d_far = Organism::xor_key_distance(&far.0, &key.0);
+        assert!(d_near < d_far, "prefixo comum deve vencer no XOR");
+    }
 }

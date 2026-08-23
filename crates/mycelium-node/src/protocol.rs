@@ -100,6 +100,12 @@ pub enum Envelope {
     /// Voucher de liquidação assinado pelo pagador (economia sem câmara
     /// de compensação: o beneficiário credita só com assinatura válida).
     VoucherRedeem { voucher: Voucher },
+    /// Overlay de zonas: entrega direcionada — só `to` processa `inner`.
+    /// Nós intermediários replicam no gossip mas ignoram o conteúdo.
+    Direct {
+        to: NodeId,
+        inner: Box<Envelope>,
+    },
 }
 
 /// Frame versionado no fio.
@@ -176,5 +182,24 @@ mod tests {
         assert!(Envelope::decode(&raw).is_err());
         frame.v = 1;
         assert!(Envelope::decode(&serde_json::to_vec(&frame).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn direct_envelope_roundtrip() {
+        let inner = Envelope::LayerNeed {
+            id: ContentId::of(b"layer-xor"),
+        };
+        let direct = Envelope::Direct {
+            to: NodeId::derive(b"destino"),
+            inner: Box::new(inner),
+        };
+        let back = Envelope::decode(&direct.encode().unwrap()).unwrap();
+        match back {
+            Envelope::Direct { to, inner } => {
+                assert_eq!(to, NodeId::derive(b"destino"));
+                assert!(matches!(*inner, Envelope::LayerNeed { .. }));
+            }
+            _ => panic!("tipo errado"),
+        }
     }
 }
