@@ -7,6 +7,7 @@ use giggs::Plot;
 use inertia::{Momentum, Vector};
 use isotope::Atom;
 use mycelium_core::{ContentId, NodeId, Nutrient};
+use mycelium_nutrients::Voucher;
 use plasma::Charge;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -96,6 +97,9 @@ pub enum Envelope {
     ValueTransfer {
         tx: mycelium_nutrients::SignedTransfer,
     },
+    /// Voucher de liquidação assinado pelo pagador (economia sem câmara
+    /// de compensação: o beneficiário credita só com assinatura válida).
+    VoucherRedeem { voucher: Voucher },
 }
 
 /// Frame versionado no fio.

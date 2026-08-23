@@ -73,6 +73,15 @@ echo "-- réplica servindo no B? --"
 curl -s "http://127.0.0.1:$PORT_B/webapp/" | head -c 120; echo
 echo "REPlica nasceu: $REPLICA_BORN"
 
+echo "== economia: voucher de hospedagem =="
+for i in $(seq 1 15); do
+  grep -q "voucher resgatado" target/scale-b.log && break
+  sleep 2
+done
+grep -hE "voucher de hospedagem emitido|voucher resgatado" target/scale-a.log target/scale-b.log | tail -2 || true
+echo "A: $("$BIN" --home "$HA" balance 2>&1 | grep -oE 'ATP=[0-9]+' | head -1)"
+echo "B: $("$BIN" --home "$HB" balance 2>&1 | grep -oE 'ATP=[0-9]+' | head -1)"
+
 if [[ "$SKIP_RECOMBINE" == "--skip-recombine" ]]; then
   kill "$DA" "$DB" 2>/dev/null; wait "$DA" "$DB" 2>/dev/null
   echo "== fim (--skip-recombine) =="

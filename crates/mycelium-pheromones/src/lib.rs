@@ -56,6 +56,11 @@ impl Gland {
         NodeId::derive(self.verifying_key().as_bytes())
     }
 
+    /// Assina bytes arbitrários (ex.: voucher de liquidação de nutrientes).
+    pub fn sign_bytes(&self, msg: &[u8]) -> Vec<u8> {
+        self.signing_key.sign(msg).to_bytes().to_vec()
+    }
+
     /// Secreta um pacote de feromônio assinado (membrana = folha por default).
     pub fn secrete(&self, trail: Trail, ttl: Duration) -> Result<Pheromone, PheromoneError> {
         self.secrete_membrane(trail, ttl, Membrane::Folha)

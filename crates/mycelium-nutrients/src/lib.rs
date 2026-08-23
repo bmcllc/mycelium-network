@@ -15,9 +15,10 @@
 //! - **Equity / Royalty** — cotas de ativos físicos + royalties em transferência (Fase 3: RWA)
 //! - **Revenue** — receita de empresas/cooperativas → pool de liquidez (Fase 4)
 
-use mycelium_core::{NodeId, Nutrient, Resources};
+use mycelium_core::{ContentId, NodeId, Nutrient, Resources};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use ed25519_dalek::{Signer, Verifier};
 
 /// Erros da economia bioquímica.
 #[derive(Debug, thiserror::Error)]
@@ -30,6 +31,12 @@ pub enum NutrientError {
     },
     #[error("transferência: {0}")]
     Transfer(String),
+    #[error("voucher: payer_key não deriva o payer declarado")]
+    KeyMismatch,
+    #[error("voucher: assinatura ed25519 inválida")]
+    BadSignature(#[from] ed25519_dalek::SignatureError),
+    #[error("voucher já resgatado (replay)")]
+    Replayed,
 }
 
 /// Motivo económico de uma transferência (mapeia as fases do lastro).
@@ -127,7 +134,6 @@ impl SignedTransfer {
             self.sig.clone()
         }
     }
-}
 
 /// Um lançamento no ledger.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -149,6 +155,81 @@ pub struct Ledger {
     seen_nonces: HashMap<[u8; 32], u64>,
     /// Transferências recentes (para a UI).
     pub transfers: Vec<SignedTransfer>,
+    /// IDs dos vouchers já resgatados (guarda anti-replay).
+    #[serde(default)]
+    redeemed: std::collections::HashSet<ContentId>,
+}
+
+/// Payload canônico do voucher — exatamente o que é assinado.
+#[derive(Serialize)]
+struct VoucherPayload<'a> {
+    payer: &'a NodeId,
+    payee: &'a NodeId,
+    nutrient: Nutrient,
+    amount: u64,
+    memo: &'a str,
+    clock: u64,
+}
+
+/// Voucher de liquidação: o **pagador** assina a transferência de nutrientes
+/// ao **beneficiário**, que credita o saldo só com assinatura válida.
+/// Consenso leve sem Raft — não-repudiabilidade por ed25519 + guarda
+/// anti-replay no ledger do beneficiário.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Voucher {
+    pub payer: NodeId,
+    pub payee: NodeId,
+    pub nutrient: Nutrient,
+    pub amount: u64,
+    pub memo: String,
+    /// Relógio lógico (unix secs na emissão).
+    pub clock: u64,
+    /// Chave pública ed25519 do pagador (NodeId::derive(payer_key) == payer).
+    pub payer_key: [u8; 32],
+    /// Assinatura ed25519 sobre o payload canônico.
+    pub signature: Vec<u8>,
+}
+
+impl Voucher {
+    /// Payload canônico — exatamente o que deve ser assinado.
+    pub fn payload_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(&VoucherPayload {
+            payer: &self.payer,
+            payee: &self.payee,
+            nutrient: self.nutrient,
+            amount: self.amount,
+            memo: &self.memo,
+            clock: self.clock,
+        })
+        .unwrap_or_default()
+    }
+
+    /// Identidade content-addressed do voucher (payload + assinatura).
+    pub fn id(&self) -> ContentId {
+        let mut bytes = self.payload_bytes();
+        bytes.extend_from_slice(&self.signature);
+        ContentId::of(&bytes)
+    }
+
+    /// Assina com a chave do pagador (sobrescreve payer pela chave usada).
+    pub fn sign(mut self, signing: &ed25519_dalek::SigningKey) -> Self {
+        let vk = signing.verifying_key();
+        self.payer_key = vk.to_bytes();
+        self.payer = mycelium_core::NodeId::derive(vk.as_bytes());
+        self.signature = signing.sign(&self.payload_bytes()).to_bytes().to_vec();
+        self
+    }
+
+    /// Verifica ligação chave↔payer e a assinatura ed25519.
+    pub fn verify(&self) -> Result<(), NutrientError> {
+        if mycelium_core::NodeId::derive(&self.payer_key) != self.payer {
+            return Err(NutrientError::KeyMismatch);
+        }
+        let key = ed25519_dalek::VerifyingKey::from_bytes(&self.payer_key)?;
+        let sig = ed25519_dalek::Signature::from_slice(&self.signature)?;
+        key.verify(&self.payload_bytes(), &sig)?;
+        Ok(())
+    }
 }
 
 impl Ledger {
@@ -362,6 +443,26 @@ impl Ledger {
     pub fn recent_transfers(&self) -> &[SignedTransfer] {
         &self.transfers
     }
+    /// Resgata um voucher assinado: verifica assinatura, credita o
+    /// beneficiário e registra o id anti-replay.
+    pub fn redeem_voucher(&mut self, voucher: &Voucher) -> Result<(), NutrientError> {
+        voucher.verify()?;
+        let id = voucher.id();
+        if self.redeemed.contains(&id) {
+            return Err(NutrientError::Replayed);
+        }
+        self.feed(
+            voucher.nutrient,
+            voucher.amount,
+            format!(
+                "voucher de {}… : {memo}",
+                voucher.payer.short(),
+                memo = voucher.memo
+            ),
+        );
+        self.redeemed.insert(id);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -482,5 +583,79 @@ mod tests {
         // 100 crédito + 10 de royalty retido (Resilience)
         assert_eq!(b.balance(Nutrient::Atp), 100);
         assert_eq!(b.balance(Nutrient::Resilience), 10);
+    }
+
+    fn test_keys(seed: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn hosting_voucher(signer: &ed25519_dalek::SigningKey, payee: NodeId) -> Voucher {
+        Voucher {
+            payer: NodeId::derive(&[]), // sign() sobrescreve pela chave
+            payee,
+            nutrient: Nutrient::Atp,
+            amount: 5,
+            memo: "réplica de webapp".into(),
+            clock: 1_700_000_000,
+            payer_key: [0; 32],
+            signature: vec![],
+        }
+        .sign(signer)
+    }
+
+    #[test]
+    fn voucher_signs_and_verifies() {
+        let payer = test_keys(1);
+        let payee = NodeId::derive(b"host");
+        let v = hosting_voucher(&payer, payee);
+
+        // Ligação chave↔payer é automática.
+        assert_eq!(v.payer, NodeId::derive(payer.verifying_key().as_bytes()));
+        assert!(v.verify().is_ok());
+    }
+
+    #[test]
+    fn tampered_voucher_fails_verification() {
+        let payer = test_keys(2);
+        let payee = NodeId::derive(b"host");
+        let mut v = hosting_voucher(&payer, payee);
+        v.amount = 999; // payload alterado pós-assinatura
+        assert!(matches!(
+            v.verify(),
+            Err(NutrientError::BadSignature(_))
+        ));
+
+        // Chave de outra identidade não passa na ligação payer↔key.
+        let impostor = test_keys(3);
+        v.signature = Vec::new();
+        let mut w = hosting_voucher(&impostor, payee);
+        w.payer = NodeId::derive(payer.verifying_key().as_bytes()); // payer roubado
+        assert!(matches!(w.verify(), Err(NutrientError::KeyMismatch)));
+    }
+
+    #[test]
+    fn redeem_credits_once_replays_rejected() {
+        let signer = test_keys(4);
+        let payee = NodeId::derive(b"host");
+        let v = hosting_voucher(&signer, payee);
+
+        let mut ledger = Ledger::new();
+        ledger.redeem_voucher(&v).unwrap();
+        assert_eq!(ledger.balance(Nutrient::Atp), 5);
+        assert!(ledger.history().iter().any(|e| e.delta == 5));
+
+        // Replay do mesmo voucher → Replayed (saldo não muda).
+        assert!(matches!(
+            ledger.redeem_voucher(&v),
+            Err(NutrientError::Replayed)
+        ));
+        assert_eq!(ledger.balance(Nutrient::Atp), 5);
+
+        // Voucher diferente (memo distinto) do mesmo pagador passa.
+        let mut v2 = hosting_voucher(&signer, payee);
+        v2.memo = "segunda réplica".into();
+        v2 = v2.sign(&signer);
+        ledger.redeem_voucher(&v2).unwrap();
+        assert_eq!(ledger.balance(Nutrient::Atp), 10);
     }
 }

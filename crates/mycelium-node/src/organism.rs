@@ -1259,13 +1259,17 @@ impl Organism {
                     return Ok(());
                 }
                 tracing::info!(%ion, %acceptor, "IonOffer aceito");
-                // Auto-scaling: o peer aceitou a réplica → envia Void + layers.
+                // Auto-scaling: o peer aceitou a réplica → envia Void + layers
+                // e paga o voucher de hospedagem (economia do substrato).
                 if self.chambers.contains_key(&ion) {
                     match self.send_ion_migrate(&ion) {
-                        Ok(n) => tracing::info!(
-                            %ion, %acceptor, layers = n,
-                            "IonMigrate automático enviado (réplica brotando)"
-                        ),
+                        Ok(n) => {
+                            tracing::info!(
+                                %ion, %acceptor, layers = n,
+                                "IonMigrate automático enviado (réplica brotando)"
+                            );
+                            self.issue_hosting_voucher(&ion, acceptor);
+                        }
                         Err(e) => tracing::warn!(%ion, error = %e, "auto-migração falhou"),
                     }
                     self.zero_load_windows.remove(&ion);
@@ -1363,6 +1367,22 @@ impl Organism {
                     tracing::debug!("value-transfer rejeitada: {e}");
                 }
             }
+            Envelope::VoucherRedeem { voucher } => {
+                if voucher.payee == self.gland.node_id() {
+                    match self.ledger.redeem_voucher(&voucher) {
+                        Ok(()) => {
+                            tracing::info!(
+                                from = %voucher.payer,
+                                amount = voucher.amount,
+                                nutrient = ?voucher.nutrient,
+                                "voucher resgatado — a rede alimenta quem alimenta"
+                            );
+                            let _ = self.persist();
+                        }
+                        Err(e) => tracing::warn!(error = %e, "voucher rejeitado"),
+                    }
+                }
+            }
         }
         self.persist()?;
         Ok(())
@@ -1405,6 +1425,57 @@ impl Organism {
             let _ = self.hyphae.broadcast_lattice(bytes);
         }
         Ok(n_layers)
+    }
+
+    /// Recompensa fixa (ATP) paga por réplica nascida sob demanda.
+    const HOSTING_REWARD_ATP: u64 = 5;
+
+    /// Emite e assina um voucher de hospedagem ao peer que frutificou uma
+    /// réplica de um ion deste nó — debita o pagador e broadcast `VoucherRedeem`.
+    fn issue_hosting_voucher(&mut self, ion: &str, payee: NodeId) {
+        if payee == self.gland.node_id() {
+            return;
+        }
+        if self.ledger.balance(Nutrient::Atp) < Self::HOSTING_REWARD_ATP {
+            tracing::debug!(ion = %ion, %payee, "sem ATP para voucher de hospedagem");
+            return;
+        }
+        if let Err(e) = self.ledger.metabolize(
+            Nutrient::Atp,
+            Self::HOSTING_REWARD_ATP,
+            Some(payee),
+            format!("hospedagem:{ion}"),
+        ) {
+            tracing::warn!(error = %e, "débito do voucher falhou");
+            return;
+        }
+        let clock = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut voucher = mycelium_nutrients::Voucher {
+            payer: self.gland.node_id(),
+            payee,
+            nutrient: Nutrient::Atp,
+            amount: Self::HOSTING_REWARD_ATP,
+            memo: format!("hospedagem da réplica `{ion}`"),
+            clock,
+            payer_key: self.gland.verifying_key().to_bytes(),
+            signature: vec![],
+        };
+        voucher.signature = self.gland.sign_bytes(&voucher.payload_bytes());
+        debug_assert!(voucher.verify().is_ok());
+
+        let env = Envelope::VoucherRedeem { voucher };
+        if let Ok(bytes) = env.encode() {
+            let _ = self.hyphae.broadcast_lattice(bytes);
+        }
+        tracing::info!(
+            ion = %ion,
+            %payee,
+            atp = Self::HOSTING_REWARD_ATP,
+            "voucher de hospedagem emitido"
+        );
     }
 
     /// Plasma reativo (tick de scaling): drena a carga observada pelo

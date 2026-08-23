@@ -121,6 +121,7 @@ Testemunha: `docs/testes-realidade.md` (cenário 1A).
 2. **Prometheus alerts** — `deploy/prometheus/alerts.yml` com regras fisiológicas (isolamento, ATP zerado, demanda de réplicas insatisfeita, réplica perdida, exportador morto, gossip congelado) ✅
 3. **Validação multi-nó do Plasma reativo** — ciclo completo testemunhado entre 2 nós reais (gossip TCP local): `IonOffer desired_replicas=13` → `IonAccept` → `IonMigrate` automático (2 layers) → `ChamberProcess frutificada` no nó B → réplica servindo tráfego; ociosidade → recombine da origem com a réplica remota cobrindo (**o ion não morre**) ✅ · Reproduzível: `bash scripts/scaling-demo.sh`
 4. **Rate-limit configurável** — `MYCELIUM_RATE_MAX` / `MYCELIUM_RATE_WINDOW_SECS` na fronteira HTTP (default 120/min por IP); necessário para carga sintética local ✅
+5. **Liquidação com voucher assinado** — economia fecha o loop do scaling: origem debita ATP e emite `Voucher` ed25519 ao peer que frutificou réplica; beneficiário credita só com assinatura válida + guarda anti-replay (`ContentId`). Testemunhado entre 2 nós: "voucher de hospedagem emitido atp=5" / "voucher resgatado" ✅
 
 ### O que ainda NÃO foi testado
 | Item | Status | Por que |
@@ -132,7 +133,7 @@ Testemunha: `docs/testes-realidade.md` (cenário 1A).
 | Plasma reativo em rede real | ✅ | Ciclo completo entre 2 nós (scripts/scaling-demo.sh). Falta escalar para >2 nós e redes distintas |
 
 ### Próximos passos sugeridos
-- **Estresse prolongado** (1h+, 5 nós) com auto-scaling ativo
-- **Liquidação de nutrientes com voucher assinado** (pagador assina `Voucher{payer,payee,nutrient,amount,clock}`; beneficiário credita só com voucher válido — consenso leve sem Raft completo)
+- **Estresse prolongado** (1h+, 5 nós) com auto-scaling + vouchers ativos
+- **Vouchers recorrentes** (hospedagem contínua por janela, não só nascimento da réplica)
 - **Growth Zones** com DHT overlay (distance XOR routing)
 - **Prometheus alerts** em produção (alertmanager + webhook do seed book)

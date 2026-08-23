@@ -1,5 +1,28 @@
 # Nutrient Ledger Distribuído
 
+## Liquidação por voucher assinado (implementado)
+
+O pagamento ponto-a-ponto já funciona sem câmara de compensação:
+
+```
+Voucher {
+    payer, payee: NodeId,
+    nutrient: Nutrient, amount: u64,
+    memo: String, clock: u64,
+    payer_key: [u8; 32],   // ed25519 pub — NodeId::derive(payer_key) == payer
+    signature: Vec<u8>,    // assina o payload canônico
+}
+```
+
+1. Pagador debita o saldo local e broadcast `Envelope::VoucherRedeem`
+   (ex.: `issue_hosting_voucher` paga 5 ATP pela réplica que nasceu).
+2. Beneficiário verifica ligação chave↔payer + assinatura (`Voucher::verify`),
+   credita `Ledger::redeem_voucher` e registra `ContentId` anti-replay.
+3. Replay do mesmo voucher → `NutrientError::Replayed`.
+
+Testemunho multi-nó: `scripts/scaling-demo.sh`
+("voucher de hospedagem emitido" no pagador / "voucher resgatado" no beneficiário).
+
 ## Problema
 
 Hoje cada nó tem seu `Ledger` local (ATP, Enzymes, Mycelia, Spores, Resilience)
