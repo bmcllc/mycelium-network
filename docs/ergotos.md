@@ -15,9 +15,10 @@ o navegador é o terminal, o micélio é o ferro.
 | Pilar | Onde vive hoje |
 |---|---|
 | Qualquer app no navegador, zero instalação | Event Horizon `/{ion}/` → vira o shell do ErgotOS (`/console`) |
-| Máquinas legadas renascem | `lattice resurrect firmware.bin` + Forja (`base-fw/bir/evolve/hil/pcb`) |
-| Controle total do hardware | B.A.S.E.: descobrir, destravar, descrever, interagir |
+| Máquinas legadas renascem | REVENANT: `lattice resurrect firmware.bin` + Forja |
+| Controle total do hardware | B.A.S.E.: descobrir, destravar, descrever (specterprobe na física) |
 | Rodar de graça, pagar em nutrientes | Vouchers ATP por hospedagem/janela; Inertia paga computação |
+| Criptografia pós-quântica e fase tropical | ET-COSMIC: `mycelium-pqc`, `mycelium-tropical` |
 | Estado que te segue | GhostID + Nucleus + Spore Bank (sessão itinerante) |
 
 ## Constelação Mycelium Network
