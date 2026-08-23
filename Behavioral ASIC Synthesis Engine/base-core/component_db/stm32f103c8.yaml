@@ -1,0 +1,65 @@
+part: "STM32F103C8"
+manufacturer: "STMicroelectronics"
+description: "Cortex-M3 MCU, 'Blue Pill', cost-effective"
+category: Mcu
+package: "LQFP-48"
+features:
+  cpu:
+    cores: 1
+    max_mhz: 72
+    architecture: "ARMv7-M"
+  memory:
+    sram: "20KB"
+    flash: "64KB"
+  peripherals:
+    dma: 7
+    i2c: 2
+    spi: 2
+    uart: 3
+    timer: 4
+    adc: 2
+# V2 — pin subset USART1 default AF (LQFP-48 Blue Pill): PA9 TX / PA10 RX.
+# X1 — SPI2 default AF: PB13 SCK / PB14 MISO / PB15 MOSI (+ PB12 NSS).
+# Y1 — I2C1 default AF: PB6 SCL / PB7 SDA.
+# Full package omitted; draft sch only — NOT FABRICABLE.
+pins:
+  - number: 10
+    name: PA0
+    functions: [gpio]
+  - number: 11
+    name: PA1
+    functions: [gpio]
+  - number: 12
+    name: PA2
+    functions: [gpio, usart2_tx]
+  - number: 13
+    name: PA3
+    functions: [gpio, usart2_rx]
+  - number: 25
+    name: PB12
+    functions: [gpio, spi2_nss, spi2_cs]
+  - number: 26
+    name: PB13
+    functions: [gpio, spi2_sck]
+  - number: 27
+    name: PB14
+    functions: [gpio, spi2_miso, spi2_rx]
+  - number: 28
+    name: PB15
+    functions: [gpio, spi2_mosi, spi2_tx]
+  - number: 30
+    name: PA9
+    functions: [gpio, usart1_tx, uart0_tx]
+  - number: 31
+    name: PA10
+    functions: [gpio, usart1_rx, uart0_rx]
+  - number: 42
+    name: PB6
+    functions: [gpio, i2c1_scl, i2c_scl]
+  - number: 43
+    name: PB7
+    functions: [gpio, i2c1_sda, i2c_sda]
+availability:
+  status: "production"
+  price_1k: 2.00
+  distributor: ["DigiKey", "Mouser", "LCSC"]

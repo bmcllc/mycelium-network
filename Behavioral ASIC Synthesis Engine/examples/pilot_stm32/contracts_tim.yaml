@@ -1,0 +1,33 @@
+# Z2 — STM32F103 TIM2 @ 0x40000000 (APB1)
+# Dual USART+TIM: páginas distintas (USART1→0x40013000, TIM2→0x40000000).
+- name: tim2_init_to_irq
+  steps:
+    - event_type: mmio_write
+      address: 0x40000000
+      value: 1
+      tolerance_ns: 100
+    - event_type: mmio_read
+      address: 0x40000010
+      value: null
+      tolerance_ns: 200
+    - event_type: irq
+      address: 0x1c
+      value: null
+      tolerance_ns: 200
+  max_total_ns: 5000
+  max_step_ns: 3000
+  order: Strict
+
+- name: tim2_period_update
+  steps:
+    - event_type: mmio_write
+      address: 0x4000002c
+      value: 1000
+      tolerance_ns: 50
+    - event_type: irq
+      address: 0x1c
+      value: null
+      tolerance_ns: 100
+  max_total_ns: 2000
+  max_step_ns: 1500
+  order: Strict

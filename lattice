@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# lattice — CLI unificada do Ecossistema Lattice (Fase 2)
+# Forja (B.A.S.E.) + Rede (Mycelium).
+#
+#   lattice resurrect <binario> [opções]   analisa firmware → Plot → URL Event Horizon
+#   lattice base <args…>                   passthrough ao base-cli
+#   lattice <comando mycelium…>            passthrough ao mycelium-cli (daemon, sow, deploy…)
+#
+# Env: LATTICE_BASE_BIN, LATTICE_MYCELIUM_BIN, LATTICE_HOME
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+BASE_REPO="$ROOT/Behavioral ASIC Synthesis Engine"
+
+find_bin() {
+    local name="$1" dir
+    for dir in "$@"; do
+        if [[ -x "$dir/$name" ]]; then
+            printf '%s\n' "$dir/$name"
+            return 0
+        fi
+    done
+    return 1
+}
+
+MYCELIUM_BIN="${LATTICE_MYCELIUM_BIN:-$(find_bin mycelium "$ROOT/target/release" "$ROOT/target/debug" || true)}"
+BASE_BIN="${LATTICE_BASE_BIN:-$(find_bin base "$BASE_REPO/target/release" "$BASE_REPO/target/debug" || true)}"
+
+usage() {
+    cat <<'EOF'
+lattice — The Lattice Foundry CLI
+
+  lattice resurrect <binario> [--home DIR] [--ion NOME] [--timeout S]
+      SpecterProbe analisa o binário (SIR/MMIO), empacota o relatório
+      num Plot, semeia no Spore Bank e sobe o Ion no Event Horizon.
+
+  lattice plant [opções]        Fase 1: instala nó (folha por default;
+                                --sporocarp com gate de prova + systemd)
+
+  lattice base <args…>          executa o base-cli direto (analyze, virt, recomp…)
+  lattice <cmd mycelium…>       executa o mycelium-cli direto (daemon, sow, status…)
+
+Env: LATTICE_BASE_BIN, LATTICE_MYCELIUM_BIN, LATTICE_HOME
+EOF
+}
+
+default_home() {
+    if [[ -n "${LATTICE_HOME:-}" ]]; then
+        printf '%s\n' "$LATTICE_HOME"
+    elif [[ -n "${HOME:-}" ]]; then
+        printf '%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}/mycelium"
+    else
+        printf '%s\n' ".mycelium"
+    fi
+}
+
+daemon_alive() {
+    local home="$1"
+    [[ -e "$home/mycelium.sock" || -e "$home/mycelium.sock.tcp" ]]
+}
+
+ensure_daemon() {
+    local home="$1"
+    if daemon_alive "$home"; then
+        return 0
+    fi
+    echo "[🌱] daemon offline — despertando organismo…"
+    mkdir -p "$home"
+    nohup "$MYCELIUM_BIN" --home "$home" daemon >>"$home/daemon.log" 2>&1 &
+    local pid=$! i
+    for i in $(seq 1 40); do
+        if daemon_alive "$home"; then
+            echo "[🌱] daemon vivo (pid $pid)"
+            return 0
+        fi
+        sleep 0.5
+    done
+    echo "erro: daemon não subiu — veja $home/daemon.log" >&2
+    return 1
+}
+
+sanitize_name() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g' | cut -c1-40
+}
+
+cmd_resurrect() {
+    [[ -n "$MYCELIUM_BIN" ]] || { echo "erro: mycelium não compilado (cargo build -p mycelium-cli --release)" >&2; exit 1; }
+    [[ -n "$BASE_BIN" ]] || { echo "erro: base não compilado (cd '$BASE_REPO' && cargo build --release)" >&2; exit 1; }
+
+    local firmware="" home ion="webapp" timeout=30
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --home) home="$2"; shift 2 ;;
+            --ion) ion="$2"; shift 2 ;;
+            --timeout) timeout="$2"; shift 2 ;;
+            -*) echo "opção desconhecida: $1" >&2; exit 1 ;;
+            *) firmware="$1"; shift ;;
+        esac
+    done
+    [[ -n "$firmware" ]] || { usage >&2; exit 1; }
+    [[ -f "$firmware" ]] || { echo "erro: arquivo não encontrado: $firmware" >&2; exit 1; }
+    home="${home:-$(default_home)}"
+    home="${home/#\~/$HOME}"
+
+    ensure_daemon "$home"
+
+    LATTICE_WORK="$(mktemp -d /tmp/lattice-resurrect.XXXXXX)"
+    trap 'rm -rf "$LATTICE_WORK"' EXIT
+    local work="$LATTICE_WORK"
+
+    echo "[⚒ ] Forja: SpecterProbe analisando $(basename "$firmware")…"
+    "$BASE_BIN" analyze "$firmware" --disasm -o "$work/base"
+    local spec="$work/base/hardware_spec.yaml"
+    [[ -f "$spec" ]] || { echo "erro: analyze não produziu hardware_spec.yaml" >&2; exit 1; }
+
+    local label
+    label="$(sanitize_name "$(basename "$firmware")")"
+    local marker="__LATTICE_SPEC_${RANDOM}${RANDOM}__"
+    {
+        printf '#!/bin/sh\nmkdir -p dist\ncat > dist/index.html <<%s\n' "'$marker'"
+        printf '<!doctype html><html><head><meta charset="utf-8"><title>Lattice · %s</title></head>' "$label"
+        printf '<body style="font-family:system-ui;background:#0b1a14;color:#c8e6c9;padding:2rem">'
+        printf '<h1>⚒ resurrect: %s</h1><p>Vacuum Chamber via B.A.S.E. + Mycelium.</p><pre>' "$label"
+        cat "$spec"
+        printf '</pre></body></html>\n%s\n' "$marker"
+    } >"$work/build.sh"
+
+    echo "[🍄] Semeando Plot no Spore Bank…"
+    "$MYCELIUM_BIN" --home "$home" deploy \
+        --message "resurrect: $label" \
+        --path build.sh \
+        --content "$(cat "$work/build.sh")" \
+        --ion "$ion" \
+        --name "resurrect-$label" \
+        --timeout "$timeout"
+}
+
+case "${1:-}" in
+    resurrect) shift; cmd_resurrect "$@" ;;
+    plant) shift; exec "$ROOT/scripts/install-lattice.sh" "$@" ;;
+    base) shift; [[ -n "$BASE_BIN" ]] || { echo "erro: base não compilado" >&2; exit 1; }; exec "$BASE_BIN" "$@" ;;
+    help|-h|--help|"") usage ;;
+    *)
+        [[ -n "$MYCELIUM_BIN" ]] || { echo "erro: mycelium não compilado" >&2; exit 1; }
+        exec "$MYCELIUM_BIN" "$@"
+        ;;
+esac

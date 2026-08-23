@@ -1,0 +1,33 @@
+# W1 — STM32F103 SPI2 @ 0x40003800 (APB1)
+# Dual USART+SPI: SPI1 @ 0x40013000 partilha página 4K com USART1 — usa SPI2.
+- name: spi2_init_to_irq
+  steps:
+    - event_type: mmio_write
+      address: 0x40003800
+      value: 68
+      tolerance_ns: 100
+    - event_type: mmio_read
+      address: 0x40003808
+      value: null
+      tolerance_ns: 200
+    - event_type: irq
+      address: 0x24
+      value: null
+      tolerance_ns: 200
+  max_total_ns: 5000
+  max_step_ns: 3000
+  order: Strict
+
+- name: spi2_xfer_byte
+  steps:
+    - event_type: mmio_write
+      address: 0x4000380c
+      value: 85
+      tolerance_ns: 50
+    - event_type: irq
+      address: 0x24
+      value: null
+      tolerance_ns: 100
+  max_total_ns: 2000
+  max_step_ns: 1500
+  order: Strict

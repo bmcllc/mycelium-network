@@ -1,0 +1,12 @@
+{"op":"mmio_write","addr":"0x40034000","value":"0x41","ts_ns":1000}
+{"op":"mmio_write","addr":"0x40034004","value":"0x0","ts_ns":1100}
+{"op":"mmio_read","addr":"0x40034000","ts_ns":1200}
+{"op":"mmio_write","addr":"0x40034000","value":"0x42","ts_ns":2000}
+{"op":"mmio_read","addr":"0x40034018","ts_ns":2100}
+{"op":"irq","vector":33,"polarity":"rising","ts_ns":2200}
+{"op":"mmio_write","addr":"0x40034000","value":"0x43","ts_ns":3000}
+{"op":"mmio_read","addr":"0x40034000","ts_ns":3100}
+{"op":"mmio_write","addr":"0x40034008","value":"0x1","ts_ns":4000}
+{"op":"mmio_read","addr":"0x40034014","ts_ns":4100}
+{"op":"mmio_write","addr":"0x40034000","value":"0x0A","ts_ns":5000}
+{"op":"mmio_read","addr":"0x40034000","ts_ns":5100}

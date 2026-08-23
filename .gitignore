@@ -7,3 +7,8 @@
 
 # cache local do cargo (sandbox)
 .cargo-home/
+
+# builds do B.A.S.E. e deps do opencode
+**/target/
+.opencode/node_modules/
+.git-base-backup/

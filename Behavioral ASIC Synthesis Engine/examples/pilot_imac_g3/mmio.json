@@ -1,0 +1,23 @@
+[
+  {
+    "address": 2147483648,
+    "value": 1,
+    "access_type": "write",
+    "function_name": "macio_gpio_init",
+    "instruction_addr": 0
+  },
+  {
+    "address": 2147483652,
+    "value": null,
+    "access_type": "read",
+    "function_name": "macio_gpio_status",
+    "instruction_addr": 4
+  },
+  {
+    "address": 2147483664,
+    "value": 1,
+    "access_type": "write",
+    "function_name": "of_claim_ok",
+    "instruction_addr": 8
+  }
+]

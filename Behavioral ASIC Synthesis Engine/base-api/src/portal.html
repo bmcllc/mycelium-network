@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>B.A.S.E. Forensics Portal</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; background: #0b1a14; color: #c8e6c9;
+         margin: 0 auto; padding: 2rem 1rem; max-width: 60rem; }
+  h1 { color: #81c784; margin-bottom: .2rem; }
+  h2 { color: #a5d6a7; border-bottom: 1px solid #1b3a2a; padding-bottom: .3rem; margin-top: 2.5rem; }
+  p.sub { color: #6b8f7a; margin-top: 0; }
+  label { display: block; margin: .8rem 0 .25rem; color: #a5d6a7; font-size: .9rem; }
+  input, textarea, button {
+    font-family: inherit; font-size: .95rem; border-radius: 6px;
+    background: #10241b; color: #c8e6c9; border: 1px solid #2e5940; padding: .5rem .7rem;
+  }
+  input[type=text], input[type=password] { width: 100%; }
+  textarea { width: 100%; min-height: 7rem; font-family: ui-monospace, monospace; }
+  button { cursor: pointer; background: #1b4630; border-color: #3d7a55; }
+  button:hover { background: #25603f; }
+  button:disabled { opacity: .5; cursor: wait; }
+  table { width: 100%; border-collapse: collapse; margin: .6rem 0; font-size: .88rem; }
+  th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid #1b3a2a; }
+  th { color: #81c784; }
+  pre { background: #10241b; border: 1px solid #1b3a2a; border-radius: 6px;
+        padding: .8rem; overflow-x: auto; font-size: .82rem; }
+  .ok { color: #81c784; } .bad { color: #ef9a9a; } .muted { color: #6b8f7a; }
+  .card { background: #10241b; border: 1px solid #1b3a2a; border-radius: 8px; padding: 1rem; margin: .8rem 0; }
+  .row { display: flex; gap: 1rem; flex-wrap: wrap; }
+  .row > div { flex: 1; min-width: 14rem; }
+  code { color: #a5d6a7; }
+</style>
+</head>
+<body>
+<h1>⚒ B.A.S.E. Forensics Portal</h1>
+<p class="sub">Upload de firmware → identificação por contrato + prova SMT. Lab (<code>saas_production=false</code>).</p>
+
+<div class="card">
+  <label for="key">API key (Bearer)</label>
+  <input type="password" id="key" placeholder="sk-base-dev-local">
+  <div class="row" style="margin-top:.6rem">
+    <button id="btn-usage">Saldo /v1/usage</button>
+    <span id="usage-out" class="muted" style="align-self:center"></span>
+  </div>
+</div>
+
+<h2>1 · Identify — firmware + traços MMIO</h2>
+<div class="card">
+  <label for="label">Label do job</label>
+  <input type="text" id="label" placeholder="pilot_stm32">
+
+  <label for="fw">Firmware (.bin / .zip, máx 16 MiB)</label>
+  <input type="file" id="fw">
+
+  <label for="mmio">Traços MMIO — JSON (array de {address, value, access_type, function_name})</label>
+  <input type="file" id="mmio-file" accept=".json">
+  <textarea id="mmio" placeholder='[{"address":1073821708,"value":8196,"access_type":"write","function_name":"usart_init","instruction_addr":0}]'></textarea>
+
+  <label for="contracts">Contratos YAML (opcional — senão gera requirements por bloco)</label>
+  <textarea id="contracts" placeholder="contracts.yaml (opcional)"></textarea>
+
+  <div style="margin-top:.8rem"><button id="btn-identify">Analisar /v1/identify</button></div>
+</div>
+<div id="identify-out"></div>
+
+<h2>2 · Prove — contratos → SMT (Z3)</h2>
+<div class="card">
+  <label for="prove-yaml">Contratos temporais YAML</label>
+  <textarea id="prove-yaml" placeholder="contracts: …"></textarea>
+  <div style="margin-top:.8rem"><button id="btn-prove">Provar /v1/prove</button></div>
+</div>
+<div id="prove-out"></div>
+
+<p class="muted">Honestidade: <code>auto_fix_complete=false · generates_os=false · saas_production=false</code>.
+API: <a href="/v1/openapi.yaml" style="color:#81c784">/v1/openapi.yaml</a> · <a href="/v1/prices" style="color:#81c784">/v1/prices</a></p>
+
+<script>
+const $ = id => document.getElementById(id);
+$('key').value = localStorage.getItem('base_api_key') || '';
+
+function apiKey() {
+  const k = $('key').value.trim() || 'sk-base-dev-local';
+  localStorage.setItem('base_api_key', k);
+  return k;
+}
+async function api(path, opts = {}) {
+  const r = await fetch(path, {
+    ...opts,
+    headers: { Authorization: 'Bearer ' + apiKey(), ...(opts.headers || {}) },
+  });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.error ? `${body.error.message} (${body.error.code})` : r.status);
+  return body;
+}
+function fileText(input) {
+  const f = input.files[0];
+  return f ? f.text() : Promise.resolve(null);
+}
+function fileB64(input) {
+  const f = input.files[0];
+  if (!f) return Promise.reject(new Error('selecione um firmware'));
+  if (f.size > 16 * 1024 * 1024) return Promise.reject(new Error('firmware > 16 MiB'));
+  return f.arrayBuffer().then(buf => {
+    const bytes = new Uint8Array(buf);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 0x8000)
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return btoa(bin);
+  });
+}
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+$('mmio-file').addEventListener('change', async e => {
+  const t = await fileText(e.target);
+  if (t) $('mmio').value = t;
+});
+
+$('btn-usage').addEventListener('click', async () => {
+  $('usage-out').className = 'muted';
+  $('usage-out').textContent = '…';
+  try {
+    const u = await api('/v1/usage');
+    $('usage-out').className = 'ok';
+    $('usage-out').textContent = `créditos restantes: ${u.credits_remaining ?? u.credits ?? JSON.stringify(u)}`;
+  } catch (e) {
+    $('usage-out').className = 'bad';
+    $('usage-out').textContent = e.message;
+  }
+});
+
+$('btn-identify').addEventListener('click', async () => {
+  const out = $('identify-out');
+  const btn = $('btn-identify');
+  btn.disabled = true;
+  out.innerHTML = '<p class="muted">analisando…</p>';
+  try {
+    const fw = await fileB64($('fw'));
+    let mmio;
+    try { mmio = JSON.parse($('mmio').value); }
+    catch { throw new Error('MMIO JSON inválido'); }
+    if (!Array.isArray(mmio) || mmio.length === 0)
+      throw new Error('identify é evidence-driven: informe traços MMIO');
+    const body = {
+      firmware_b64: fw,
+      mmio,
+      label: $('label').value.trim() || null,
+      contracts_yaml: $('contracts').value.trim() || null,
+    };
+    const r = await api('/v1/identify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    out.innerHTML = renderIdentify(r);
+  } catch (e) {
+    out.innerHTML = `<p class="bad">erro: ${esc(e.message)}</p>`;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+function renderIdentify(r) {
+  const blocks = r.hardware.blocks.map(b => `
+    <tr><td><code>${esc(b.id)}</code></td><td>${esc(b.kind)}</td>
+    <td>${esc(b.base_address_hex)}</td><td>${b.size}</td>
+    <td>${b.register_count}</td><td>${(b.confidence * 100).toFixed(0)}%</td></tr>`).join('');
+  const contracts = r.by_contract.map(c => {
+    const st = c.proved === true ? '<span class="ok">proved</span>'
+      : c.proved === false ? '<span class="bad">failed</span>' : '<span class="muted">—</span>';
+    return `<tr><td><code>${esc(c.contract)}</code></td><td>${esc(c.kind)}</td>
+      <td>${esc(c.identified_as)}</td><td>${st}</td><td>${esc(c.detail)}</td></tr>`;
+  }).join('');
+  const proof = r.proof
+    ? `<p>Prova: ${r.proof.contracts_proved}/${r.proof.contracts_total} contratos (${esc(r.proof.backend)})</p>`
+    : '';
+  const u = r.usage;
+  return `
+    <div class="card">
+      <p><b>${esc(r.label || r.id)}</b> <span class="muted">· ${esc(r.id)}</span></p>
+      <p class="muted">confiança ${(r.hardware.confidence * 100).toFixed(0)}% ·
+         tensão ψ=${r.hardware.tension_psi.toFixed(3)} ·
+         evidências ${r.hardware.evidence_entries} ·
+         sha256 <code>${esc(r.hardware.firmware_sha256.slice(0, 16))}…</code></p>
+      <table><tr><th>Bloco</th><th>Tipo</th><th>Base</th><th>Tamanho</th><th>Regs</th><th>Conf.</th></tr>${blocks}</table>
+      ${contracts ? `<table><tr><th>Contrato</th><th>Tipo</th><th>Identificado como</th><th>Status</th><th>Detalhe</th></tr>${contracts}</table>` : ''}
+      ${proof}
+      <p class="muted">usage: ${u.units} units · cobrado ${u.credits_charged} · restante ${u.credits_remaining}</p>
+    </div>`;
+}
+
+$('btn-prove').addEventListener('click', async () => {
+  const out = $('prove-out');
+  const btn = $('btn-prove');
+  btn.disabled = true;
+  out.innerHTML = '<p class="muted">provando…</p>';
+  try {
+    const yaml = $('prove-yaml').value.trim();
+    if (!yaml) throw new Error('cole o YAML de contratos');
+    const r = await api('/v1/prove', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contracts_yaml: yaml }),
+    });
+    const rows = (r.results || []).map(x => `
+      <tr><td><code>${esc(x.contract ?? x.name ?? '')}</code></td>
+      <td>${x.satisfied === true ? '<span class="ok">satisfied</span>'
+        : x.satisfied === false ? '<span class="bad">violated</span>' : esc(JSON.stringify(x.status ?? ''))}</td>
+      <td>${esc(x.detail ?? '')}</td></tr>`).join('');
+    out.innerHTML = `
+      <div class="card">
+        <p>${r.all_satisfied ? '<span class="ok">todos satisfeitos</span>' : '<span class="bad">há violações</span>'}
+           · ${r.contracts_proved}/${r.contracts_total} provados · backend ${esc(r.backend)}
+           ${r.deadlock ? '· <span class="bad">deadlock detectado</span>' : ''}</p>
+        ${rows ? `<table><tr><th>Contrato</th><th>Status</th><th>Detalhe</th></tr>${rows}</table>` : `<pre>${esc(JSON.stringify(r.results, null, 2))}</pre>`}
+        <p class="muted">cobrado ${r.usage.credits_charged} · restante ${r.usage.credits_remaining}</p>
+      </div>`;
+  } catch (e) {
+    out.innerHTML = `<p class="bad">erro: ${esc(e.message)}</p>`;
+  } finally {
+    btn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>

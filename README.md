@@ -53,6 +53,21 @@ Rede só com seed book (sem mDNS / sem `--bootstrap` manual):
 
 Demos: `./scripts/e2e-demo.sh` · `./scripts/horizon-demo.sh` · `./scripts/seedbook-demo.sh` · `./scripts/isotope-decay-demo.sh`
 
+## CLI unificada `lattice` (Forja + Rede)
+
+```bash
+# Fase 1 — planta um nó (folha CGNAT por default; --sporocarp exige gate de prova)
+./lattice plant
+
+# Comando mágico: B.A.S.E. analisa o binário → Plot → Ion no Event Horizon
+./lattice resurrect caminho/para/firmware.bin
+# → http://127.0.0.1:7474/webapp/
+
+# Passthrough: lattice base … (base-cli) e lattice daemon|sow|status… (mycelium-cli)
+```
+
+Requer binários compilados (`target/release/mycelium` e `Behavioral ASIC Synthesis Engine/target/{release,debug}/base`) ou `LATTICE_MYCELIUM_BIN` / `LATTICE_BASE_BIN`. Home default: `LATTICE_HOME` ou `~/.local/share/mycelium`.
+
 ## Fluxo ponta a ponta
 
 ```

@@ -1,0 +1,15 @@
+{
+  "phase": "C",
+  "device": "imac_g3_late_2001",
+  "target_os": "reference|haiku|reactos",
+  "operator": "_______________",
+  "date": "YYYY-MM-DD",
+  "image_sha256": "_______________",
+  "method": "openfirmware|netboot|cd",
+  "result": "boot_ok|panic|hang|not_run",
+  "sow_signed": false,
+  "production": false,
+  "reactos_external": true,
+  "haiku_external": true,
+  "generates_os": false
+}

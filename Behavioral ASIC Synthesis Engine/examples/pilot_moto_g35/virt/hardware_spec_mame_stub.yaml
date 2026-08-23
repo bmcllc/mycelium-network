@@ -1,0 +1,58 @@
+version: 1
+source: specter_live_sample_mame
+cpu:
+  architecture: Arm64
+  clock_mhz: 1000
+  endianness: Little
+  cores: 1
+memory:
+  regions: []
+blocks:
+  - id: mame_mmio0
+    kind: Unknown
+    base_address: 0xA00000
+    size: 0x1000
+    registers:
+      - offset: 0
+        name: DATA
+        width: 32
+        access: ReadWrite
+        purpose: DataPort
+        reset_value: null
+        observed_values: []
+        bitfields: []
+        polling: false
+        count: 0
+      - offset: 4
+        name: CTRL
+        width: 32
+        access: ReadWrite
+        purpose: Control
+        reset_value: null
+        observed_values: []
+        bitfields: []
+        polling: false
+        count: 0
+    protocol:
+      states: []
+      transitions: []
+      entry_condition: null
+      exit_condition: null
+    timing:
+      activation: null
+      processing: null
+      interrupt_response: null
+      dma_setup: null
+      polling_interval: null
+    dma: null
+    dependencies: []
+    confidence: 0.5
+interrupts: []
+dma_channels: []
+constraints:
+  max_power_watts: 1.0
+  required_bandwidths: []
+  pin_count: null
+  pcb_layers: null
+  temp_range: null
+confidence: 0.5

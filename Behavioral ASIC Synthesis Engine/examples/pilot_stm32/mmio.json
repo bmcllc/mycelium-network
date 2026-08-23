@@ -1,0 +1,30 @@
+[
+  {
+    "address": 1073821708,
+    "value": 8196,
+    "access_type": "write",
+    "function_name": "usart_init",
+    "instruction_addr": 0
+  },
+  {
+    "address": 1073821696,
+    "value": null,
+    "access_type": "read",
+    "function_name": "usart_status",
+    "instruction_addr": 4
+  },
+  {
+    "address": 1073821700,
+    "value": 65,
+    "access_type": "write",
+    "function_name": "usart_putc",
+    "instruction_addr": 8
+  },
+  {
+    "address": 1073821696,
+    "value": null,
+    "access_type": "read",
+    "function_name": "usart_status_txe",
+    "instruction_addr": 12
+  }
+]

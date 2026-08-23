@@ -1,0 +1,23 @@
+[
+  {
+    "address": 2835349504,
+    "value": 1,
+    "access_type": "write",
+    "function_name": "ap_uart_init",
+    "instruction_addr": 0
+  },
+  {
+    "address": 2835349508,
+    "value": null,
+    "access_type": "read",
+    "function_name": "ap_uart_status",
+    "instruction_addr": 4
+  },
+  {
+    "address": 2835349504,
+    "value": 65,
+    "access_type": "write",
+    "function_name": "ap_uart_putc",
+    "instruction_addr": 8
+  }
+]

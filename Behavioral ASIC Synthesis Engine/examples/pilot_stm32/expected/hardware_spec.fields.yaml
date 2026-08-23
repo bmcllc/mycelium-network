@@ -1,0 +1,30 @@
+# Allowlist of HardwareSpec fields that must remain stable for the STM32 USART wedge.
+# Checked by smoke (run.sh) and base-core test pilot_stm32_goldens.
+
+required_top_level:
+  - version
+  - source
+  - cpu
+  - memory
+  - blocks
+  - interrupts
+  - dma_channels
+  - constraints
+  - confidence
+
+required_block_fields:
+  - id
+  - kind
+  - base_address
+  - size
+  - registers
+  - confidence
+
+pilot_notes:
+  classify: uart
+  # Clustering 4K: USART1 @ 0x40013800 → page 0x40013000
+  base_address_page: 0x40013000
+  usart1_base: 0x40013800
+  mmio_source: mmio.json
+  preferred_manufacturer: STMicroelectronics
+  cpu_part: STM32F103C8

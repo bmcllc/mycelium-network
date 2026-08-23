@@ -1,0 +1,24 @@
+# Moto G35 synth — AP_UART0 @ 0xA9000000 (Unisoc-range placeholder)
+- name: ap_uart_init
+  steps:
+    - event_type: mmio_write
+      address: 0xA9000000
+      value: 1
+      tolerance_ns: 100
+    - event_type: mmio_read
+      address: 0xA9000004
+      value: null
+      tolerance_ns: 200
+  max_total_ns: 5000
+  max_step_ns: 3000
+  order: Strict
+
+- name: ap_uart_tx_byte
+  steps:
+    - event_type: mmio_write
+      address: 0xA9000000
+      value: 65
+      tolerance_ns: 50
+  max_total_ns: 2000
+  max_step_ns: 1500
+  order: Strict

@@ -1,0 +1,6 @@
+# Libretro / RetroArch mem-watch style (Specter Live E5)
+# ≠ core shipado — só parser de texto
+mem_write 0x7E0010 0xFF
+mem_read 0x7E0010
+W 0x7E0012 0x01
+R 0x7E0012

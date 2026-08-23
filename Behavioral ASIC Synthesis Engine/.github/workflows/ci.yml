@@ -1,0 +1,148 @@
+name: B.A.S.E. CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Build all crates
+        run: cargo build --workspace
+
+      - name: Run all tests
+        run: cargo test --workspace
+
+      - name: HIL template (EXPERIMENTAL, host-only)
+        run: |
+          cargo test -p base-hil
+          cargo build -p base-hil
+          # default: sem hil_usb / sem libusb
+          cargo test -p base-hil --features hil_programmer
+          # CLI thin wrapper (V3) — default build, no USB
+          cargo build -p base-cli
+          ./target/debug/base hil enumerate -o /tmp/base_hil_enum
+          test -f /tmp/base_hil_enum/hil_enumerate.json
+          grep -q Simulated /tmp/base_hil_enum/hil_enumerate.json
+          printf '\x00' > /tmp/base_hil_empty.bin
+          ./target/debug/base hil flash /tmp/base_hil_empty.bin --mock-flash -o /tmp/base_hil_flash
+          test -f /tmp/base_hil_flash/hil_flash_receipt.json
+          grep -q mock_dry_run /tmp/base_hil_flash/hil_flash_receipt.json
+          grep -vq '"production": true' /tmp/base_hil_flash/hil_flash_receipt.json
+          # programador EXPERIMENTAL (comando externo); ≠ production flash
+          # flash silício real continua gated por ALLOW_FLASH + CMD do operador
+
+      - name: Pilot smoke (Path to Real v0.2 / R0–R6)
+        timeout-minutes: 15
+        run: |
+          cargo build -p base-cli
+          chmod +x examples/pilot/run.sh
+          ./examples/pilot/run.sh
+          test -f examples/pilot/out/CASE_SUMMARY.md
+
+      - name: Pilot T1 B2 (UART+SPI opt-in)
+        timeout-minutes: 10
+        run: |
+          chmod +x examples/pilot/run_t1_b2.sh
+          ./examples/pilot/run_t1_b2.sh
+          test -f examples/pilot/out_t1_b2/CASE_SUMMARY_T1.md
+
+      - name: Pilot U1 STM32 (USART opt-in)
+        timeout-minutes: 10
+        run: |
+          chmod +x examples/pilot_stm32/run.sh
+          ./examples/pilot_stm32/run.sh
+          test -f examples/pilot_stm32/out/CASE_SUMMARY.md
+
+      - name: Pilot W1 STM32 (USART+SPI2 opt-in)
+        timeout-minutes: 10
+        run: |
+          chmod +x examples/pilot_stm32/run_w1_spi.sh
+          ./examples/pilot_stm32/run_w1_spi.sh
+          test -f examples/pilot_stm32/out_w1_spi/CASE_SUMMARY_W1.md
+
+      - name: Pilot X3 STM32 (USART+I2C1 opt-in)
+        timeout-minutes: 10
+        run: |
+          chmod +x examples/pilot_stm32/run_x3_i2c.sh
+          ./examples/pilot_stm32/run_x3_i2c.sh
+          test -f examples/pilot_stm32/out_x3_i2c/CASE_SUMMARY_X3.md
+
+      - name: Pilot Y3 STM32 (USART+SPI2+I2C1 opt-in)
+        timeout-minutes: 10
+        run: |
+          chmod +x examples/pilot_stm32/run_y3_triple.sh
+          ./examples/pilot_stm32/run_y3_triple.sh
+          test -f examples/pilot_stm32/out_y3_triple/CASE_SUMMARY_Y3.md
+
+      - name: Pilot Z2 STM32 (USART+TIM2 opt-in)
+        timeout-minutes: 10
+        run: |
+          chmod +x examples/pilot_stm32/run_z2_tim.sh
+          ./examples/pilot_stm32/run_z2_tim.sh
+          test -f examples/pilot_stm32/out_z2_tim/CASE_SUMMARY_Z2.md
+
+      - name: Pilot study Specter VM (Forth+Lua)
+        timeout-minutes: 10
+        run: |
+          chmod +x examples/pilot_study/run_study.sh
+          ./examples/pilot_study/run_study.sh
+          test -f examples/pilot_study/out/CASE_SUMMARY_STUDY.md
+
+      - name: HIL Lab Gate A
+        timeout-minutes: 5
+        run: |
+          chmod +x examples/hil_lab/run_hil_lab.sh
+          ./examples/hil_lab/run_hil_lab.sh
+          test -f examples/hil_lab/out/CASE_SUMMARY_HIL_LAB.md
+
+      - name: OS-port assist G35 fase A (opt-in)
+        timeout-minutes: 5
+        run: |
+          chmod +x examples/pilot_moto_g35/run.sh
+          ./examples/pilot_moto_g35/run.sh
+          test -f examples/pilot_moto_g35/out/CASE_SUMMARY_G35_A.md
+
+      - name: OS-port assist iMac G3 fase A (opt-in)
+        timeout-minutes: 5
+        run: |
+          chmod +x examples/pilot_imac_g3/run.sh
+          ./examples/pilot_imac_g3/run.sh
+          test -f examples/pilot_imac_g3/out/CASE_SUMMARY_IMAC_A.md
+
+      - name: Pilot FW host gate
+        run: |
+          test -x examples/pilot/out/fw/firmware_host
+          examples/pilot/out/fw/firmware_host
+          # host smoke ≠ silício — smoke only proves host build + exit 0
+
+      - name: Check documentation
+        run: cargo doc --no-deps --workspace
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: Format check
+        run: cargo fmt --check

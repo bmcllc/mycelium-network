@@ -1,0 +1,9 @@
+flowchart LR
+    evspi2_init_to_irq_1_0[WRITE 0x40003800 = 68, 0ns]
+    evspi2_init_to_irq_1_1[READ 0x40003808, 150ns]
+    evspi2_init_to_irq_1_2[/IRQ 0x24, 500ns/]
+    evspi2_init_to_irq_1_0 -->|150ns| evspi2_init_to_irq_1_1
+    evspi2_init_to_irq_1_1 -->|350ns| evspi2_init_to_irq_1_2
+    evspi2_xfer_byte_1_0[WRITE 0x4000380c = 85, 1000ns]
+    evspi2_xfer_byte_1_1[/IRQ 0x24, 1200ns/]
+    evspi2_xfer_byte_1_0 -->|200ns| evspi2_xfer_byte_1_1

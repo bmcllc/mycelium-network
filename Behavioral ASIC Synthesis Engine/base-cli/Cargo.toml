@@ -1,0 +1,41 @@
+[package]
+name = "base-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "B.A.S.E. CLI — unified command-line interface"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+anyhow = "1"
+tracing = { version = "0.1", features = ["log"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base-core = { path = "../base-core" }
+base-pcb = { path = "../base-pcb" }
+base-fw = { path = "../base-fw" }
+base-check = { path = "../base-check" }
+base-evolve = { path = "../base-evolve" }
+specter-probe = { path = "../specterprobe" }
+base-bir = { path = "../base-bir" }
+base-bsl = { path = "../base-bsl" }
+base-hil = { path = "../base-hil" }
+base-vm = { path = "../base-vm" }
+base-port = { path = "../base-port" }
+base-virt = { path = "../base-virt" }
+base-reason = { path = "../base-reason" }
+base-recomp = { path = "../base-recomp" }
+
+[features]
+default = []
+# Opt-in: forward HIL USB / programmer features (CI default stays off).
+hil_usb = ["base-hil/hil_usb"]
+hil_programmer = ["base-hil/hil_programmer"]
+# Lab silício: USB real + programador (sem mock)
+hil_live = ["hil_usb", "hil_programmer"]
+
+[[bin]]
+name = "base"
+path = "src/main.rs"

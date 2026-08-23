@@ -1,0 +1,33 @@
+# X3 — STM32F103 I2C1 @ 0x40005400 (APB1)
+# Dual USART+I2C: páginas distintas (USART1→0x40013000, I2C1→0x40005000).
+- name: i2c1_init_to_irq
+  steps:
+    - event_type: mmio_write
+      address: 0x40005400
+      value: 1
+      tolerance_ns: 100
+    - event_type: mmio_read
+      address: 0x40005414
+      value: null
+      tolerance_ns: 200
+    - event_type: irq
+      address: 0x1f
+      value: null
+      tolerance_ns: 200
+  max_total_ns: 5000
+  max_step_ns: 3000
+  order: Strict
+
+- name: i2c1_xfer_byte
+  steps:
+    - event_type: mmio_write
+      address: 0x40005410
+      value: 85
+      tolerance_ns: 50
+    - event_type: irq
+      address: 0x1f
+      value: null
+      tolerance_ns: 100
+  max_total_ns: 2000
+  max_step_ns: 1500
+  order: Strict
