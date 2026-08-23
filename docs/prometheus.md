@@ -27,6 +27,9 @@ Disponível no Event Horizon (porta 7474 por default).
 | `mycelium_isotope_atoms` | gauge | Átomos no Nucleus |
 | `mycelium_membrane{membrane="..."}` | gauge | Membrana atual (label) |
 | `mycelium_physarum_phase{phase="..."}` | gauge | Fase Physarum (label) |
+| `mycelium_ion_charge{ion="..."}` | gauge | Carga do ion (-1 negativa, 0 neutra, 1 positiva) — Plasma reativo |
+| `mycelium_ion_desired_replicas{ion="..."}` | gauge | Réplicas desejadas sob carga observada |
+| `mycelium_ion_remote_replicas{ion="..."}` | gauge | Réplicas remotas vivas conhecidas (via IonReady) |
 
 ## Frequência
 
@@ -59,8 +62,36 @@ scrape_configs:
           group: 'substrato'
 ```
 
+### Alertas (Alertmanager)
+
+Regras prontas em [`deploy/prometheus/alerts.yml`](../deploy/prometheus/alerts.yml):
+isolamento (`MyceliumSemVizinhos`), ATP esgotado, demanda de réplicas não
+satisfeita (`MyceliumIonSemReplicas`), réplica perdida, exportador morto e
+gossip congelado. Instale com:
+
+```yaml
+rule_files:
+  - /etc/prometheus/alerts.yml   # copie deploy/prometheus/alerts.yml para cá
+```
+
+## Plasma reativo (auto-scaling)
+
+O ciclo completo roda sem operador humano:
+
+1. **Carga observada** — o rizomorfo conta cada request por ion
+   (`EventHorizon::note_request`); a cada 45s o organismo drena a janela.
+2. **Sense** — `Ion::sense(req/s)` ajusta a carga: 0 req/s → Negative,
+   1–50 → Neutral, >50 → Positive (réplicas desejadas = 1 + n/50).
+3. **Brotar** — carga positiva e réplicas < desejadas → broadcast `IonOffer`
+   (cooldown de 120s). Peer com recursos ociosos responde `IonAccept`, recebe
+   `IonMigrate` (Void + layers) automático e frutifica sua própria Chamber,
+   anunciando `IonReady` (rota extra no Horizon, gravidade distribui).
+4. **Recombinar** — três janelas seguidas de carga zero **e** uma réplica
+   remota viva cobrindo → a Chamber local é recombinada (processo morto,
+   rota removida). A última réplica viva nunca morre.
+
 ## Código
 
-- **Snapshot:** `mycelium-node/src/organism.rs` → `metrics_tick`
-- **Endpoint:** `singularity/src/proxy.rs` → rota `/metrics`
-- **Armazenamento:** `singularity/src/lib.rs` → `EventHorizon.metrics`
+- **Snapshot:** `mycelium-node/src/organism.rs` → `metrics_tick` + `plasma_scale_tick`
+- **Endpoint:** `singularity/src/proxy.rs` → rota `/metrics` + `note_request`
+- **Armazenamento:** `singularity/src/lib.rs` → `EventHorizon.metrics` + `ion_requests`

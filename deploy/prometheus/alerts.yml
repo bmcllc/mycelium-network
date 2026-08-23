@@ -1,0 +1,80 @@
+# Alertas Prometheus para o Mycelium Network.
+#
+# Regras fisiológicas: o substrato deve permanecer vivo e alimentado.
+# Instalar no alertmanager/prometheus (rule_files) — ver docs/prometheus.md.
+#
+groups:
+  - name: mycelium-vitalidade
+    rules:
+      # Isolamento: nó sem vizinhos perde a rede viva (hifas mortas).
+      - alert: MyceliumSemVizinhos
+        expr: mycelium_neighbors == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Nó {{ $labels.instance }} isolado da mesh"
+          description: "mycelium_neighbors == 0 há mais de 10m. Verifique bootstrap/seed book, Nostr transport (folha CGNAT) ou inbound do esporocarp."
+
+      # ATP zerado: o metabolismo econômico parou (sem crédito p/ deploy).
+      - alert: MyceliumAtpZerado
+        expr: mycelium_atp == 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Saldo de ATP esgotado em {{ $labels.instance }}"
+          description: "Sem ATP o organismo não paga deploys (`sow`/`signal`/`deploy`). Contribua recursos (`--contribute`) ou aguarde heartbeat."
+
+      # Ion sem carga negativa persistente não é problema; ion com
+      # desired_replicas > réplicas conhecidas indica demanda insatisfeita.
+      - alert: MyceliumIonSemReplicas
+        expr: mycelium_ion_desired_replicas > (1 + mycelium_ion_remote_replicas)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ion {{ $labels.ion }} com demanda acima das réplicas vivas"
+          description: "O Plasma pede réplicas (carga positiva) mas nenhum peer aceitou o IonOffer. Verifique recursos ociosos nos peers e conectividade gossip."
+
+      # Réplica remota morreu: IonReady sumiu do horizonte deste nó.
+      - alert: MyceliumReplicaPerdida
+        expr: mycelium_ion_remote_replicas < (mycelium_ion_remote_replicas offset 30m)
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "Réplica de {{ $labels.ion }} saiu de órbita"
+          description: "Um custodiano anunciou IonReady e depois silenciou. O auto-scaling re-oferece a réplica no próximo ciclo de carga."
+
+      # Silêncio total do exportador (scrape falha → up == 0).
+      - alert: MyceliumExportadorMorto
+        expr: up{job="mycelium"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Event Horizon {{ $labels.instance }} não responde /metrics"
+          description: "O daemon pode ter caído. Confira `mycelium status`, o PID em {home}/daemon.pid e os logs."
+
+  - name: mycelium-fluxo
+    rules:
+      # Gossip congelado: mensagens_in paradas com vizinhos vivos.
+      - alert: MyceliumGossipCongelado
+        expr: rate(mycelium_messages_in[15m]) == 0 and mycelium_neighbors > 0
+        for: 20m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gossipsub sem entrada apesar de vizinhos ativos"
+          description: "Hifas conectadas mas nenhuma mensagem em 15m. Possível partição de tópico ou relé mesh degradado (`relay_health`)."
+
+      # Anastomoses (conexões novas) estagnadas por muito tempo.
+      - alert: MyceliumAnastomoseEstagnada
+        expr: rate(mycelium_anastomoses[1h]) == 0
+        for: 2h
+        labels:
+          severity: info
+        annotations:
+          summary: "Nenhuma nova conexão formada na última hora"
+          description: "A rede não cresce neste ponto. Normal à noite/dormância; investigue se persistir por múltiplos ciclos."

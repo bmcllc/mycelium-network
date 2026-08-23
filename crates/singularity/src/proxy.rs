@@ -297,6 +297,8 @@ async fn proxy(State(table): State<HorizonTable>, req: Request) -> Response {
             }
         }
     };
+    // Carga observada: alimenta o Plasma sense → auto-scaling de réplicas.
+    table.write().unwrap().note_request(&ion);
 
     // Reescreve /{ion}/foo → /foo no upstream.
     let rest = {

@@ -142,6 +142,12 @@ impl Cloud {
         doomed
     }
 
+    /// Remove um Ion do Plasma devolvendo-o ao chamador (recombine
+    /// controlada pelo organismo — decomposição explícita fora daqui).
+    pub fn remove(&mut self, name: &str) -> Option<Ion> {
+        self.ions.remove(name)
+    }
+
     /// Ions que pedem réplicas (carga positiva).
     pub fn hungry(&self) -> impl Iterator<Item = &Ion> {
         self.ions
@@ -205,6 +211,24 @@ mod tests {
         let doomed = cloud.react();
         assert_eq!(doomed, vec!["idle".to_string()]);
         assert!(cloud.is_empty());
+    }
+
+    #[test]
+    fn cloud_remove_hands_ion_back_to_caller() {
+        let host = NodeId::derive(b"node");
+        let mut cloud = Cloud::new();
+        let mut ion = Ion::birth("web", host, chamber("web"));
+        ion.sense(200);
+        assert_eq!(ion.charge, Charge::Positive);
+        cloud.inject(ion).unwrap();
+
+        // Remove sem decompor: o chamador decide (recombine controlada).
+        let mut taken = cloud.remove("web").expect("ion presente");
+        assert!(cloud.is_empty());
+        assert_eq!(taken.name, "web");
+        taken.decompose();
+        assert_eq!(taken.charge, Charge::Negative);
+        assert!(cloud.remove("web").is_none());
     }
 
     #[test]

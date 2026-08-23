@@ -112,13 +112,13 @@ sow + recall: plot atravessou CGNAT → 5G sem VPS nem relay circuit
 Testemunha: `docs/testes-realidade.md` (cenário 1A).
 
 ## Concluído nesta sessão
-1. **Entropy gossip** — distribuir/coletar shades via Lattice Envelope ✅
-2. **PQC híbrido** — handshake pós-Noise com `blake3(noise_secret || pqc_secret)` ✅
-3. **Nutrient ledger CRDT** — `BalanceSync` gossip a cada 60s ✅
-4. **Plasma Ion migration** — `IonOffer`/`IonAccept`/`IonMigrate`/`IonReady` ✅
-5. **Sporocarp CDN** — `GET /plots/{id}` + `GET /layers/{id}` no Horizon ✅
-6. **Growth Zones** — `ZoneAnnounce` gossip + `mycelium zones` ✅
-7. **Prometheus /metrics** — endpoint + tick 30s ✅
+1. **Plasma reativo (auto-scaling de Ions)** — ciclo completo sem operador:
+   - `EventHorizon::note_request`/`take_request_counts`: carga HTTP por ion observada pelo rizomorfo ✅
+   - tick de scaling 45s no organismo: `Ion::sense(req/s)` + decisões ✅
+   - carga positiva → `IonOffer` automático (cooldown 120s) → peer aceita → `IonMigrate` automático (Void + layers) → `IonReady` registra réplica remota e rota extra no Horizon ✅
+   - 3 janelas de carga zero **com réplica remota viva** → recombine (Chamber morta, rota removida; a última réplica nunca morre) ✅
+   - métricas novas: `mycelium_ion_charge`, `mycelium_ion_desired_replicas`, `mycelium_ion_remote_replicas` ✅
+2. **Prometheus alerts** — `deploy/prometheus/alerts.yml` com regras fisiológicas (isolamento, ATP zerado, demanda de réplicas insatisfeita, réplica perdida, exportador morto, gossip congelado) ✅
 
 ### O que ainda NÃO foi testado
 | Item | Status | Por que |
@@ -127,10 +127,10 @@ Testemunha: `docs/testes-realidade.md` (cenário 1A).
 | Estresse prolongado (1h+) | ❌ | Só 2min com 3 nós. Rode: `bash scripts/stress-test.sh 60 5` |
 | Growth Zones runtime | ✅ | `ZoneAnnounce` replicado entre 5 nós. `mycelium zones` mostra prefixos |
 | CandidateRelay casa↔5G | 🟡 | Protocolo testado local. Entre redes reais não rodou |
+| Plasma reativo em rede real | 🟡 | Ciclo testado localmente entre nós virtuais; falta gerar carga >50 req/s num deploy real multi-nó |
 
 ### Próximos passos sugeridos
-- **PQC transport real** (implementar Transport trait TCP → KEM → yamux)
-- **Plasma reactive scaling** (réplicas automáticas conforme carga)
-- **Prometheus alerts** (alertmanager rules)
+- **Estresse prolongado** (1h+, 5 nós) validando auto-scaling sob carga sintética
 - **Nutrient ledger com consenso** (Raft/PBFT leve entre esporocarps)
 - **Growth Zones** com DHT overlay (distance XOR routing)
+- **Prometheus alerts** em produção (alertmanager + webhook do seed book)

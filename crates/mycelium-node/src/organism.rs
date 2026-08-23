@@ -6,7 +6,7 @@ use crate::store::{IonRecord, NodeStore, OrganismState, StoreError};
 use giggs::{Leaf, Plot};
 use inertia::{Flywheel, Momentum, Thrust, Vector};
 use isotope::{Atom, Nucleus, DEFAULT_RING_SIZE};
-use mycelium_core::{ContentId, Membrane, NodeId, Nutrient, Resources};
+use mycelium_core::{ContentId, FruitingBody, Membrane, NodeId, Nutrient, Resources};
 use mycelium_hyphae::{
     detect_global_ipv6, diagnose_membrane, env_assume_reachable, with_membrane_flag, HyphaEvent,
     HyphaeConfig, HyphaeNode, MailboxMessage, RelayAdvertisement, SeedBook, DEFAULT_DNS_SEED_NAME,
@@ -18,12 +18,12 @@ use mycelium_sporebank::{
     content_id_from_layer_dht_key, dht_key, layer_dht_key, SporeBank,
 };
 use mycelium_tropical::{MyceliumPhase, PhysarumNetwork};
-use plasma::{Cloud, Ion};
+use plasma::{Charge, Cloud, Ion};
 use singularity::{serve_horizon, EventHorizon, HorizonHandle, HorizonTable, Orbit};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thefield::{Proposal, SignalState};
 use tokio::sync::mpsc;
 use vacuum::{
@@ -133,6 +133,12 @@ pub struct Organism {
     assets: crate::assets::AssetRegistry,
     /// Nonce de transferência emitida (anti-replay).
     transfer_nonce: u64,
+    /// Réplicas remotas vivas por ion (anunciadas via IonReady).
+    ion_replica_peers: HashMap<String, Vec<NodeId>>,
+    /// Janelas consecutivas de carga zero por ion local (gatilho de recombine).
+    zero_load_windows: HashMap<String, u32>,
+    /// Cooldown do último IonOffer de auto-scaling por ion.
+    last_scaling_offer: HashMap<String, Instant>,
 }
 
 impl Organism {
@@ -336,6 +342,9 @@ impl Organism {
             ghost,
             assets,
             transfer_nonce: 0,
+            ion_replica_peers: HashMap::new(),
+            zero_load_windows: HashMap::new(),
+            last_scaling_offer: HashMap::new(),
         };
 
         for rec in records {
@@ -1250,6 +1259,17 @@ impl Organism {
                     return Ok(());
                 }
                 tracing::info!(%ion, %acceptor, "IonOffer aceito");
+                // Auto-scaling: o peer aceitou a réplica → envia Void + layers.
+                if self.chambers.contains_key(&ion) {
+                    match self.send_ion_migrate(&ion) {
+                        Ok(n) => tracing::info!(
+                            %ion, %acceptor, layers = n,
+                            "IonMigrate automático enviado (réplica brotando)"
+                        ),
+                        Err(e) => tracing::warn!(%ion, error = %e, "auto-migração falhou"),
+                    }
+                    self.zero_load_windows.remove(&ion);
+                }
             }
             Envelope::IonMigrate { ion, void, layers } => {
                 let layer_store = match vacuum::LayerStore::open(self.store.layers_dir()) {
@@ -1270,6 +1290,15 @@ impl Organism {
                     return Ok(());
                 }
                 let name = void.name.clone();
+                // Registra no Plasma para sense/scaling uniforme na réplica.
+                if self.cloud.get(&name).is_none() {
+                    if let Ok(chamber) = Chamber::suck_store(void.clone(), &layer_store, self.resources) {
+                        match self.cloud.inject(Ion::birth(&name, self.gland.node_id(), chamber)) {
+                            Ok(()) | Err(plasma::PlasmaError::AlreadyOrbiting(_)) => {}
+                            Err(e) => tracing::warn!(ion = %name, "cloud.inject falhou: {e}"),
+                        }
+                    }
+                }
                 match vacuum::ChamberProcess::fruit_void(
                     &self.mycelium_bin,
                     &self.store.chambers_dir(),
@@ -1309,6 +1338,10 @@ impl Organism {
                 if node == self.gland.node_id() {
                     return Ok(());
                 }
+                let peers = self.ion_replica_peers.entry(ion.clone()).or_default();
+                if !peers.contains(&node) {
+                    peers.push(node);
+                }
                 let host = format!("sporocarp.mycelium/{}", self.gland.node_id().short());
                 {
                     let mut table = self.horizon.write().unwrap();
@@ -1333,6 +1366,162 @@ impl Organism {
         }
         self.persist()?;
         Ok(())
+    }
+
+    /// Empacota Void + layers do ion local e envia `IonMigrate` pelas hifas.
+    ///
+    /// Usado pelo comando manual (`mycelium ion-migrate`) e pelo auto-scaling
+    /// do Plasma (quando um peer responde `IonAccept` a um `IonOffer`).
+    fn send_ion_migrate(&mut self, ion: &str) -> Result<usize, String> {
+        let chamber = match self.chambers.get(ion) {
+            Some(c) => c,
+            None => return Err(format!("ion `{ion}` não está neste nó")),
+        };
+        // Extrai Void do chamber spec
+        let void = Void {
+            name: ion.to_string(),
+            layers: chamber
+                .void_layers()
+                .iter()
+                .filter_map(|s| s.parse::<ContentId>().ok())
+                .collect(),
+            entrypoint: "chamber-serve".into(),
+        };
+        let layer_store = LayerStore::open(self.store.layers_dir())
+            .map_err(|e| format!("layer store indisponível: {e}"))?;
+        let mut layers_data = Vec::new();
+        for lid in &void.layers {
+            if let Some(bytes) = layer_store.get(lid) {
+                layers_data.push((*lid, bytes));
+            }
+        }
+        let n_layers = void.layers.len();
+        let env = Envelope::IonMigrate {
+            ion: ion.to_string(),
+            void,
+            layers: layers_data,
+        };
+        if let Ok(bytes) = env.encode() {
+            let _ = self.hyphae.broadcast_lattice(bytes);
+        }
+        Ok(n_layers)
+    }
+
+    /// Plasma reativo (tick de scaling): drena a carga observada pelo
+    /// Horizon, alimenta `Ion::sense` e decide — carga positiva brota
+    /// réplicas (IonOffer → IonAccept → IonMigrate → IonReady); carga zero
+    /// persistente recombina o Ion local quando outra réplica viva cobre.
+    fn plasma_scale_tick(&mut self) {
+        const WINDOW_SECS: u64 = 45;
+        const OFFER_COOLDOWN: Duration = Duration::from_secs(120);
+        const RECOMBINE_AFTER_WINDOWS: u32 = 3;
+
+        let counts = { self.horizon.write().unwrap().take_request_counts() };
+
+        // 1. Sense: carga por ion local vivo + janelas de ociosidade.
+        for name in self.chambers.keys().cloned().collect::<Vec<_>>() {
+            let requests = counts.get(&name).copied().unwrap_or(0);
+            let rps = requests / WINDOW_SECS.max(1);
+            if let Some(ion) = self.cloud.get_mut(&name) {
+                ion.sense(rps);
+            }
+            let windows = self.zero_load_windows.entry(name.clone()).or_insert(0);
+            *windows = if requests == 0 {
+                windows.saturating_add(1)
+            } else {
+                0
+            };
+        }
+
+        // 2. Carga positiva e réplicas abaixo do desejado → IonOffer (cooldown).
+        let now = Instant::now();
+        let mut offers: Vec<(String, Charge, u32, Vec<ContentId>)> = Vec::new();
+        for name in self.chambers.keys() {
+            let Some(ion) = self.cloud.get(name) else {
+                continue;
+            };
+            if ion.charge != Charge::Positive {
+                continue;
+            }
+            let remote = self
+                .ion_replica_peers
+                .get(name)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if 1 + remote >= ion.desired_replicas as usize {
+                continue; // réplicas suficientes já orbitam
+            }
+            let cooled = self
+                .last_scaling_offer
+                .get(name)
+                .map(|t| now.duration_since(*t) >= OFFER_COOLDOWN)
+                .unwrap_or(true);
+            if !cooled {
+                continue;
+            }
+            let Some(chamber) = self.chambers.get(name) else {
+                continue;
+            };
+            let layers = chamber
+                .void_layers()
+                .iter()
+                .filter_map(|s| s.parse::<ContentId>().ok())
+                .collect();
+            offers.push((name.clone(), ion.charge, ion.desired_replicas, layers));
+            self.last_scaling_offer.insert(name.clone(), now);
+        }
+        for (ion, charge, desired_replicas, layers) in offers {
+            let env = Envelope::IonOffer {
+                ion: ion.clone(),
+                host: self.gland.node_id(),
+                charge,
+                desired_replicas,
+                layers,
+            };
+            if let Ok(bytes) = env.encode() {
+                let _ = self.hyphae.broadcast_lattice(bytes);
+            }
+            tracing::info!(
+                %ion,
+                desired_replicas,
+                "plasma: carga positiva — IonOffer de réplica broadcast"
+            );
+        }
+
+        // 3. Ociosidade persistente com réplica remota viva → recombine.
+        let idle: Vec<String> = self
+            .zero_load_windows
+            .iter()
+            .filter(|(name, windows)| {
+                **windows >= RECOMBINE_AFTER_WINDOWS && self.chambers.contains_key(*name)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in idle {
+            let covered = self
+                .ion_replica_peers
+                .get(&name)
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+            if !covered {
+                continue; // última réplica viva — morrer apagaria o ion da rede
+            }
+            if let Some(mut ion) = self.cloud.remove(&name) {
+                ion.decompose();
+            }
+            if let Some(proc) = self.chambers.remove(&name) {
+                tracing::info!(
+                    ion = %name,
+                    upstream = %proc.upstream,
+                    "plasma: demanda zero persistente — Chamber recombinada (réplica remota cobre)"
+                );
+            }
+            self.horizon.write().unwrap().remove_ion(&name);
+            self.state.ions.retain(|r| r.name != name);
+            self.zero_load_windows.remove(&name);
+            self.last_scaling_offer.remove(&name);
+            let _ = self.persist();
+        }
     }
 
     fn handle_control(&mut self, req: Request) -> Response {
@@ -1571,39 +1760,13 @@ impl Organism {
                 Response::Ok { message: msg.trim().to_string() }
             }
             Request::IonMigrate { ion, target } => {
-                let ion_name = ion.clone();
-                let chamber = match self.chambers.get(&ion_name) {
-                    Some(c) => c,
-                    None => return Response::Err { message: format!("ion `{ion_name}` não está neste nó") },
-                };
-                // Extrai Void do chamber spec
-                let void = vacuum::Void {
-                    name: ion_name.clone(),
-                    layers: chamber.void_layers().iter().filter_map(|s| s.parse::<ContentId>().ok()).collect(),
-                    entrypoint: "chamber-serve".into(),
-                };
-                // Lê layers do LayerStore
-                let layer_store = match vacuum::LayerStore::open(self.store.layers_dir()) {
-                    Ok(s) => s,
-                    Err(_) => return Response::Err { message: "layer store indisponível".into() },
-                };
-                let mut layers_data = Vec::new();
-                for lid in &void.layers {
-                    if let Some(bytes) = layer_store.get(lid) {
-                        layers_data.push((*lid, bytes));
+                match self.send_ion_migrate(&ion) {
+                    Ok(n_layers) => {
+                        self.ion_hosts.insert(ion.clone(), target);
+                        Response::Ok { message: format!("ion `{ion}` Void + {n_layers} layers enviado para migração") }
                     }
+                    Err(message) => Response::Err { message },
                 }
-                let n_layers = void.layers.len();
-                let env = Envelope::IonMigrate {
-                    ion: ion_name.clone(),
-                    void,
-                    layers: layers_data,
-                };
-                if let Ok(bytes) = env.encode() {
-                    let _ = self.hyphae.broadcast_lattice(bytes);
-                }
-                self.ion_hosts.insert(ion_name.clone(), target);
-                Response::Ok { message: format!("ion `{ion_name}` Void + {n_layers} layers enviado para migração") }
             }
             Request::Zones => {
                 let mut msg = String::new();
@@ -2050,6 +2213,7 @@ impl Organism {
         let mut metrics_tick = tokio::time::interval(Duration::from_secs(30));
         let mut balance_tick = tokio::time::interval(Duration::from_secs(60));
         let mut zone_tick = tokio::time::interval(Duration::from_secs(120));
+        let mut scale_tick = tokio::time::interval(Duration::from_secs(45));
         // Primeiro tick imediato já foi coberto na germinação; atrasa o próximo.
         seed_tick.tick().await;
         // DuckDNS: espera um pouco para ter listen addrs.
@@ -2059,6 +2223,7 @@ impl Organism {
         metrics_tick.tick().await;
         balance_tick.tick().await;
         zone_tick.tick().await;
+        scale_tick.tick().await;
 
         if self.sporocarp {
             tracing::info!("sporocarp ativo — relay + DNS (se DUCKDNS_*) — sem UPnP");
@@ -2173,6 +2338,44 @@ impl Organism {
                     prom.push_str(&format!("# HELP mycelium_uptime_segundos Uptime do ledger (heartbeat)\n"));
                     prom.push_str(&format!("# TYPE mycelium_uptime_segundos counter\n"));
                     prom.push_str(&format!("mycelium_uptime_hours 1\n"));
+                    // Plasma por-ion: carga, réplicas desejadas/remotas e ociosidade.
+                    let mut ion_charge = String::new();
+                    let mut ion_desired = String::new();
+                    let mut ion_remote = String::new();
+                    for name in self.cloud.names() {
+                        let Some(ion) = self.cloud.get(name) else { continue };
+                        let charge_val: i8 = match ion.charge {
+                            Charge::Positive => 1,
+                            Charge::Neutral => 0,
+                            Charge::Negative => -1,
+                        };
+                        ion_charge.push_str(&format!(
+                            "mycelium_ion_charge{{ion=\"{name}\"}} {charge_val}\n"
+                        ));
+                        ion_desired.push_str(&format!(
+                            "mycelium_ion_desired_replicas{{ion=\"{name}\"}} {}\n",
+                            ion.desired_replicas
+                        ));
+                        let remote = self
+                            .ion_replica_peers
+                            .get(name)
+                            .map(|v| v.len())
+                            .unwrap_or(0);
+                        ion_remote.push_str(&format!(
+                            "mycelium_ion_remote_replicas{{ion=\"{name}\"}} {remote}\n"
+                        ));
+                    }
+                    if !ion_charge.is_empty() {
+                        prom.push_str("# HELP mycelium_ion_charge Carga do ion (-1 negativa, 0 neutra, 1 positiva)\n");
+                        prom.push_str("# TYPE mycelium_ion_charge gauge\n");
+                        prom.push_str(&ion_charge);
+                        prom.push_str("# HELP mycelium_ion_desired_replicas Réplicas desejadas sob carga observada\n");
+                        prom.push_str("# TYPE mycelium_ion_desired_replicas gauge\n");
+                        prom.push_str(&ion_desired);
+                        prom.push_str("# HELP mycelium_ion_remote_replicas Réplicas remotas vivas conhecidas (IonReady)\n");
+                        prom.push_str("# TYPE mycelium_ion_remote_replicas gauge\n");
+                        prom.push_str(&ion_remote);
+                    }
                     let mut table = self.horizon.write().unwrap();
                     table.set_metrics(prom);
                 }
@@ -2207,6 +2410,10 @@ impl Organism {
                             let _ = self.hyphae.broadcast_lattice(bytes);
                         }
                     }
+                }
+
+                _ = scale_tick.tick() => {
+                    self.plasma_scale_tick();
                 }
 
                 _ = heartbeat.tick() => {

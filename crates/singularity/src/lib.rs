@@ -56,6 +56,9 @@ pub struct EventHorizon {
     metrics: String,
     /// Caminho do home do nó (para acessar SporeBank nas rotas CDN).
     home: Option<PathBuf>,
+    /// Requisições proxyadas por ion na janela corrente (drenadas pelo
+    /// organismo a cada tick de scaling → Plasma `sense`).
+    ion_requests: HashMap<String, u64>,
 }
 
 impl EventHorizon {
@@ -130,6 +133,17 @@ impl EventHorizon {
         &self.metrics
     }
 
+    /// Conta uma requisição proxyada para o ion (chamado pelo rizomorfo).
+    pub fn note_request(&mut self, ion: &str) {
+        *self.ion_requests.entry(ion.to_string()).or_insert(0) += 1;
+    }
+
+    /// Drena os contadores da janela (zera) — o organismo converte em
+    /// req/s e alimenta `Ion::sense` do Plasma.
+    pub fn take_request_counts(&mut self) -> HashMap<String, u64> {
+        std::mem::take(&mut self.ion_requests)
+    }
+
     /// Define o snapshot de métricas (chamado pelo organismo periodicamente).
     pub fn set_metrics(&mut self, snapshot: String) {
         self.metrics = snapshot;
@@ -196,5 +210,20 @@ mod tests {
             horizon.route("app.mycelium"),
             Err(SingularityError::NoOrbit(_))
         ));
+    }
+
+    #[test]
+    fn request_counters_drain_and_reset() {
+        let mut horizon = EventHorizon::new();
+        horizon.note_request("webapp");
+        horizon.note_request("webapp");
+        horizon.note_request("api");
+
+        let counts = horizon.take_request_counts();
+        assert_eq!(counts.get("webapp"), Some(&2));
+        assert_eq!(counts.get("api"), Some(&1));
+
+        // Janela drenada: próxima leitura vem vazia.
+        assert!(horizon.take_request_counts().is_empty());
     }
 }
