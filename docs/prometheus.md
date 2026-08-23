@@ -8,6 +8,16 @@ GET /metrics  →  text/plain; version=0.0.4
 
 Disponível no Event Horizon (porta 7474 por default).
 
+O rate-limit da fronteira é configurável por ambiente (default **120
+req/min por IP**):
+
+```bash
+MYCELIUM_RATE_MAX=100000            # teto de requests por janela/IP
+MYCELIUM_RATE_WINDOW_SECS=60        # tamanho da janela
+```
+
+Útil para benchmarks e carga sintética local (ex.: `scripts/scaling-demo.sh`).
+
 ## Métricas exportadas
 
 | Métrica | Tipo | Descrição |

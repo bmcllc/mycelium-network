@@ -37,26 +37,54 @@ impl Drop for HorizonHandle {
 }
 
 /// Janela e teto do rate-limit por IP (requests).
+/// Configuráveis via `MYCELIUM_RATE_MAX` e `MYCELIUM_RATE_WINDOW_SECS`
+/// (ex.: benchmarks/testes com carga sintética local).
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const RATE_MAX: u32 = 120;
+
+struct RateConfig {
+    max: u32,
+    window: Duration,
+}
 
 fn rate_table() -> &'static Mutex<HashMap<IpAddr, (Instant, u32)>> {
     static TABLE: OnceLock<Mutex<HashMap<IpAddr, (Instant, u32)>>> = OnceLock::new();
     TABLE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn rate_config() -> &'static RateConfig {
+    static CONFIG: OnceLock<RateConfig> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let max = std::env::var("MYCELIUM_RATE_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(RATE_MAX);
+        let window_secs = std::env::var("MYCELIUM_RATE_WINDOW_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(RATE_WINDOW.as_secs());
+        RateConfig {
+            max,
+            window: Duration::from_secs(window_secs),
+        }
+    })
+}
+
 fn allow_ip(ip: IpAddr) -> bool {
+    let config = rate_config();
     let mut guard = match rate_table().lock() {
         Ok(g) => g,
         Err(_) => return true,
     };
     let now = Instant::now();
     let entry = guard.entry(ip).or_insert((now, 0));
-    if now.duration_since(entry.0) > RATE_WINDOW {
+    if now.duration_since(entry.0) > config.window {
         *entry = (now, 1);
         return true;
     }
-    if entry.1 >= RATE_MAX {
+    if entry.1 >= config.max {
         return false;
     }
     entry.1 += 1;
