@@ -20,14 +20,22 @@ o navegador é o terminal, o micélio é o ferro.
 | Rodar de graça, pagar em nutrientes | Vouchers ATP por hospedagem/janela; Inertia paga computação |
 | Estado que te segue | GhostID + Nucleus + Spore Bank (sessão itinerante) |
 
-## Encaixe das marcas-irmãs
+## Constelação Mycelium Network
 
+- **ERGOT** — o OS universal sobre o micélio
 - **RIZOMORFO** = camada de transporte da rede: o stack que atravessa
   CGNAT/5G/firewall sem pedir licença (Nostr transport, QEL, CandidateRelay,
   DistanceBridge). *"A rede que não pede IP."*
 - **REVENANT** = pipeline de ressurreição de máquinas mortas: `resurrect`
   firmware.bin/ROM/ISO → análise B.A.S.E. → Plot → Ion executável.
   *"Nenhum hardware morre de verdade."*
+- **B.A.S.E.** = a Forja (Behavioral ASIC Synthesis Engine): descobrir,
+  destravar e controlar hardware/software
+- **specterprobe** = instrumento de sondagem/destravamento físico da Forja
+  (`Behavioral ASIC Synthesis Engine/specterprobe/`) — entra no capítulo
+  REVENANT quando o aparelho desbloquear
+- **ET-COSMIC** = ponte PQC/tropical (ML-KEM-1024, max-plus) portada para os
+  crates `mycelium-pqc` / `mycelium-tropical` / `mycelium-distancebridge`
 
 ## Tecnologias novas a cultivar (roadmap ErgotOS)
 
