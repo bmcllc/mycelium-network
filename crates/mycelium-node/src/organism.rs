@@ -1268,7 +1268,12 @@ impl Organism {
                                 %ion, %acceptor, layers = n,
                                 "IonMigrate automático enviado (réplica brotando)"
                             );
-                            self.issue_hosting_voucher(&ion, acceptor);
+                            self.issue_hosting_voucher(
+                                &ion,
+                                acceptor,
+                                Self::HOSTING_REWARD_ATP,
+                                "réplica",
+                            );
                         }
                         Err(e) => tracing::warn!(%ion, error = %e, "auto-migração falhou"),
                     }
@@ -1429,20 +1434,22 @@ impl Organism {
 
     /// Recompensa fixa (ATP) paga por réplica nascida sob demanda.
     const HOSTING_REWARD_ATP: u64 = 5;
+    /// Tip por janela de scaling com tráfego para cada réplica remota viva.
+    const HOSTING_TIP_ATP: u64 = 1;
 
-    /// Emite e assina um voucher de hospedagem ao peer que frutificou uma
-    /// réplica de um ion deste nó — debita o pagador e broadcast `VoucherRedeem`.
-    fn issue_hosting_voucher(&mut self, ion: &str, payee: NodeId) {
+    /// Emite e assina um voucher de hospedagem ao peer que serve este ion
+    /// — debita o pagador e broadcast `VoucherRedeem`.
+    fn issue_hosting_voucher(&mut self, ion: &str, payee: NodeId, amount: u64, motivo: &str) {
         if payee == self.gland.node_id() {
             return;
         }
-        if self.ledger.balance(Nutrient::Atp) < Self::HOSTING_REWARD_ATP {
+        if self.ledger.balance(Nutrient::Atp) < amount {
             tracing::debug!(ion = %ion, %payee, "sem ATP para voucher de hospedagem");
             return;
         }
         if let Err(e) = self.ledger.metabolize(
             Nutrient::Atp,
-            Self::HOSTING_REWARD_ATP,
+            amount,
             Some(payee),
             format!("hospedagem:{ion}"),
         ) {
@@ -1457,8 +1464,8 @@ impl Organism {
             payer: self.gland.node_id(),
             payee,
             nutrient: Nutrient::Atp,
-            amount: Self::HOSTING_REWARD_ATP,
-            memo: format!("hospedagem da réplica `{ion}`"),
+            amount,
+            memo: format!("{motivo} `{ion}`"),
             clock,
             payer_key: self.gland.verifying_key().to_bytes(),
             signature: vec![],
@@ -1473,7 +1480,8 @@ impl Organism {
         tracing::info!(
             ion = %ion,
             %payee,
-            atp = Self::HOSTING_REWARD_ATP,
+            atp = amount,
+            motivo = %motivo,
             "voucher de hospedagem emitido"
         );
     }
@@ -1592,6 +1600,25 @@ impl Organism {
             self.zero_load_windows.remove(&name);
             self.last_scaling_offer.remove(&name);
             let _ = self.persist();
+        }
+
+        // 4. Hospedagem contínua: enquanto há tráfego na janela, cada
+        //    réplica remota viva recebe um tip — a renda acompanha a demanda.
+        for (name, peers) in self.ion_replica_peers.clone() {
+            if counts.get(&name).copied().unwrap_or(0) == 0 {
+                continue; // janela ociosa não rende
+            }
+            if !self.chambers.contains_key(&name) {
+                continue;
+            }
+            for peer in peers {
+                self.issue_hosting_voucher(
+                    &name,
+                    peer,
+                    Self::HOSTING_TIP_ATP,
+                    "janela de tráfego",
+                );
+            }
         }
     }
 

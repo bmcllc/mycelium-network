@@ -2812,6 +2812,7 @@ name = "mycelium-nutrients"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "ed25519-dalek",
  "mycelium-core",
  "serde",
  "serde_json",

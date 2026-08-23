@@ -53,15 +53,15 @@ echo "plot: $CID"
 sleep 4
 echo "ion no A: $(curl -s "http://127.0.0.1:$PORT_A/webapp/" | head -c 80)"
 
-echo "== rajada de carga (~50s, acima do limiar de 50 req/s) =="
+echo "== rajada de carga (~105s, cobre 2 janelas de scaling) =="
 ( while true; do seq 1 400 | xargs -P 40 -I{} curl -s -o /dev/null "http://127.0.0.1:$PORT_A/webapp/"; done ) &
 LOOP=$!
-sleep 50
+sleep 105
 kill "$LOOP" 2>/dev/null; wait "$LOOP" 2>/dev/null || true
 
-echo "== observando o ciclo do Plasma (até 120s) =="
+echo "== observando o ciclo do Plasma (até 180s) =="
 REPLICA_BORN=0
-for i in $(seq 1 60); do
+for i in $(seq 1 90); do
   if grep -q "IonReady\|frutificada" target/scale-b.log 2>/dev/null; then REPLICA_BORN=1; break; fi
   sleep 2
 done
