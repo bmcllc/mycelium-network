@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ETΞRNET — Soberania Digital</title>
+  <meta name="description" content="Computação quântico-relativística soberana. Sem servidores. Sem identidade. Sem rastro." />
+  <link rel="manifest" href="manifest.json" />
+  <style>
+    :root { --void-black: #0a0a0f; --quantum-blue: #00f0ff; --sov-gold: #ffd700; }
+    body { background: var(--void-black); color: #fff; font-family: 'Courier New', monospace; margin: 0; padding: 2rem; }
+    .hero { max-width: 800px; margin: 4rem auto; text-align: center; }
+    h1 { font-size: 3rem; color: var(--quantum-blue); text-shadow: 0 0 20px var(--quantum-blue); }
+    .cta { background: var(--sov-gold); color: #000; padding: 1rem 2rem; border: none; font-size: 1.2rem; cursor: pointer; margin-top: 2rem; }
+    .status { margin-top: 2rem; font-size: 0.9rem; opacity: 0.7; }
+    .badge { display: inline-block; padding: 0.5rem 1rem; border: 1px solid var(--quantum-blue); margin: 0.5rem; }
+  </style>
+</head>
+<body>
+  <div class="hero">
+    <h1>ETΞRNET / VOID-COSMIC</h1>
+    <p>Computação Quântica-Relativística Soberana</p>
+    <p>Sem servidores. Sem identidade. Sem rastro.</p>
+    
+    <div class="badges">
+      <span class="badge">🔐 PQC ML-KEM-1024</span>
+      <span class="badge">⚡ Lightning Network</span>
+      <span class="badge">🌐 Nostr Mesh</span>
+      <span class="badge">🎯 vHGPU Distribuída</span>
+    </div>
+    
+    <button class="cta" onclick="joinMesh()">JUNTAR-SE À MESH</button>
+    
+    <div class="status" id="node-status">
+      <p>Aguardando conexão...</p>
+      <p style="font-size: 0.8rem; margin-top: 1rem;">
+        ⚠️ GUERRA DECLARADA à indústria de software tradicional.<br/>
+        Leia a <a href="https://github.com/et-cosmic/ET-COSMIC/blob/main/DOC/CARTA-DE-GUERRA.md" style="color: var(--quantum-blue);">Carta de Guerra</a>
+      </p>
+    </div>
+  </div>
+
+  <script type="module">
+    // Importar motor P2P (build bundle em produção)
+    let initVoidNode, getNodeStatus;
+    
+    try {
+      const core = await import('./et-core.js');
+      initVoidNode = core.initVoidNode;
+      getNodeStatus = core.getNodeStatus;
+    } catch (e) {
+      console.warn('[INFO] et-core.js não disponível — modo estático');
+    }
+    
+    window.joinMesh = async () => {
+      if (!initVoidNode) {
+        alert('Motor P2P ainda não carregado. Aguarde...');
+        return;
+      }
+      
+      const btn = document.querySelector('.cta');
+      btn.textContent = 'INICIALIZANDO...';
+      btn.disabled = true;
+      
+      try {
+        await initVoidNode();
+        updateStatus();
+        btn.textContent = 'NÓ ATIVO ✓';
+        btn.style.background = '#00f0ff';
+      } catch (err) {
+        console.error(err);
+        btn.textContent = 'FALHA — TENTAR NOVAMENTE';
+        btn.disabled = false;
+        btn.style.background = '#ff4444';
+      }
+    };
+
+    function updateStatus() {
+      if (!getNodeStatus) return;
+      
+      const status = getNodeStatus();
+      document.getElementById('node-status').innerHTML = `
+        <p><strong>Nó Ativo:</strong> ${status.nodeId?.slice(0, 16)}...</p>
+        <p><strong>Peers Conectados:</strong> ${status.peers}</p>
+        <p><strong>Tráfego Compartilhado:</strong> ${(status.bytesShared / 1024 / 1024).toFixed(2)} MB</p>
+        <p><strong>Créditos SOV:</strong> ${status.sovCredits}</p>
+        <p><strong>Uptime:</strong> ${status.uptimeHours} horas</p>
+        <p style="margin-top: 1rem; color: var(--sov-gold);">
+          🎉 Você agora é parte da resistência! Cada byte compartilhado enfraquece a indústria.
+        </p>
+      `;
+    }
+    
+    // Auto-check se já está rodando
+    if (getNodeStatus && window.location.hostname.includes('github.io')) {
+      setTimeout(() => {
+        const status = getNodeStatus();
+        if (status.nodeId) updateStatus();
+      }, 5000);
+    }
+  </script>
+  
+  <!-- ETΞRNET Symbiosis Snippet (para outros sites incorporarem) -->
+  <!-- 
+  <script async src="https://et-cosmic.github.io/et-core.js" 
+          data-sov-wallet="npub1..." 
+          data-content-hash="QmX7..."></script>
+  -->
+</body>
+</html>

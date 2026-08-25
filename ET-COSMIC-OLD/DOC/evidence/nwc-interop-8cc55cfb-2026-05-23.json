@@ -1,0 +1,48 @@
+{
+  "walletPubKey": "8cc55cfbebc1514cf37a89df34c9ece33a5f79bbac0e56d1925dfb365f504c75",
+  "relay": "ws://127.0.0.1:7777",
+  "startedAt": 1779580218577,
+  "finishedAt": 1779580338899,
+  "durationMs": 120322,
+  "checks": [
+    {
+      "id": "connect",
+      "status": "pass",
+      "durationMs": 55.85024700000008,
+      "details": "Conectado em ws://127.0.0.1:7777"
+    },
+    {
+      "id": "get_info",
+      "status": "fail",
+      "durationMs": 30037.409496,
+      "details": "NWC request timeout: get_info (responses=0, parse_failures=0)",
+      "errorCode": "TIMEOUT"
+    },
+    {
+      "id": "get_balance",
+      "status": "fail",
+      "durationMs": 30012.151125000004,
+      "details": "NWC request timeout: get_balance (responses=0, parse_failures=0)",
+      "errorCode": "TIMEOUT"
+    },
+    {
+      "id": "list_transactions",
+      "status": "fail",
+      "durationMs": 30107.957343999995,
+      "details": "NWC request timeout: list_transactions (responses=0, parse_failures=0)",
+      "errorCode": "TIMEOUT"
+    },
+    {
+      "id": "make_invoice",
+      "status": "fail",
+      "durationMs": 30108.178505999997,
+      "details": "NWC request timeout: make_invoice (responses=0, parse_failures=0)",
+      "errorCode": "TIMEOUT"
+    }
+  ],
+  "summary": {
+    "passed": 1,
+    "failed": 4,
+    "skipped": 0
+  }
+}

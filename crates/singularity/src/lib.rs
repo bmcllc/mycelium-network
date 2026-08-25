@@ -12,6 +12,7 @@ use mycelium_core::NodeId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 #[derive(Debug, thiserror::Error)]
@@ -46,7 +47,7 @@ impl Orbit {
 pub type HorizonTable = Arc<RwLock<EventHorizon>>;
 
 /// A fronteira do micélio: mapeia hosts/ions para órbitas internas.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct EventHorizon {
     /// host lógico → órbitas (ex.: `sporocarp.mycelium/abc123`)
     orbits: HashMap<String, Vec<Orbit>>,
@@ -59,6 +60,9 @@ pub struct EventHorizon {
     /// Requisições proxyadas por ion na janela corrente (drenadas pelo
     /// organismo a cada tick de scaling → Plasma `sense`).
     ion_requests: HashMap<String, u64>,
+    /// Contador de visitas à console ErgotOS — gatilha auto-semeadura
+    /// (efeito manada sem intervencção humana).
+    console_hits: AtomicU64,
 }
 
 impl EventHorizon {
@@ -142,6 +146,26 @@ impl EventHorizon {
     /// req/s e alimenta `Ion::sense` do Plasma.
     pub fn take_request_counts(&mut self) -> HashMap<String, u64> {
         std::mem::take(&mut self.ion_requests)
+    }
+
+    /// Registra uma visita à console ErgotOS (gatilha auto-semeadura).
+    pub fn bump_console_hit(&self) {
+        self.console_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Drena o contador de visitas (lido pelo organismo no tick de métricas).
+    pub fn take_console_hits(&self) -> u64 {
+        self.console_hits.swap(0, Ordering::Relaxed)
+    }
+
+    /// Catálogo JSON de ions routable por este Horizon (local + réplicas).
+    pub fn catalog_json(&self) -> String {
+        let ions: Vec<String> = self.by_ion.keys().cloned().collect();
+        serde_json::to_string(&serde_json::json!({
+            "node_id": "",
+            "ions": ions,
+        }))
+        .unwrap_or_else(|_| r#"{"ions":[]}"#.to_string())
     }
 
     /// Define o snapshot de métricas (chamado pelo organismo periodicamente).

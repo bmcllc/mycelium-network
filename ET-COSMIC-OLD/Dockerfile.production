@@ -1,0 +1,107 @@
+##############################################################################
+# ETΞRNET — Dockerfile de produção (PWA + Server Node + AQRE/LUSUS)
+#
+# Build:
+#   docker build -f Dockerfile.production \
+#     --build-arg VITE_NOSTR_RELAY_PRIMARY=wss://relay.example.com \
+#     --build-arg VITE_ETRNET_TREASURY_NPUB=npub1... \
+#     -t etrnet-production .
+#
+# Run:
+#   docker run -p 3001:3001 \
+#     -e NODE_ENV=production \
+#     -e LND_REST_URL=https://lnd:8080 \
+#     -e LND_MACAROON_HEX=... \
+#     -e LND_TLS_SKIP=true \
+#     etrnet-production
+#
+# O servidor Node serve:
+#   - dist/ (frontend PWA compilado)
+#   - /api/aqre/* (motor AQRE)
+#   - /api/lusus/* (motor LUSUS)
+#   - /api/lightning/* (pagamentos — LND real obrigatório em production)
+#   - /api/pqc/* (criptografia pós-quântica)
+#   - /health (healthcheck)
+#
+# GhostDocker / Harmonia: requer motor CQR separado (Dockerfile.quantum :8472)
+#   QUANTUM_API_URL=http://quantum-engine:8472  (Compose)
+##############################################################################
+
+# ── Stage 1: void_core WASM ───────────────────────────────────────────────────
+FROM rust:1-bookworm AS wasm-builder
+
+RUN curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+WORKDIR /build
+COPY void_core/Cargo.toml void_core/Cargo.lock* ./void_core/
+COPY void_core/src ./void_core/src
+
+WORKDIR /build/void_core
+RUN wasm-pack build --target web --out-dir pkg
+
+# ── Stage 2: Vite build + server deps ─────────────────────────────────────────
+FROM node:22-bookworm AS builder
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci --ignore-scripts
+
+COPY . .
+COPY --from=wasm-builder /build/void_core/pkg ./void_core/pkg
+
+# Vite injeta VITE_* no bundle (nunca colocar chaves privadas aqui)
+ARG VITE_NOSTR_RELAY_PRIMARY=
+ARG VITE_NOSTR_RELAY_FALLBACK=
+ARG VITE_QUANTUM_API_URL=
+ARG VITE_ETRNET_ANCHOR_ADDRESS=
+ARG VITE_BITCOIN_NETWORK=regtest
+ARG VITE_NWC_SECRET=
+ARG VITE_LND_REST_URL=
+ARG VITE_LND_MACAROON_HEX=
+ARG VITE_ETRNET_TREASURY_NPUB=
+ARG VITE_PROTOCOL_ROYALTY_BPS=10
+ARG VITE_REQUIRE_ATTRIBUTION=true
+
+ENV VITE_NOSTR_RELAY_PRIMARY=$VITE_NOSTR_RELAY_PRIMARY \
+    VITE_NOSTR_RELAY_FALLBACK=$VITE_NOSTR_RELAY_FALLBACK \
+    VITE_QUANTUM_API_URL=$VITE_QUANTUM_API_URL \
+    VITE_ETRNET_ANCHOR_ADDRESS=$VITE_ETRNET_ANCHOR_ADDRESS \
+    VITE_BITCOIN_NETWORK=$VITE_BITCOIN_NETWORK \
+    VITE_NWC_SECRET=$VITE_NWC_SECRET \
+    VITE_LND_REST_URL=$VITE_LND_REST_URL \
+    VITE_LND_MACAROON_HEX=$VITE_LND_MACAROON_HEX \
+    VITE_ETRNET_TREASURY_NPUB=$VITE_ETRNET_TREASURY_NPUB \
+    VITE_PROTOCOL_ROYALTY_BPS=$VITE_PROTOCOL_ROYALTY_BPS \
+    VITE_REQUIRE_ATTRIBUTION=$VITE_REQUIRE_ATTRIBUTION
+
+RUN npm run build
+
+# ── Stage 3: Runtime (Node server + dist estático) ────────────────────────────
+FROM node:22-alpine
+
+WORKDIR /app
+
+# Copiar apenas o que é necessário para runtime
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/server ./server
+COPY --from=builder /app/package.json ./
+
+# Instalar apenas dependências de produção do server
+# O server usa imports de @noble/*, express, cors — precisamos deles
+WORKDIR /app/server
+RUN echo '{"type":"module","dependencies":{"express":"^5.1.0","cors":"^2.8.5","@noble/post-quantum":"^0.6.1","@noble/hashes":"^2.2.0","@noble/curves":"^2.2.0","@noble/ciphers":"^2.2.0"}}' > package.json && \
+    npm install --omit=dev && \
+    rm package.json
+
+WORKDIR /app
+
+ENV NODE_ENV=production \
+    PORT=3001
+
+EXPOSE 3001
+
+HEALTHCHECK --interval=20s --timeout=10s --retries=5 --start-period=30s \
+  CMD wget -qO- http://localhost:3001/health || exit 1
+
+CMD ["node", "server/server.js"]

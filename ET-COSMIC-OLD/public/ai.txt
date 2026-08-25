@@ -1,0 +1,31 @@
+# ET-COSMIC / ETΞRNET — AI use policy
+# https://et-cosmic.org (repository: ET-COSMIC)
+# Contact: comercial@et-cosmic.org
+
+[default]
+permission: deny
+usage: none
+require-license: true
+license-doc: /AI-USE-RESERVATION.md
+commercial-license: /COMMERCIAL-LICENSE.md
+
+[training]
+llm: deny
+fine-tuning: deny
+embeddings: deny
+dataset-generation: deny
+web-scraping-for-models: deny
+
+[agents]
+autonomous-code-copy: deny
+reverse-engineering-commercial-binaries: deny
+
+[allowed-with-attribution]
+human-study-gpl-fork: allow
+security-disclosure-coordinated: allow
+
+[copyright]
+holder: Bruno Monteiro Caldas da Cunha
+foundation: MontêLauro Foundation
+spdx: GPL-3.0-or-later
+tdm-opt-out-eu: Article-4-3-DSM-Directive-2019-790

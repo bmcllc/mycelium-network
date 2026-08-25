@@ -1,0 +1,11 @@
+# Gateway HTTPS → quantum-engine (VPS / Compose profile quantum)
+# URL no telemóvel: https://<IP-VPS>:9443  (tls internal — aceitar certificado no browser uma vez)
+
+{
+  auto_https disable_redirects
+}
+
+:443 {
+  tls internal
+  reverse_proxy {$CQR_UPSTREAM:quantum-engine:8472}
+}

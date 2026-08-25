@@ -1,0 +1,175 @@
+# GitLab CI — build PWA + GitLab Pages (repo privado OK)
+#
+# URL: https://<namespace>.gitlab.io/<project>/
+# Docs: docs/GITLAB-PAGES-HOSTING.md
+
+stages:
+  - test
+  - build
+
+variables:
+  GIT_DEPTH: "1"
+  DEBIAN_FRONTEND: noninteractive
+  CARGO_HOME: "${CI_PROJECT_DIR}/.cargo"
+  RUSTUP_HOME: "${CI_PROJECT_DIR}/.rustup"
+
+cache:
+  key: "${CI_COMMIT_REF_SLUG}-deps-v2"
+  paths:
+    - node_modules/
+    - void_core/target/
+    - .cargo/
+    - .rustup/
+
+.gitlab-wasm-setup: &wasm_setup
+  - apt-get update -qq && apt-get install -y -qq curl build-essential pkg-config libssl-dev clang llvm
+  - |
+    export PATH="${CARGO_HOME}/bin:${PATH}"
+    if [ ! -x "${CARGO_HOME}/bin/rustc" ]; then
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
+    fi
+    rustup target add wasm32-unknown-unknown
+    if [ ! -x "${CARGO_HOME}/bin/wasm-pack" ]; then
+      curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+    fi
+    rustc --version
+    wasm-pack --version
+
+test:
+  stage: test
+  image: node:22-bookworm
+  timeout: 10m
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+  cache:
+    key: "${CI_COMMIT_REF_SLUG}-test-deps"
+    paths:
+      - node_modules/
+  script:
+    - node --version
+    # Stub void_core/pkg para que npm ci funcione sem Rust/WASM
+    - mkdir -p void_core/pkg
+    - |
+      if [ ! -f void_core/pkg/package.json ]; then
+        cat > void_core/pkg/package.json <<'STUBPKG'
+      { "name": "void_core", "version": "0.0.0-stub", "type": "module", "main": "void_core.js" }
+      STUBPKG
+        cat > void_core/pkg/void_core.js <<'STUBJS'
+      export default async function init() {}
+      export function derive_ghost_id() { return { handle: "", public_key: new Uint8Array(32) }; }
+      export function init_void_core() {}
+      export function create_pedersen_commitment() { return { commitment: new Uint8Array(32), blinding_factor: new Uint8Array(32) }; }
+      export function create_balance_proof() { return new Uint8Array(32); }
+      export function create_range_proof() { return { proof: new Uint8Array(64), commitment: new Uint8Array(32) }; }
+      export function verify_range_proof() { return true; }
+      export function create_hash_chronicle() { return { event_hash: new Uint8Array(32) }; }
+      export function aggregate_zk_proofs() { return { merkle_root: new Uint8Array(32), proof_count: 1, compressed_size: 128 }; }
+      export function license_compute_device_id() { return new Uint8Array(32); }
+      export function license_verify_handshake() { return { ok: true, device_id_hex: "", reason: "ok" }; }
+      export function license_build_payload() { return new Uint8Array(121); }
+      export function seal_qel_shard() { return new Uint8Array(); }
+      export function open_qel_shard() { return new Uint8Array(); }
+      export function ml_kem_keygen() { return { publicKey: new Uint8Array(), secretKey: new Uint8Array() }; }
+      export function ml_kem_encapsulate() { return { ciphertext: new Uint8Array(), sharedSecret: new Uint8Array() }; }
+      export function ml_kem_decapsulate() { return new Uint8Array(); }
+      export function ml_dsa_keygen() { return { publicKey: new Uint8Array(), secretKey: new Uint8Array() }; }
+      export function ml_dsa_sign() { return new Uint8Array(); }
+      export function ml_dsa_verify() { return true; }
+      export function compute_pow_hash() { return ""; }
+      export function verify_pow_hash() { return true; }
+      export function sha3_hash() { return new Uint8Array(); }
+      export function generate_zk_proof() { return new Uint8Array(); }
+      export function verify_zk_proof() { return true; }
+      export function compress_state() { return new Uint8Array(); }
+      export function decompress_state() { return new Uint8Array(); }
+      STUBJS
+        cat > void_core/pkg/void_core.d.ts <<'STUBDTS'
+      declare module "void_core" {
+        export default function init(): Promise<void>;
+        export function derive_ghost_id(entropy: Uint8Array): { handle: string; public_key: Uint8Array };
+        export function init_void_core(): void;
+        export function create_pedersen_commitment(value: bigint, blinding?: Uint8Array): { commitment: Uint8Array; blinding_factor: Uint8Array };
+        export function create_balance_proof(inputs: Uint8Array, outputs: Uint8Array): Uint8Array;
+        export function create_range_proof(value: bigint, blinding: Uint8Array): { proof: Uint8Array; commitment: Uint8Array };
+        export function verify_range_proof(proof: Uint8Array, commitment: Uint8Array): boolean;
+        export function create_hash_chronicle(payload: Uint8Array, parents: Uint8Array): { event_hash: Uint8Array };
+        export function aggregate_zk_proofs(data: Uint8Array, size?: number): { merkle_root: Uint8Array; proof_count: number; compressed_size: number };
+        export function license_compute_device_id(entropy: Uint8Array, sku: string): Uint8Array;
+        export function license_verify_handshake(vendorPk: Uint8Array, deviceEntropy: Uint8Array, sku: string, payload: Uint8Array, signature: Uint8Array, timestamp: bigint): { ok: boolean; device_id_hex: string; reason: string };
+        export function license_build_payload(...args: unknown[]): Uint8Array;
+        export function seal_qel_shard(...args: unknown[]): Uint8Array;
+        export function open_qel_shard(...args: unknown[]): Uint8Array;
+        export function ml_kem_keygen(): { publicKey: Uint8Array; secretKey: Uint8Array };
+        export function ml_kem_encapsulate(pk: Uint8Array): { ciphertext: Uint8Array; sharedSecret: Uint8Array };
+        export function ml_kem_decapsulate(ct: Uint8Array, sk: Uint8Array): Uint8Array;
+        export function ml_dsa_keygen(): { publicKey: Uint8Array; secretKey: Uint8Array };
+        export function ml_dsa_sign(msg: Uint8Array, sk: Uint8Array): Uint8Array;
+        export function ml_dsa_verify(msg: Uint8Array, sig: Uint8Array, pk: Uint8Array): boolean;
+        export function compute_pow_hash(input: string): string;
+        export function verify_pow_hash(input: string, target: string): boolean;
+        export function sha3_hash(data: Uint8Array): Uint8Array;
+        export function parse_bolt11(bolt11: string): string;
+        export function validate_bolt11(bolt11: string): boolean;
+        export function generate_zk_proof(...args: unknown[]): Uint8Array;
+        export function verify_zk_proof(...args: unknown[]): boolean;
+        export function compress_state(...args: unknown[]): Uint8Array;
+        export function decompress_state(...args: unknown[]): Uint8Array;
+      }
+      STUBDTS
+      fi
+    - npm ci --include=dev
+    - npm test
+    - npx tsc --noEmit
+
+pages:
+  stage: build
+  needs:
+    - test
+  image: node:22-bookworm
+  timeout: 2h
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  before_script:
+    - *wasm_setup
+    - export PATH="${CARGO_HOME}/bin:${PATH}"
+    - node --version
+    - rm -rf node_modules
+    - npm ci --include=dev
+    - node -e "require.resolve('vite'); require.resolve('@vitejs/plugin-react'); console.log('vite ok')"
+  script:
+    - export PATH="${CARGO_HOME}/bin:${PATH}"
+    - export CC=clang
+    # VITE_PAGES_BASE vem de CI_PAGES_URL (domínio único → / ; group pages → /project/)
+    - export GITLAB_PAGES_URL="${CI_PAGES_URL:-https://${CI_PROJECT_NAMESPACE_SLUG}.gitlab.io/${CI_PROJECT_NAME,,}}"
+    # CI/CD → Variables: VITE_PAGES_API_ORIGIN ou PAGES_API_ORIGIN (URL do VPS soberano)
+    - |
+      if [ -n "${VITE_PAGES_API_ORIGIN:-}" ]; then
+        export VITE_PAGES_API_ORIGIN="${VITE_PAGES_API_ORIGIN}"
+      elif [ -n "${PAGES_API_ORIGIN:-}" ]; then
+        export VITE_PAGES_API_ORIGIN="${PAGES_API_ORIGIN}"
+      else
+        echo "Aviso: VITE_PAGES_API_ORIGIN não definido — checkout Builder/VOID-308 offline em Pages"
+      fi
+    - npm run deploy:gitlab
+    - rm -rf public
+    - cp -r dist public
+    - test -f public/index.html
+    - test -f public/404.html
+    - test ! -f public/_redirects
+    - test -d public/assets
+    - test -f public/mesh/liquidity/index.html
+    - test -f public/sabor-quantico/index.html
+    - test -f public/governance/sovereignty/index.html
+    - ls public/assets/*.js | head -3
+    - ls -la public/ | head -20
+  artifacts:
+    paths:
+      - public
+    expire_in: 1 week

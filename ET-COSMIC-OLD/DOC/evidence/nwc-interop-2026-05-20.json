@@ -1,0 +1,44 @@
+{
+  "walletPubKey": "8cc55cfbebc1514cf37a89df34c9ece33a5f79bbac0e56d1925dfb365f504c75",
+  "relay": "ws://127.0.0.1:7777",
+  "startedAt": 1779240225805,
+  "finishedAt": 1779240226130,
+  "durationMs": 325,
+  "checks": [
+    {
+      "id": "connect",
+      "status": "pass",
+      "durationMs": 75.40688799999998,
+      "details": "Conectado em ws://127.0.0.1:7777"
+    },
+    {
+      "id": "get_info",
+      "status": "pass",
+      "durationMs": 85.83273499999996,
+      "details": "Alias=NWC network=regtest methods=14"
+    },
+    {
+      "id": "get_balance",
+      "status": "pass",
+      "durationMs": 59.36036899999999,
+      "details": "Saldo 0 sats"
+    },
+    {
+      "id": "list_transactions",
+      "status": "pass",
+      "durationMs": 58.7038399999999,
+      "details": "Transações retornadas=0"
+    },
+    {
+      "id": "make_invoice",
+      "status": "pass",
+      "durationMs": 44.07471600000008,
+      "details": "Invoice criada hash=c7d428b82a66..."
+    }
+  ],
+  "summary": {
+    "passed": 5,
+    "failed": 0,
+    "skipped": 0
+  }
+}

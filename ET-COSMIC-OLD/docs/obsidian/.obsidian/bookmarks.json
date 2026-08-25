@@ -1,0 +1,54 @@
+{
+  "items": [
+    {
+      "type": "group",
+      "ctime": 1747872000000,
+      "items": [
+        {
+          "type": "file",
+          "ctime": 1747872000000,
+          "path": "VOID-QRC-PLANO-INDUSTRIA.md",
+          "title": "🏠 Plano Principal VØID-QRC"
+        },
+        {
+          "type": "file",
+          "ctime": 1747872000000,
+          "path": "README.md",
+          "title": "Índice vault (secundário)"
+        }
+      ],
+      "title": "ET-COSMIC — Início"
+    },
+    {
+      "type": "group",
+      "ctime": 1747872000000,
+      "items": [
+        {
+          "type": "file",
+          "ctime": 1747872000000,
+          "path": "LUSUS-7-FALHAS.md",
+          "title": "Fase 1 · LUSUS"
+        },
+        {
+          "type": "file",
+          "ctime": 1747872000000,
+          "path": "IMC-ARCHITECTURE.md",
+          "title": "Fase 2 · IMC"
+        },
+        {
+          "type": "file",
+          "ctime": 1747872000000,
+          "path": "VOID-SOVEREIGN-STACK.md",
+          "title": "Fase 3 · Sovereign Stack"
+        },
+        {
+          "type": "file",
+          "ctime": 1747872000000,
+          "path": "SOV-ECONOMY.md",
+          "title": "Fase 3 · SOV"
+        }
+      ],
+      "title": "Por fase VOID-QRC"
+    }
+  ]
+}

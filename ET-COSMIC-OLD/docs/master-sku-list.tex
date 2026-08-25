@@ -1,0 +1,354 @@
+\documentclass[10pt,a4paper,landscape]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1.5cm]{geometry}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{fancyhdr}
+
+\definecolor{voidgreen}{HTML}{B6FF3A}
+\hypersetup{colorlinks=true,linkcolor=voidgreen,urlcolor=voidgreen}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small ET-COSMIC --- Master SKU List}
+\fancyhead[R]{\small MontêLauro Foundation · 283 SKUs}
+\fancyfoot[C]{\small \thepage}
+
+\title{\textbf{ET-COSMIC B2B}\\Master SKU List (283 IDs)}
+\author{Gerado de \texttt{src/b2b/masterSkuList.json}}
+\date{2026-05-21}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+\vspace{0.5cm}
+
+\noindent
+Catálogo canónico de identificadores \texttt{VOID-XX} para builds white-label (\texttt{VITE\_B2B\_SKUS}).
+Metadados de nome/tipo/rota: \texttt{skuCatalog.generated.ts}.\\
+Licença dupla: GPL-3.0-or-later + comercial opcional. Taxa de protocolo transparente na UI.
+
+\vspace{0.5cm}
+\begin{longtable}{@{}rl p{4.2cm} p{1.4cm} p{3.8cm}@{}}
+\toprule
+\# & SKU & Nome comercial & Tipo & Rota UI \\
+\midrule
+\endhead
+1 & \textbf{VOID-00} & Core WASM & infra & — \\
+2 & \textbf{VOID-01} & TypeScript SDK & infra & — \\
+3 & \textbf{VOID-02} & void-runner & infra & — \\
+4 & \textbf{VOID-03} & Quantum Engine & infra & — \\
+5 & \textbf{VOID-04} & Express Gateway & infra & — \\
+6 & \textbf{VOID-05} & Sovereign Stack & infra & — \\
+7 & \textbf{VOID-06} & Anchor Contracts & infra & — \\
+8 & \textbf{VOID-07} & Android Shell & infra & — \\
+9 & \textbf{VOID-08} & PWA Sovereign & infra & — \\
+10 & \textbf{VOID-09} & Arquivo R\&D Teoria & infra & — \\
+11 & \textbf{VOID-0A} & pi\_worker WASM & infra & — \\
+12 & \textbf{VOID-0B} & RE-trolab Bridge & infra & — \\
+13 & \textbf{VOID-0C} & Specs \& Whitepaper Pack & infra & — \\
+14 & \textbf{VOID-0D} & Rust Workspace & infra & — \\
+15 & \textbf{VOID-0E} & Production Docker Image & infra & — \\
+16 & \textbf{VOID-0F} & Nginx Sovereign Proxy & infra & — \\
+17 & \textbf{VOID-10} & Dashboard Hub & route & \texttt{/dashboard} \\
+18 & \textbf{VOID-11} & VOID Messenger & route & \texttt{/messenger} \\
+19 & \textbf{VOID-12} & Phantom Harvester & route & \texttt{/harvester} \\
+20 & \textbf{VOID-13} & Landing \& Marketing Shell & infra & — \\
+21 & \textbf{VOID-14} & Onboarding Flow & infra & — \\
+22 & \textbf{VOID-15} & GhostID Setup Widget & infra & — \\
+23 & \textbf{VOID-16} & Dev Setup Banner & infra & — \\
+24 & \textbf{VOID-17} & Panel Tier Badges & infra & — \\
+25 & \textbf{VOID-18} & Network Simulation Core & infra & — \\
+26 & \textbf{VOID-20} & ZKP Studio & route & \texttt{/crypto/zkp} \\
+27 & \textbf{VOID-21} & GhostID \& VPN & route & \texttt{/crypto/ghostid} \\
+28 & \textbf{VOID-22} & PQC Enterprise & route & \texttt{/crypto/pqc} \\
+29 & \textbf{VOID-23} & CQR→PQC Bridge & route & \texttt{/crypto/cqr-pqc} \\
+30 & \textbf{VOID-24} & Crypto Testament & route & \texttt{/crypto/testament} \\
+31 & \textbf{VOID-25} & Karma Wallet & route & \texttt{/crypto/karma} \\
+32 & \textbf{VOID-26} & Trust Bundle & bundle & — \\
+33 & \textbf{VOID-30} & DEX Order Book & route & \texttt{/finance/dex} \\
+34 & \textbf{VOID-31} & Chimera Dark Pool & route & \texttt{/finance/chimera} \\
+35 & \textbf{VOID-32} & Nostr DEX & route & \texttt{/finance/nostr-dex} \\
+36 & \textbf{VOID-33} & Stablecoin Engine & route & \texttt{/finance/stablecoin} \\
+37 & \textbf{VOID-34} & RWA Tokenization & route & \texttt{/finance/rwa} \\
+38 & \textbf{VOID-35} & Sovereign Pools & route & \texttt{/finance/pools} \\
+39 & \textbf{VOID-36} & Janus Finance & route & \texttt{/finance/janus} \\
+40 & \textbf{VOID-37} & Payment Gateway & route & \texttt{/finance/payment} \\
+41 & \textbf{VOID-38} & Collapse Finance & route & \texttt{/finance/collapse} \\
+42 & \textbf{VOID-39} & Finance Full Stack & bundle & — \\
+43 & \textbf{VOID-40} & Distance Bridge & route & \texttt{/network/distance} \\
+44 & \textbf{VOID-41} & Parasitic Architecture & route & \texttt{/network/parasitic} \\
+45 & \textbf{VOID-42} & EcoNet & route & \texttt{/network/echonet} \\
+46 & \textbf{VOID-43} & Nostr Sync Mesh & route & \texttt{/network/mesh} \\
+47 & \textbf{VOID-44} & Acoustic Handshake & route & \texttt{/network/acoustic} \\
+48 & \textbf{VOID-45} & Supply Chain Security & route & \texttt{/network/supply-chain} \\
+49 & \textbf{VOID-46} & Network Edge Bundle & bundle & — \\
+50 & \textbf{VOID-50} & Mirage Enclaves & route & \texttt{/compute/mirage} \\
+51 & \textbf{VOID-51} & HGPU Visualizer & route & \texttt{/compute/hgpu} \\
+52 & \textbf{VOID-52} & vHGPU Farm & route & \texttt{/compute/vhgpu} \\
+53 & \textbf{VOID-53} & PMU vHGPU Cores & route & \texttt{/compute/pmu-vhgpu} \\
+54 & \textbf{VOID-54} & Bruno Theory Engine & route & \texttt{/compute/bruno-theory} \\
+55 & \textbf{VOID-55} & PMU Truth Ω & route & \texttt{/compute/pmu-truth} \\
+56 & \textbf{VOID-56} & PMU Roadmap \& Anchor & route & \texttt{/compute/pmu-roadmap} \\
+57 & \textbf{VOID-57} & Cosmic Harmonia & route & \texttt{/compute/cosmic-harmony} \\
+58 & \textbf{VOID-58} & Animus Substrates & route & \texttt{/compute/animus} \\
+59 & \textbf{VOID-59} & Hydra Parallel & route & \texttt{/compute/hydra} \\
+60 & \textbf{VOID-60} & Omega Layer & route & \texttt{/compute/omega} \\
+61 & \textbf{VOID-61} & HGPU Compute & route & \texttt{/compute/hgpu-compute} \\
+62 & \textbf{VOID-62} & Compute Appliance & bundle & — \\
+63 & \textbf{VOID-70} & LSC Engine & route & \texttt{/quantum/lsc} \\
+64 & \textbf{VOID-71} & QRC Topology & route & \texttt{/quantum/qrc} \\
+65 & \textbf{VOID-72} & Paleo Engine & route & \texttt{/quantum/paleo} \\
+66 & \textbf{VOID-73} & Collapse Algebra & route & \texttt{/quantum/collapse} \\
+67 & \textbf{VOID-74} & Anacroclastia Lab & route & \texttt{/quantum/anacroclastia} \\
+68 & \textbf{VOID-75} & Nostr Oracle & route & \texttt{/quantum/oracle} \\
+69 & \textbf{VOID-76} & QRNG Service & route & \texttt{/quantum/qrng} \\
+70 & \textbf{VOID-77} & QR Stocks & route & \texttt{/quantum/qrstocks} \\
+71 & \textbf{VOID-78} & Heptary Quantum & route & \texttt{/quantum/heptary} \\
+72 & \textbf{VOID-79} & AQRE Monitor & route & \texttt{/quantum/aqre} \\
+73 & \textbf{VOID-80} & LUSUS Terminal & route & \texttt{/quantum/lusus} \\
+74 & \textbf{VOID-81} & CQR Entropy Gateway & bundle & — \\
+75 & \textbf{VOID-90} & Quantum DAO & route & \texttt{/governance/dao} \\
+76 & \textbf{VOID-91} & Anti-Sybil Lab & route & \texttt{/governance/anti-sybil} \\
+77 & \textbf{VOID-92} & Double-Spend Defense & route & \texttt{/governance/double-spend} \\
+78 & \textbf{VOID-93} & Temporal Oracle & route & \texttt{/governance/temporal} \\
+79 & \textbf{VOID-94} & Social Recovery & route & \texttt{/governance/social-recovery} \\
+80 & \textbf{VOID-95} & Consent \& AMP (CGF) & route & \texttt{/governance/consent} \\
+81 & \textbf{VOID-96} & Sovereignty \& Royalties & route & \texttt{/governance/sovereignty} \\
+82 & \textbf{VOID-97} & Governance Suite & bundle & — \\
+83 & \textbf{VOID-100} & Phantom Shopper & route & \texttt{/defi/phopper} \\
+84 & \textbf{VOID-101} & Aegis Vault & route & \texttt{/defi/aegis} \\
+85 & \textbf{VOID-102} & Paleo Yield & route & \texttt{/defi/yield} \\
+86 & \textbf{VOID-103} & Ghost Locker & route & \texttt{/defi/ghost-locker} \\
+87 & \textbf{VOID-104} & PoW Faucet & route & \texttt{/defi/faucet} \\
+88 & \textbf{VOID-110} & Active Terminal & route & \texttt{/terminal/active} \\
+89 & \textbf{VOID-111} & Symbiont Inoculator & route & \texttt{/terminal/symbiont} \\
+90 & \textbf{VOID-112} & Lua Plugin Runtime & route & \texttt{/terminal/lua} \\
+91 & \textbf{VOID-113} & Watchtower & route & \texttt{/terminal/watchtower} \\
+92 & \textbf{VOID-114} & Sphinx Mixnet & route & \texttt{/terminal/sphinx} \\
+93 & \textbf{VOID-115} & Differential Core & route & \texttt{/terminal/differential} \\
+94 & \textbf{VOID-116} & Mining (CPU) & route & \texttt{/terminal/mining} \\
+95 & \textbf{VOID-117} & GPU Mining & route & \texttt{/terminal/gpu-mining} \\
+96 & \textbf{VOID-118} & Homotopy Mining & route & \texttt{/terminal/homotopy} \\
+97 & \textbf{VOID-119} & Ghost Mailbox & route & \texttt{/terminal/ghost-mailbox} \\
+98 & \textbf{VOID-120} & Octree SDF & route & \texttt{/terminal/octree} \\
+99 & \textbf{VOID-121} & Social Fabric & route & \texttt{/terminal/social} \\
+100 & \textbf{VOID-122} & Glossary \& Docs Hub & route & \texttt{/terminal/glossary} \\
+101 & \textbf{VOID-130} & VOID Shell & service & — \\
+102 & \textbf{VOID-131} & VOID Browser & service & — \\
+103 & \textbf{VOID-132} & Animus IA Filosofica & service & — \\
+104 & \textbf{VOID-133} & VOID OS Appliance & service & — \\
+105 & \textbf{VOID-140} & QEL Shamir Fragmentation & service & — \\
+106 & \textbf{VOID-141} & Double Ratchet E2EE & service & — \\
+107 & \textbf{VOID-142} & UTXO Confidencial & service & — \\
+108 & \textbf{VOID-143} & Entropy Orchestrator & service & — \\
+109 & \textbf{VOID-144} & Secure Random Facade & service & — \\
+110 & \textbf{VOID-145} & Steganography Layer & service & — \\
+111 & \textbf{VOID-146} & Fuzzy Extractor (bio) & service & — \\
+112 & \textbf{VOID-147} & Signing Keys Vault & service & — \\
+113 & \textbf{VOID-148} & Matchmaker Protocol & service & — \\
+114 & \textbf{VOID-149} & Topology Tracker & service & — \\
+115 & \textbf{VOID-150} & GF(256) Primitives & service & — \\
+116 & \textbf{VOID-151} & ZK Compressor & service & — \\
+117 & \textbf{VOID-152} & Local CQR Engine & service & — \\
+118 & \textbf{VOID-153} & Remote CQR Config & service & — \\
+119 & \textbf{VOID-154} & Anti-Higgs Shield & service & — \\
+120 & \textbf{VOID-155} & Singularity Harvester & service & — \\
+121 & \textbf{VOID-156} & UTU Token Registry & service & — \\
+122 & \textbf{VOID-157} & LDK Lightning Bridge & service & — \\
+123 & \textbf{VOID-158} & NWC Interop & service & — \\
+124 & \textbf{VOID-159} & Crypto Primitives Bundle & bundle & — \\
+125 & \textbf{VOID-160} & AMP Pipeline & service & — \\
+126 & \textbf{VOID-161} & SLCC Consent Layer & service & — \\
+127 & \textbf{VOID-162} & Consent Receipt Store & service & — \\
+128 & \textbf{VOID-163} & Consent Lattice & service & — \\
+129 & \textbf{VOID-164} & CGF Consent Contract & service & — \\
+130 & \textbf{VOID-165} & PMU Ω Pipeline & service & — \\
+131 & \textbf{VOID-166} & PMU Compute Orchestrator & service & — \\
+132 & \textbf{VOID-167} & vHGPU AMP Client & service & — \\
+133 & \textbf{VOID-168} & Recursive STARK (AMP) & service & — \\
+134 & \textbf{VOID-169} & LDK WASM Bridge & service & — \\
+135 & \textbf{VOID-170} & Known Limitations Registry & service & — \\
+136 & \textbf{VOID-171} & Protocol Royalty & service & — \\
+137 & \textbf{VOID-172} & Core Consent Hook & service & — \\
+138 & \textbf{VOID-173} & Sovereign Config & service & — \\
+139 & \textbf{VOID-174} & AMP Enterprise Bundle & bundle & — \\
+140 & \textbf{VOID-180} & ScrapScanner Core & service & — \\
+141 & \textbf{VOID-181} & ScrapScanner CLI & service & — \\
+142 & \textbf{VOID-182} & Telegram Scraper & service & — \\
+143 & \textbf{VOID-183} & Binance Scraper & service & — \\
+144 & \textbf{VOID-184} & Mercado Bitcoin Scraper & service & — \\
+145 & \textbf{VOID-185} & Phantom Harvest Harmony & service & — \\
+146 & \textbf{VOID-186} & Contact Directory & service & — \\
+147 & \textbf{VOID-187} & vCard / export pipeline & service & — \\
+148 & \textbf{VOID-188} & Exchange Intel Bundle & bundle & — \\
+149 & \textbf{VOID-189} & Social Harvest Bundle & bundle & — \\
+150 & \textbf{VOID-190} & GhostDocker Bridge & service & — \\
+151 & \textbf{VOID-191} & void-runner Client & service & — \\
+152 & \textbf{VOID-192} & Phantom Pipeline VPS & service & — \\
+153 & \textbf{VOID-193} & HiggsGit Sync & service & — \\
+154 & \textbf{VOID-194} & GhostDock Core & service & — \\
+155 & \textbf{VOID-195} & EcoNet VPS Module & service & — \\
+156 & \textbf{VOID-196} & Harmonia CLI & service & — \\
+157 & \textbf{VOID-197} & Harmonia VPS Script & service & — \\
+158 & \textbf{VOID-198} & build-vps.sh Appliance & service & — \\
+159 & \textbf{VOID-199} & Perfil B LAN Bundle & bundle & — \\
+160 & \textbf{VOID-200} & Chat Store E2EE & service & — \\
+161 & \textbf{VOID-201} & Channel Store & service & — \\
+162 & \textbf{VOID-202} & HCN Store & service & — \\
+163 & \textbf{VOID-203} & G-Counter CRDT & service & — \\
+164 & \textbf{VOID-204} & UTXO Store & service & — \\
+165 & \textbf{VOID-205} & Messaging Data Bundle & bundle & — \\
+166 & \textbf{VOID-210} & Native Bridge (Capacitor) & service & — \\
+167 & \textbf{VOID-211} & ETRNET Nostr Kinds & service & — \\
+168 & \textbf{VOID-212} & Relay Health Probe & service & — \\
+169 & \textbf{VOID-213} & Lightning+Nostr Transport & service & — \\
+170 & \textbf{VOID-214} & Local Drivers (BLE/serial) & service & — \\
+171 & \textbf{VOID-215} & Acoustic Driver & service & — \\
+172 & \textbf{VOID-216} & Distance Bridge Core & service & — \\
+173 & \textbf{VOID-217} & Mesh Preflight & service & — \\
+174 & \textbf{VOID-218} & CQR Tunnel Quick & service & — \\
+175 & \textbf{VOID-219} & Mesh Transport Bundle & bundle & — \\
+176 & \textbf{VOID-230} & Lua: LSC Monitor & service & — \\
+177 & \textbf{VOID-231} & Lua: vHGPU Farm & service & — \\
+178 & \textbf{VOID-232} & Lua: Ghost Strategy & service & — \\
+179 & \textbf{VOID-233} & Lua: Collapse Strategy & service & — \\
+180 & \textbf{VOID-234} & Lua: Homotopy Validator & service & — \\
+181 & \textbf{VOID-235} & Quantum Switch & service & — \\
+182 & \textbf{VOID-236} & WebGPU Tensor Engine & service & — \\
+183 & \textbf{VOID-237} & AQRE Client & service & — \\
+184 & \textbf{VOID-238} & LUSUS Client & service & — \\
+185 & \textbf{VOID-239} & Anacroclastic Limits & service & — \\
+186 & \textbf{VOID-240} & Paleo Entropy Fossil & service & — \\
+187 & \textbf{VOID-241} & BB84 / Penrose (Python) & service & — \\
+188 & \textbf{VOID-242} & PMU Domain Compute (Py) & service & — \\
+189 & \textbf{VOID-243} & Plugin API (Py) & service & — \\
+190 & \textbf{VOID-244} & Quantum Plugins Bundle & bundle & — \\
+191 & \textbf{VOID-250} & Quantum Research Lab & service & — \\
+192 & \textbf{VOID-251} & HGPU Research & service & — \\
+193 & \textbf{VOID-252} & ZK/STARK Research & service & — \\
+194 & \textbf{VOID-253} & WASM Deep Research & service & — \\
+195 & \textbf{VOID-254} & Animus Bootstrap & service & — \\
+196 & \textbf{VOID-255} & Animus Substrates Lib & service & — \\
+197 & \textbf{VOID-256} & Void Animus Plugin & service & — \\
+198 & \textbf{VOID-257} & Module Reality Backend & service & — \\
+199 & \textbf{VOID-258} & Omega Research UI & service & — \\
+200 & \textbf{VOID-259} & Void Protocol Core & service & — \\
+201 & \textbf{VOID-260} & useVhgpuFarm Hook & service & — \\
+202 & \textbf{VOID-261} & useLua Runtime & service & — \\
+203 & \textbf{VOID-262} & Mobile WebView Guard & service & — \\
+204 & \textbf{VOID-263} & R\&D Full Bundle & bundle & — \\
+205 & \textbf{VOID-264} & ZK Research Bundle & bundle & — \\
+206 & \textbf{VOID-270} & Payment Gateway Core & service & — \\
+207 & \textbf{VOID-271} & Chimera Exchange Core & service & — \\
+208 & \textbf{VOID-272} & Nostr DEX Core & service & — \\
+209 & \textbf{VOID-273} & Sovereign Pools Core & service & — \\
+210 & \textbf{VOID-274} & RWA Tokenization Core & service & — \\
+211 & \textbf{VOID-275} & Collapse Finance Core & service & — \\
+212 & \textbf{VOID-276} & Janus Finance Core & service & — \\
+213 & \textbf{VOID-277} & Ghost Locker Core & service & — \\
+214 & \textbf{VOID-278} & PoW Faucet Core & service & — \\
+215 & \textbf{VOID-279} & Finance Engines Bundle & bundle & — \\
+216 & \textbf{VOID-280} & Production Preflight & service & — \\
+217 & \textbf{VOID-281} & Sovereign Preflight & service & — \\
+218 & \textbf{VOID-282} & Real+ Preflight & service & — \\
+219 & \textbf{VOID-283} & Stack Status & service & — \\
+220 & \textbf{VOID-284} & PMU Audit (full) & service & — \\
+221 & \textbf{VOID-285} & PMU Anchor Propose/Finalize & service & — \\
+222 & \textbf{VOID-286} & Anchor Local/Sepolia & service & — \\
+223 & \textbf{VOID-287} & Android Build Suite & service & — \\
+224 & \textbf{VOID-288} & Archive Sync Teoria & service & — \\
+225 & \textbf{VOID-289} & NWC Dev Toolkit & service & — \\
+226 & \textbf{VOID-290} & LND Wallet Bootstrap & service & — \\
+227 & \textbf{VOID-291} & Relay Health SLA & service & — \\
+228 & \textbf{VOID-292} & Sepolia Dev Bootstrap & service & — \\
+229 & \textbf{VOID-293} & Sourcify Verify & service & — \\
+230 & \textbf{VOID-294} & Certification Bundle & bundle & — \\
+231 & \textbf{VOID-295} & Anchor Ops Bundle & bundle & — \\
+232 & \textbf{VOID-296} & Mobile Release Bundle & bundle & — \\
+233 & \textbf{VOID-297} & Dev CQR Quick & service & — \\
+234 & \textbf{VOID-298} & Quantum Docker Prepare & service & — \\
+235 & \textbf{VOID-299} & Ops Master Bundle & bundle & — \\
+236 & \textbf{VOID-300} & Managed Sovereign Stack & service & — \\
+237 & \textbf{VOID-301} & Managed CQR Gateway & service & — \\
+238 & \textbf{VOID-302} & Managed void-runner Farm & service & — \\
+239 & \textbf{VOID-303} & PMU Audit-as-a-Service & service & — \\
+240 & \textbf{VOID-304} & Anchor Ceremony & service & — \\
+241 & \textbf{VOID-305} & White-label PWA Build & service & — \\
+242 & \textbf{VOID-306} & Android Soberano MDM & service & — \\
+243 & \textbf{VOID-307} & Tailnet Harmonia & service & — \\
+244 & \textbf{VOID-308} & Research Archive License & service & — \\
+245 & \textbf{VOID-309} & Bruno Theory Consulting & service & — \\
+246 & \textbf{VOID-310} & Compliance Harvest Audit & service & — \\
+247 & \textbf{VOID-311} & Nostr Relay Dedicated & service & — \\
+248 & \textbf{VOID-312} & LND Operations & service & — \\
+249 & \textbf{VOID-313} & Training \& Certification & service & — \\
+250 & \textbf{VOID-314} & SDK Integration Support & service & — \\
+251 & \textbf{VOID-315} & STARK/ZK Integration & service & — \\
+252 & \textbf{VOID-316} & Supply Chain Attestation & service & — \\
+253 & \textbf{VOID-317} & Mixnet Operations & service & — \\
+254 & \textbf{VOID-318} & Full Managed Appliance & service & — \\
+255 & \textbf{VOID-319} & Enterprise Success (24/7) & bundle & — \\
+256 & \textbf{VOID-320} & App Layout Shell & service & — \\
+257 & \textbf{VOID-321} & Router Hub System & service & — \\
+258 & \textbf{VOID-322} & HTTP JSON Client & service & — \\
+259 & \textbf{VOID-323} & QR Code Utils & service & — \\
+260 & \textbf{VOID-324} & Dev Log \& Telemetry (local) & service & — \\
+261 & \textbf{VOID-325} & White-label Theme Pack & service & — \\
+262 & \textbf{VOID-326} & Multi-tenant SKU Manifest & service & — \\
+263 & \textbf{VOID-327} & Landing Page Only SKU & bundle & — \\
+264 & \textbf{VOID-328} & Messenger-only SKU & bundle & — \\
+265 & \textbf{VOID-329} & UX White-label Bundle & bundle & — \\
+266 & \textbf{AMP-GOVERNANCE-PACK} & AMP Governance Pack & bundle & — \\
+267 & \textbf{ANIMUS-OS-PREVIEW} & Animus OS Preview & bundle & — \\
+268 & \textbf{CERTIFIED-PRODUCTION} & Certified Production & bundle & — \\
+269 & \textbf{COMPUTE-WORKER} & Compute Worker & bundle & — \\
+270 & \textbf{CRYPTO-LAB} & Crypto Lab & bundle & — \\
+271 & \textbf{EDGE-INTELLIGENCE} & Edge Intelligence & bundle & — \\
+272 & \textbf{ENTROPY-APPLIANCE} & Entropy Appliance & bundle & — \\
+273 & \textbf{FINANCE-NODE} & Finance Node & bundle & — \\
+274 & \textbf{FULL-ENTERPRISE} & Full VOID Enterprise & bundle & — \\
+275 & \textbf{GPU-ORCHESTRATION} & GPU Orchestration & bundle & — \\
+276 & \textbf{MESSENGER-ENTERPRISE} & Messenger Enterprise & bundle & — \\
+277 & \textbf{PERFIL-B-HOME} & Perfil B Home Lab & bundle & — \\
+278 & \textbf{PRIVACY-MAX} & Privacy Max & bundle & — \\
+279 & \textbf{QUANTUM-LAB-PACK} & Quantum Lab Pack & bundle & — \\
+280 & \textbf{RESEARCH-INSTITUTE} & Research Institute & bundle & — \\
+281 & \textbf{SOVEREIGN-CITIZEN} & Sovereign Citizen & bundle & — \\
+282 & \textbf{VPS-OPERATOR-PACK} & VPS Operator Pack & bundle & — \\
+283 & \textbf{WHITE-LABEL-OEM} & White-label OEM & bundle & — \\
+\bottomrule
+\end{longtable}
+
+\section*{Funcionalidade Hardware Premium (VOID-QRC Fase 4)}
+\addcontentsline{toc}{section}{Hardware Premium}
+
+Regimes de matéria condensada vendáveis como \emph{capability flags} no handshake VOID-00.
+Implementação: \texttt{core/hamiltonians/anderson.py} · stress: \texttt{npm run anderson:stress}.
+
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Regime & SKU perfil & Desordem $W$ & Objectivo industrial \\
+\midrule
+\textbf{Anderson} & SKU-A & Baixo $W$ (0.4) & Latência baixa · estados delocalizados \\
+\textbf{Anderson} & SKU-B & Alto $W$ (2.5) & Retenção de memória · localização \\
+\textbf{Peierls} & VOID-600 & Gap de banda & Isolador topológico 1D (roadmap) \\
+\textbf{SSH} & VOID-511 & Paridade & Qubit lógico / Max-Cut marketplace \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+\textbf{Licenciamento:} \texttt{void\_core/src/license.rs} (ML-DSA-87) · ver \texttt{npm run license:preflight}.
+
+\vfill
+\begin{center}
+\small\textcolor{gray}{ET-COSMIC · MontêLauro Foundation · 283 SKUs · catálogo sincronizado com skuCatalog.generated.ts}
+\end{center}
+\end{document}

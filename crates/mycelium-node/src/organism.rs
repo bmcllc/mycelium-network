@@ -135,6 +135,10 @@ pub struct Organism {
     transfer_nonce: u64,
     /// Réplicas remotas vivas por ion (anunciadas via IonReady).
     ion_replica_peers: HashMap<String, Vec<NodeId>>,
+    /// Catálogo global de ions que pares expõem no seu Horizon.
+    peer_ions: HashMap<NodeId, Vec<String>>,
+    /// Flag: a console ErgOTOS foi visitada desde o último tick (auto-semeadura).
+    console_hit: bool,
     /// Janelas consecutivas de carga zero por ion local (gatilho de recombine).
     zero_load_windows: HashMap<String, u32>,
     /// Cooldown do último IonOffer de auto-scaling por ion.
@@ -343,6 +347,8 @@ impl Organism {
             assets,
             transfer_nonce: 0,
             ion_replica_peers: HashMap::new(),
+            peer_ions: HashMap::new(),
+            console_hit: false,
             zero_load_windows: HashMap::new(),
             last_scaling_offer: HashMap::new(),
         };
@@ -885,6 +891,39 @@ impl Organism {
         }
     }
 
+    /// Efeito manada: visita à console ErgotOS semeia localmente um
+    /// `ergot-seed` (ion consciência do desktop) que anuncia a si por toda
+    /// a rede via `IonAnnounce`. Outros nós recebem o anúncio e brotam o
+    /// mesmo seed → a console se multiplica sem toque humano.
+    fn try_brood_seed_ion(&mut self) {
+        let name = "ergot-seed";
+        if self.chambers.contains_key(name) {
+            return;
+        }
+        if self.ledger.balance(Nutrient::Atp) == 0 {
+            tracing::debug!("sem ATP para brotar ergot-seed");
+            return;
+        }
+        let plot = giggs::Plot {
+            author: self.gland.node_id(),
+            message: "\u{1F304} ergot-seed — a floresta cresce onde é semeada"
+                .to_string(),
+            parents: vec![],
+            leaves: vec![],
+        };
+        let id = match self.bank.deposit(plot) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(error = %e, "seed deposit falhou");
+                return;
+            }
+        };
+        match self.fruit_ion(name, &id.to_string(), "", true) {
+            Ok(()) => tracing::info!("ergot-seed brotado — console ErgotOS autônoma"),
+            Err(e) => tracing::warn!(error = %e, "seed fruit falhou"),
+        }
+    }
+
     fn serve_layer_if_present(&mut self, id: &ContentId) -> Result<(), OrganismError> {
         let store = LayerStore::open(self.store.layers_dir())
             .map_err(|e| OrganismError::Msg(e.to_string()))?;
@@ -1422,6 +1461,24 @@ impl Organism {
             Envelope::ValueTransfer { tx } => {
                 if let Err(e) = self.apply_incoming_transfer(tx, false) {
                     tracing::debug!("value-transfer rejeitada: {e}");
+                }
+            }
+            Envelope::IonAnnounce {
+                node_id,
+                ion,
+                membrane: _,
+            } => {
+                let ion_clone = ion.clone();
+                if node_id != self.gland.node_id() {
+                    let ions = self.peer_ions.entry(node_id).or_default();
+                    if !ions.contains(&ion) {
+                        ions.push(ion);
+                    }
+                }
+                // Efeito manada sem intervencção: ao anunciar um `ergot-seed`
+                // pelo gossip, brota uma console ErgotOS autônoma neste nó.
+                if ion_clone == "ergot-seed" {
+                    self.try_brood_seed_ion();
                 }
             }
             Envelope::VoucherRedeem { voucher } => {
@@ -2528,6 +2585,8 @@ impl Organism {
                     }
                     let mut table = self.horizon.write().unwrap();
                     table.set_metrics(prom);
+                    // Sinal da console: visita autônoma → auto-semeadura.
+                    self.console_hit = table.take_console_hits() > 0;
                 }
 
                 _ = balance_tick.tick() => {
@@ -2550,6 +2609,22 @@ impl Organism {
                 }
 
                 _ = zone_tick.tick() => {
+                    // Anúncio global de Ions (catálogo para a console ErgotOS).
+                    for name in self.chambers.keys() {
+                        let env = Envelope::IonAnnounce {
+                            node_id: self.gland.node_id(),
+                            ion: name.clone(),
+                            membrane: self.membrane.to_string(),
+                        };
+                        if let Ok(bytes) = env.encode() {
+                            let _ = self.hyphae.broadcast_lattice(bytes);
+                        }
+                    }
+                    // Efeito manada: visita à console semeadura local autônoma.
+                    if self.console_hit && self.chambers.get("ergot-seed").is_none() {
+                        self.try_brood_seed_ion();
+                        self.console_hit = false;
+                    }
                     if !self.state.ions.is_empty() {
                         let prefix = format!("Qm{}", self.gland.node_id().short());
                         let env = Envelope::ZoneAnnounce {
@@ -2594,6 +2669,19 @@ impl Organism {
                         let n = self.hyphae.reach_seeds(&addrs);
                         if n > 0 {
                             tracing::debug!(reached = n, "re-bootstrap de seeds");
+                        }
+                    }
+                    // Infra descentralizada: TTL + health check + persistência.
+                    let pruned = self.seed_book.prune_expired();
+                    if pruned > 0 {
+                        tracing::info!(pruned, "seeds expiradas removidas");
+                        if let Err(e) = self.seed_book.save_file(self.store.root.join("seeds.txt")) {
+                            tracing::warn!(error = %e, "save_file seeds.txt");
+                        }
+                    }
+                    if let Ok(checked) = self.seed_book.health_check() {
+                        if checked > 0 {
+                            tracing::debug!(checked, "health check de seeds");
                         }
                     }
                     // Relay mesh: esporocarp alcançável anuncia; folhas tentam circuit.

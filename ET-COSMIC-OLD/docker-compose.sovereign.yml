@@ -1,0 +1,320 @@
+##############################################################################
+# VØID·COSMIC_VPS — Stack Soberana Completa
+#
+# Inclui:
+#   - void-frontend   nginx:alpine                  (frontend ET-RNET)
+#   - bitcoind        lncm/bitcoind:v27.2            (nó Bitcoin)
+#   - lnd             lightninglabs/lnd:v0.18.2-beta (Lightning Daemon)
+#   - rtl             shahanafarooqui/rtl:v0.15.8    (UI + NWC bridge)
+#   - nostr-relay     scsibug/nostr-rs-relay          (relay NOSTR próprio)
+#   - quantum-engine  Python CQR + void-runner       (GhostDocker / Harmonia)
+#   - etrnet-server   Dockerfile.production          (servidor ET-RNET)
+#
+# STACK DESCENTRALIZADA:
+#   Cada nó roda esta stack independentemente. Não depende de nenhum servidor central.
+#   O NOSTR relay é soberano (seu relay, seus dados). O Lightning é self-custodial.
+#
+# PRIMEIRO USO:
+#   1. cp .env.sovereign.example .env.sovereign && vim .env.sovereign
+#   2. docker compose -f docker-compose.sovereign.yml up -d bitcoind lnd rtl nostr-relay
+#   3. docker exec -it lnd lncli --network=regtest create
+#   4. docker exec lnd xxd -p -c 256 /root/.lnd/data/chain/bitcoin/regtest/admin.macaroon | tr -d '\n'
+#   5. Colar em LND_MACAROON_HEX= no .env.sovereign
+#   6. docker compose -f docker-compose.sovereign.yml --profile server --profile frontend up -d
+#
+# PRODUÇÃO:
+#   BITCOIN_NETWORK=mainnet docker compose -f docker-compose.sovereign.yml --profile server --profile frontend up -d
+##############################################################################
+
+name: void-cosmic-vps
+
+volumes:
+  bitcoin_data:
+  lnd_data:
+  rtl_data:
+  nostr_data:
+  quantum_pool:
+
+networks:
+  void_net:
+    name: void-cosmic-vps_net
+    driver: bridge
+    ipam:
+      config:
+        # Evita colisão com outras stacks Docker (ex.: 172.30.88.0/24 já em uso)
+        - subnet: ${VOID_DOCKER_SUBNET:-172.30.88.0/24}
+
+services:
+
+  # ── Bitcoin Core ─────────────────────────────────────────────────────────────
+  bitcoind:
+    image: lncm/bitcoind:v27.2
+    container_name: bitcoind
+    restart: unless-stopped
+    volumes:
+      - bitcoin_data:/data/.bitcoin
+    networks:
+      void_net:
+        ipv4_address: 172.30.88.2
+    ports:
+      - "8332:8332"   # RPC (mainnet)
+      - "18332:18332" # RPC (testnet)
+      - "18443:18443" # RPC (regtest)
+      - "8333:8333"   # P2P (mainnet)
+    environment:
+      BITCOIN_NETWORK:   ${BITCOIN_NETWORK:-regtest}
+      BITCOIN_RPC_USER:  ${BITCOIN_RPC_USER:-void}
+      BITCOIN_RPC_PASS:  ${BITCOIN_RPC_PASS:-voidpassword}
+    # lncm/bitcoind já tem ENTRYPOINT=bitcoind — aqui vão apenas os flags
+    command: >
+      -regtest
+      -rpcuser=${BITCOIN_RPC_USER:-void}
+      -rpcpassword=${BITCOIN_RPC_PASS:-voidpassword}
+      -rpcallowip=172.30.88.0/24
+      -rpcallowip=127.0.0.1
+      -rpcbind=0.0.0.0
+      -zmqpubrawblock=tcp://0.0.0.0:28332
+      -zmqpubrawtx=tcp://0.0.0.0:28333
+      -txindex=1
+      -server=1
+      -rest=1
+    healthcheck:
+      # CMD-SHELL necessário para expandir variáveis de ambiente
+      test: ["CMD-SHELL",
+             "bitcoin-cli -regtest -rpcuser=$$BITCOIN_RPC_USER -rpcpassword=$$BITCOIN_RPC_PASS getblockchaininfo"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # ── Lightning Network Daemon ──────────────────────────────────────────────────
+  lnd:
+    image: lightninglabs/lnd:v0.18.2-beta
+    container_name: lnd
+    restart: unless-stopped
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/scripts/lnd-entrypoint.sh"]
+    volumes:
+      - lnd_data:/root/.lnd
+      - ./secrets:/secrets:ro
+      - ./scripts/lnd-entrypoint.sh:/scripts/lnd-entrypoint.sh:ro
+    networks:
+      void_net:
+        ipv4_address: 172.30.88.3
+    ports:
+      - "9735:9735"   # P2P Lightning
+      - "8180:8080"   # REST API LND (8080 ocupado localmente → exposto em 8180)
+      - "10009:10009" # gRPC
+    environment:
+      BITCOIN_NETWORK:  ${BITCOIN_NETWORK:-regtest}
+      BITCOIN_RPC_USER: ${BITCOIN_RPC_USER:-void}
+      BITCOIN_RPC_PASS: ${BITCOIN_RPC_PASS:-voidpassword}
+      LND_ALIAS:        ${LND_ALIAS:-VOID-NODE}
+    # lightninglabs/lnd já tem ENTRYPOINT=lnd — aqui vão apenas os flags
+    command: >
+      --bitcoin.regtest
+      --bitcoin.node=bitcoind
+      --bitcoind.rpchost=bitcoind:18443
+      --bitcoind.rpcuser=${BITCOIN_RPC_USER:-void}
+      --bitcoind.rpcpass=${BITCOIN_RPC_PASS:-voidpassword}
+      --bitcoind.zmqpubrawblock=tcp://bitcoind:28332
+      --bitcoind.zmqpubrawtx=tcp://bitcoind:28333
+      --restlisten=0.0.0.0:8080
+      --rpclisten=0.0.0.0:10009
+      --tlsextraip=0.0.0.0
+      --tlsextradomain=lnd
+      --accept-keysend
+      --accept-amp
+      --protocol.wumbo-channels
+      --maxpendingchannels=10
+      --alias=${LND_ALIAS:-VOID-NODE}
+      --color=#1a1a2e
+    healthcheck:
+      # Checa apenas se o daemon está escutando — lncli create vem depois
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 10009 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 45s
+
+  # ── Ride The Lightning (UI + NWC bridge) ──────────────────────────────────────
+  # RTL >= v0.15 inclui suporte nativo a NWC (Nostr Wallet Connect)
+  rtl:
+    image: shahanafarooqui/rtl:v0.15.8
+    container_name: rtl
+    restart: unless-stopped
+    depends_on:
+      lnd:
+        condition: service_healthy
+    volumes:
+      - lnd_data:/root/.lnd:ro
+      - rtl_data:/RTL
+      - ./config/rtl.json:/RTL/RTL-Config.json
+    networks:
+      void_net:
+        ipv4_address: 172.30.88.4
+    ports:
+      - "3000:3000"
+    environment:
+      # RTL concatena RTL-Config.json ao path — deve ser o diretório, não o ficheiro
+      RTL_CONFIG_PATH: /RTL
+      LND_SERVER_URL:  https://lnd:8080
+
+  # ── Motor quântico CQR + void-runner (GhostDocker / Higgs / Phantom) ─────────
+  # Subir: docker compose -f docker-compose.sovereign.yml --profile quantum up -d quantum-engine
+  # Harmonia: npm run cosmic:harmony   (QUANTUM_API=http://127.0.0.1:8472)
+  quantum-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile.quantum
+      network: host
+    container_name: quantum-engine
+    profiles: ["quantum"]
+    restart: unless-stopped
+    networks:
+      void_net:
+        ipv4_address: 172.30.88.7
+    ports:
+      - "8472:8472"
+    volumes:
+      - quantum_pool:/app/void_pool
+    environment:
+      QUANTUM_HOST: "0.0.0.0"
+      QUANTUM_PORT: "8472"
+      VOID_POOL_DIR: /app/void_pool
+    healthcheck:
+      test: ["CMD", "python", "/app/quantum/docker_healthcheck.py"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+  # HTTPS público → quantum-engine (URL fixa no APK: https://<VPS>:9443)
+  cqr-gateway:
+    image: caddy:2-alpine
+    container_name: cqr-gateway
+    profiles: ["quantum"]
+    restart: unless-stopped
+    depends_on:
+      quantum-engine:
+        condition: service_healthy
+    networks:
+      void_net:
+        ipv4_address: 172.30.88.9
+    ports:
+      - "${CQR_HTTPS_PORT:-9443}:443"
+    environment:
+      CQR_UPSTREAM: quantum-engine:8472
+    volumes:
+      - ./config/Caddyfile.cqr:/etc/caddy/Caddyfile:ro
+
+  # ── ET-RNET Server (Node + LND REST + AQRE/LUSUS) ─────────────────────────────
+  # Requer LND_MACAROON_HEX no .env.sovereign — subir depois do Passo 4.
+  # Subir apenas este serviço: docker compose -f docker-compose.sovereign.yml --profile server up -d etrnet-server
+  etrnet-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+      args:
+        VITE_NOSTR_RELAY_PRIMARY: ${VITE_NOSTR_RELAY_PRIMARY:-}
+        VITE_NOSTR_RELAY_FALLBACK: ${VITE_NOSTR_RELAY_FALLBACK:-}
+        VITE_BITCOIN_NETWORK: ${VITE_BITCOIN_NETWORK:-regtest}
+        VITE_ETRNET_TREASURY_NPUB: ${VITE_ETRNET_TREASURY_NPUB:-}
+        VITE_NWC_SECRET: ${VITE_NWC_SECRET:-}
+        VITE_LND_REST_URL: ${VITE_LND_REST_URL:-}
+        VITE_LND_MACAROON_HEX: ${VITE_LND_MACAROON_HEX:-}
+        VITE_ETRNET_ANCHOR_ADDRESS: ${VITE_ETRNET_ANCHOR_ADDRESS:-}
+        VITE_QUANTUM_API_URL: ${VITE_QUANTUM_API_URL:-http://127.0.0.1:8472}
+    container_name: etrnet-server
+    profiles: ["server"]  # não sobe com `up -d` sem --profile server
+    restart: unless-stopped
+    depends_on:
+      lnd:
+        condition: service_healthy
+    networks:
+      void_net:
+        ipv4_address: 172.30.88.5
+    ports:
+      - "3001:3001"
+    environment:
+      PORT:             3001
+      LND_REST_URL:     https://lnd:8080
+      LND_MACAROON_HEX: ${LND_MACAROON_HEX}
+      LND_TLS_SKIP:     "true"   # LND usa TLS auto-assinado internamente
+      NWC_SECRET:       ${NWC_SECRET:-}
+      NODE_ENV:         production
+      QUANTUM_API_URL:  http://quantum-engine:8472
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3001/health || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ── NOSTR Relay Próprio (nostr-rs-relay) ─────────────────────────────────────
+  # Relay NOSTR soberano usando nostr-rs-relay (Rust, alta performance).
+  # Suporta os kinds 31214-31219 usados pelo protocolo ETRNET.
+  # Subir: docker compose -f docker-compose.sovereign.yml up -d nostr-relay
+  # Conectar: ws://localhost:7777
+  nostr-relay:
+    image: scsibug/nostr-rs-relay:latest
+    container_name: nostr-relay
+    restart: unless-stopped
+    networks:
+      void_net:
+        ipv4_address: 172.30.88.6
+    ports:
+      - "7777:8080"   # WebSocket relay
+    volumes:
+      - nostr_data:/usr/src/app/db
+      - ./config/nostr.toml:/usr/src/app/config.toml:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf http://127.0.0.1:8080/ -o /dev/null 2>/dev/null || wget -q --spider http://127.0.0.1:8080/ 2>/dev/null || (echo >/dev/tcp/127.0.0.1/8080) 2>/dev/null || exit 1",
+        ]
+      interval: 15s
+      timeout: 8s
+      retries: 5
+      start_period: 25s
+
+  # ── VØID Frontend (ET-RNET SPA) ─────────────────────────────────────────────
+  # Frontend estático servido via Nginx. Build com Vite + nginx:alpine.
+  # Subir: docker compose -f docker-compose.sovereign.yml --profile frontend up -d void-frontend
+  void-frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VITE_NOSTR_RELAY_PRIMARY: ${VITE_NOSTR_RELAY_PRIMARY:-}
+        VITE_NOSTR_RELAY_FALLBACK: ${VITE_NOSTR_RELAY_FALLBACK:-}
+        VITE_QUANTUM_API_URL: ${VITE_QUANTUM_API_URL:-same-origin}
+        VITE_BITCOIN_NETWORK: ${VITE_BITCOIN_NETWORK:-regtest}
+        VITE_NWC_SECRET: ${VITE_NWC_SECRET:-}
+        VITE_LND_REST_URL: ${VITE_LND_REST_URL:-}
+        VITE_LND_MACAROON_HEX: ${VITE_LND_MACAROON_HEX:-}
+        VITE_ETRNET_ANCHOR_ADDRESS: ${VITE_ETRNET_ANCHOR_ADDRESS:-}
+        QUANTUM_UPSTREAM: http://quantum-engine:8472
+    container_name: void-frontend
+    profiles: ["frontend"]
+    restart: unless-stopped
+    depends_on:
+      nostr-relay:
+        condition: service_healthy
+      quantum-engine:
+        condition: service_healthy
+        required: false
+    networks:
+      void_net:
+        ipv4_address: 172.30.88.8
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080 || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 30s

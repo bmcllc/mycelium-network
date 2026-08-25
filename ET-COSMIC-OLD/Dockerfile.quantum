@@ -1,0 +1,42 @@
+##############################################################################
+# VØID Quantum — Motor CQR + void-runner (GhostDocker Rust)
+#
+# Pré-requisito:
+#   npm run production:quantum:prepare   # void-runner + venv Python no host
+#
+# O docker build NÃO corre pip/apt (DNS do daemon costuma falhar no build).
+##############################################################################
+
+FROM python:3.12-slim-bookworm
+
+WORKDIR /app
+
+COPY docker-quantum-venv/ /opt/venv/
+ENV PATH="/opt/venv/bin:${PATH}" \
+    VIRTUAL_ENV=/opt/venv \
+    PYTHONUNBUFFERED=1
+
+COPY quantum/ ./quantum/
+COPY pmu-base/python/ ./pmu-base/python/
+COPY docker-quantum-bin/void-runner /usr/local/bin/void-runner
+COPY docker-quantum-bin/pi_worker.wasm ./artifacts/pi_worker.wasm
+COPY scripts/quantum-docker-entrypoint.sh /usr/local/bin/quantum-entrypoint.sh
+
+RUN chmod +x /usr/local/bin/quantum-entrypoint.sh /usr/local/bin/void-runner && \
+    chmod +x /app/quantum/docker_healthcheck.py && \
+    mkdir -p /app/void_pool
+
+ENV ET_RNET_ROOT=/app \
+    VOID_COSMIC_ROOT=/app \
+    VOID_POOL_DIR=/app/void_pool \
+    VOID_RUNNER_BIN=/usr/local/bin/void-runner \
+    VOID_PI_WASM=/app/artifacts/pi_worker.wasm \
+    QUANTUM_HOST=0.0.0.0 \
+    QUANTUM_PORT=8472
+
+EXPOSE 8472
+
+HEALTHCHECK --interval=20s --timeout=10s --retries=5 --start-period=45s \
+  CMD ["python", "/app/quantum/docker_healthcheck.py"]
+
+ENTRYPOINT ["/usr/local/bin/quantum-entrypoint.sh"]

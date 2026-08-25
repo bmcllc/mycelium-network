@@ -1,0 +1,13 @@
+[
+  {
+    "platform": "telegram",
+    "platformId": "100001",
+    "username": "exemplo_void",
+    "nostrPubkey": ""
+  },
+  {
+    "platform": "twitter",
+    "platformId": "void_eternal",
+    "username": "void_eternal"
+  }
+]

@@ -119,6 +119,7 @@ pub async fn serve_horizon(
     let app = Router::new()
         .route("/", any(root))
         .route("/console", any(console))
+        .route("/catalog", any(catalog))
         .route("/health", any(health))
         .route("/metrics", any(metrics))
         .route("/plots/{id}", any(serve_plot))
@@ -239,6 +240,7 @@ async fn root(State(table): State<HorizonTable>) -> impl IntoResponse {
 
 /// UI mínima do Event Horizon — lista ions e links.
 async fn console(State(table): State<HorizonTable>) -> impl IntoResponse {
+    table.read().unwrap().bump_console_hit();
     let ions = {
         let t = table.read().unwrap();
         t.ion_upstreams()
@@ -281,7 +283,7 @@ async fn console(State(table): State<HorizonTable>) -> impl IntoResponse {
   <h1>Event Horizon</h1>
   <p>Console do Singularity — ions em órbita neste nó. Cada link passa pelo rizomorfo até a Vacuum Chamber.</p>
   <ul>{items}</ul>
-  <p class="meta"><a href="/">JSON</a> · <a href="/health">health</a></p>
+  <p class="meta"><a href="/catalog">catálogo JSON</a> · <a href="/">JSON</a> · <a href="/health">health</a></p>
 </body>
 </html>"#
     );
@@ -289,6 +291,15 @@ async fn console(State(table): State<HorizonTable>) -> impl IntoResponse {
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         html,
+    )
+}
+
+async fn catalog(State(table): State<HorizonTable>) -> impl IntoResponse {
+    let json = table.read().unwrap().catalog_json();
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        json,
     )
 }
 

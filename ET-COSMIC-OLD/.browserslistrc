@@ -1,0 +1,6 @@
+# Browsers alvo para o build ETΞRNET
+# Firefox 103+ (suporta ES2022 completo)
+> 0.5%
+last 2 Firefox versions
+Firefox >= 103
+not dead

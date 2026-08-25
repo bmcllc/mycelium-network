@@ -1,0 +1,46 @@
+# nostr-rs-relay — Configuração para stack ET-RNET soberana
+# Relay dedicado: ws://localhost:7777
+# Suporta kinds 0-9999 + 31214-31219 (protocolo ETRNET)
+
+[info]
+relay_url = "ws://localhost:7777"
+name = "ET-RNET Relay"
+description = "Relay NOSTR soberano para a rede ET-RNET. Suporta mesh P2P, UTXO anchoring e mensagens privadas E2EE."
+contact = "anon@etrnet.local"
+
+[database]
+# SQLite no volume Docker nostr_data
+data_directory = "/usr/src/app/db"
+in-memory = false
+
+[network]
+port = 8080
+address = "0.0.0.0"
+# Sem limite de rate para nós locais
+remote_ip_header = ""
+
+[limits]
+# Máx. 1MB por evento (shards UTXO podem ser grandes)
+max_event_bytes = 1048576
+max_ws_message_bytes = 2097152
+max_ws_frame_bytes = 2097152
+broadcast_buffer = 16384
+event_persist_timeout = 3000
+reject_future_seconds = 1800
+
+# Kinds relevantes para o protocolo ETRNET:
+#   31214 — UTXO anchor
+#   31215 — shard mesh
+#   31216 — GhostID handshake
+#   31217 — PoW challenge
+#   31218 — zkProof
+#   31219 — channel state
+# Aceitar todos os kinds por default (sem whitelist)
+
+[pay_to_relay]
+enabled = false
+
+[authorization]
+# Relay aberto — sem autenticação NIP-42 para uso interno
+nip42_auth = false
+nip42_whitelist = false

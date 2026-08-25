@@ -1,0 +1,41 @@
+{
+  "port": "3000",
+  "defaultNodeIndex": 1,
+  "dbDirectoryPath": "/RTL",
+  "SSO": {
+    "rtlSSO": 0,
+    "rtlCookiePath": ""
+  },
+  "nodes": [
+    {
+      "index": 1,
+      "lnNode": "VOID-LND",
+      "lnImplementation": "LND",
+      "NWC": {
+        "isActive": true,
+        "relays": [
+          "wss://relay.primal.net",
+          "wss://relay.damus.io"
+        ],
+        "budgetAmount": 1000,
+        "budgetCurrency": "SATS",
+        "budgetRenewal": "DAILY",
+        "isEnabled": true
+      },
+      "authentication": {
+        "configPath": "/root/.lnd/lnd.conf",
+        "macaroonPath": "/root/.lnd/data/chain/bitcoin/regtest"
+      },
+      "settings": {
+        "userPersona": "OPERATOR",
+        "themeMode": "NIGHT",
+        "themeColor": "PURPLE",
+        "logLevel": "WARNING",
+        "lnServerUrl": "https://lnd:8080",
+        "fiatConversion": false,
+        "unannouncedChannels": false
+      }
+    }
+  ],
+  "multiPassHashed": "96ab1b99f4ab1d68c7cf467a5ed64d17be792ebbc55c2dd0539ca6a761a95038"
+}

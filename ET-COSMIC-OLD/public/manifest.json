@@ -1,0 +1,82 @@
+{
+  "name": "ETΞRNET / VOID-COSMIC",
+  "short_name": "ETΞRNET",
+  "id": "/",
+  "description": "Computação Quântica-Relativística Soberana — Sem servidores, sem identidade, sem rastro",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0a0a0f",
+  "theme_color": "#00f0ff",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["technology", "productivity", "utilities"],
+  "lang": "pt-BR",
+  "dir": "ltr",
+  "prefer_related_applications": false,
+  "share_target": {
+    "action": "/share",
+    "method": "POST",
+    "enctype": "multipart/form-data",
+    "params": {
+      "title": "title",
+      "text": "text",
+      "url": "url",
+      "files": [
+        {
+          "name": "files",
+          "accept": ["*/*"]
+        }
+      ]
+    }
+  },
+  "protocol_handlers": [
+    {
+      "protocol": "web+eternet",
+      "url": "/protocol/%s"
+    },
+    {
+      "protocol": "web+sov",
+      "url": "/wallet/%s"
+    }
+  ],
+  "related_applications": [],
+  "shortcuts": [
+    {
+      "name": "Pagamentos",
+      "short_name": "Pay",
+      "description": "Gateway de pagamento Lightning via NWC",
+      "url": "/finance/payment",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Juntar à Mesh",
+      "short_name": "Mesh",
+      "description": "Ativar nó P2P na rede ETERNET",
+      "url": "/?action=join",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Sabor Quântico",
+      "short_name": "SQ",
+      "description": "Calculadora de preços e tiers",
+      "url": "/sabor-quantico",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }]
+    }
+  ],
+  "screenshots": [],
+  "iarc_rating_id": "",
+  "edge_side_panel": {}
+}

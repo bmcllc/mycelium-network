@@ -1,0 +1,91 @@
+ET-COSMIC / ETΞRNET / VØID Ecosystem
+=====================================
+
+Copyright (C) 2024-2026 Bruno Monteiro Caldas da Cunha
+MontêLauro Foundation — mantenedora de referência do monorepo
+
+Licença pública (totalmente livre): GNU Affero General Public License v3.0 ou posterior
+(SPDX: AGPL-3.0-or-later). Texto: LICENSE · manifesto: LICENCA-LIVRE.md
+Créditos: CREDITS.md
+Licença comercial (opcional): COMMERCIAL-LICENSE.md
+Reserva IA / anti-clonagem: AI-USE-RESERVATION.md · public/ai.txt
+
+────────────────────────────────────────────────────────────────────────────
+RESERVA DE USO — IA, MINERAÇÃO E ENGENHARIA REVERSA (COMERCIAL)
+────────────────────────────────────────────────────────────────────────────
+
+O titular RESERVA expressamente (ver AI-USE-RESERVATION.md):
+
+  • Treino, fine-tuning ou destilação de modelos de IA com este código ou docs
+  • Scraping automatizado para datasets de código ou clones via codegen
+  • Mineração de texto/dados (TDM) comercial sem licença escrita (opt-out UE art. 4.º(3))
+  • Engenharia reversa de binários comerciais (ramo 2), salvo lei imperativa
+
+Sinalização: public/ai.txt, public/robots.txt, meta noindex AI no index.html.
+
+NOTA GPL: a GPL permite estudo e RE para interoperabilidade no ramo comunitário;
+a reserva acima aplica-se a usos FORA do âmbito GPL (IA, clonagem, comercial).
+
+────────────────────────────────────────────────────────────────────────────
+CÓDIGO ABERTO — ANTI-PRIVATIZAÇÃO
+────────────────────────────────────────────────────────────────────────────
+
+Este monorepo é e permanece software livre sob GPL. É PROIBIDO, no âmbito da
+licença comunitária:
+
+  • Remover ou substituir LICENSE, NOTICE, DUAL-LICENSE.md ou CREDITS.md
+  • Distribuir binários sem oferecer código-fonte correspondente (GPL §6)
+  • Remover créditos de autoria da interface ou dos cabeçalhos-fonte
+  • Alegar propriedade exclusiva sobre o upstream público sem licença comercial
+
+Forks públicos herdam GPL. Privatização só via contrato comercial (ramo 2 em
+DUAL-LICENSE.md), nunca por “fechar” o repositório oficial.
+
+────────────────────────────────────────────────────────────────────────────
+ATRIBUIÇÃO OBRIGATÓRIA (derivados e forks)
+────────────────────────────────────────────────────────────────────────────
+
+Qualquer distribuição, fork ou produto derivado DEVE:
+
+1. Manter este NOTICE (ou equivalente) com os créditos intactos.
+2. Exibir na interface, de forma legível:
+      « Powered by ET-COSMIC · MontêLauro Foundation / Bruno Cunha »
+   (ou tradução equivalente — ver getAttributionNotice() no código).
+3. Não remover avisos de copyright dos ficheiros-fonte (GPL §4).
+4. Publicar código-fonte completo das modificações ao distribuir binários.
+
+Crédito curto (UI):     ET-COSMIC · Bruno Cunha
+Crédito longo (docs):   Bruno Monteiro Caldas da Cunha — MontêLauro Foundation
+
+────────────────────────────────────────────────────────────────────────────
+LICENCIAMENTO COMERCIAL (dual licensing — ramo 2)
+────────────────────────────────────────────────────────────────────────────
+
+Uso em produto proprietário/fechado do SDK ou módulos seleccionados SEM
+publicar fonte exige licença comercial do titular. Isto NÃO remove a GPL do
+repositório público nem impede forks abertos.
+
+  Ver DUAL-LICENSE.md, COMMERCIAL-LICENSE.md e AI-USE-RESERVATION.md
+
+────────────────────────────────────────────────────────────────────────────
+ROYALTIES DE PROTOCOLO (taxa técnica transparente)
+────────────────────────────────────────────────────────────────────────────
+
+Taxa configurável (predefinição 10 bps = 0,1 %) em canais oficiais:
+
+  • Payment Gateway (Lightning / NWC)
+  • Nostr DEX
+  • Symbiont / ANIMUS (compute — quando activado)
+
+Destino: VITE_ETRNET_TREASURY_NPUB (tesouraria de governança).
+A taxa NÃO privatiza o código; o fonte permanece GPL.
+
+Módulo: src/protocol/sovereignty/protocolRoyalty.ts
+Painel: /governance/sovereignty
+
+────────────────────────────────────────────────────────────────────────────
+COMPONENTES DE TERCEIROS
+────────────────────────────────────────────────────────────────────────────
+
+Dependências npm, Python e Rust mantêm as suas licenças originais.
+Consulte package.json, quantum/requirements.txt e Cargo.toml.

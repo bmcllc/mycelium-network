@@ -25,8 +25,9 @@ use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 use hickory_resolver::Resolver;
 use libp2p::Multiaddr;
 use mycelium_core::Membrane;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// URL padrão do catálogo público (sobrescrevível).
 pub const DEFAULT_BOOTSTRAP_URL: &str =
@@ -56,11 +57,36 @@ pub fn with_membrane_flag(multiaddr: &str, membrane: Membrane) -> String {
     format!("{base}{}", membrane.seed_suffix())
 }
 
-/// Livro de sementes: peers conhecidos para bootstrap remoto.
+/// Tempo de vida padrão de uma seed sem confirmação de vida (7 dias).
+const SEED_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+/// Intervalo mínimo entre health checks da mesma seed (1 hora).
+const SEED_HEALTH_MIN_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Entrada de seed com metadados de vida.
+#[derive(Debug, Clone)]
+pub struct SeedEntry {
+    pub addr: String,           // multiaddr com flag de membrana opcional
+    pub first_seen: u64,        // unix secs
+    pub last_seen: u64,         // unix secs (atualizado em health check OK)
+    pub source: SeedSource,     // origem da seed
+    pub health_failures: u32,   // falhas consecutivas de health check
+}
+
+/// Origem da seed para priorização.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedSource {
+    Cli,        // passada na CLI (alta confiança)
+    LocalFile,  // seeds.txt no home
+    DnsTxt,     // DNS TXT (Spore Bank)
+    HttpCatalog,// catálogo HTTP público
+    Gossip,     // recebida via gossip de peer (baixa confiança inicial)
+}
+
+/// Livro de sementes descentralizado: peers com TTL, health check e merge via gossip.
 #[derive(Debug, Clone, Default)]
 pub struct SeedBook {
-    /// Entradas com possível sufixo `/floresta` etc.
-    seeds: BTreeSet<String>,
+    /// Entradas com metadados de vida.
+    seeds: BTreeMap<String, SeedEntry>,
 }
 
 impl SeedBook {
@@ -77,6 +103,11 @@ impl SeedBook {
     }
 
     pub fn add(&mut self, addr: impl AsRef<str>) -> Result<(), HyphaeError> {
+        self.add_with_source(addr, SeedSource::Cli)
+    }
+
+    /// Adiciona seed com fonte explícita (usado por merge de gossip).
+    pub fn add_with_source(&mut self, addr: impl AsRef<str>, source: SeedSource) -> Result<(), HyphaeError> {
         let mut s = addr.as_ref().trim().to_string();
         if s.is_empty() || s.starts_with('#') {
             return Ok(());
@@ -93,7 +124,20 @@ impl SeedBook {
         } else {
             base.to_string()
         };
-        self.seeds.insert(stored);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let entry = self.seeds.entry(stored.clone()).or_insert(SeedEntry {
+            addr: stored,
+            first_seen: now,
+            last_seen: now,
+            source,
+            health_failures: 0,
+        });
+        entry.last_seen = now;
+        // Fonte CLI/LocalFile sobrepõe Gossip; outras mantêm a mais confiável
+        if matches!(source, SeedSource::Cli | SeedSource::LocalFile)
+            || entry.source == SeedSource::Gossip && !matches!(source, SeedSource::Gossip) {
+            entry.source = source;
+        }
         Ok(())
     }
 
@@ -103,12 +147,12 @@ impl SeedBook {
         S: AsRef<str>,
     {
         for s in iter {
-            self.add(s)?;
+            self.add_with_source(s, SeedSource::LocalFile)?;
         }
         Ok(())
     }
 
-    /// Carrega linhas de um arquivo texto.
+    /// Carrega linhas de um arquivo texto (fonte LocalFile).
     pub fn load_file(&mut self, path: impl AsRef<Path>) -> Result<usize, HyphaeError> {
         let path = path.as_ref();
         if !path.exists() {
@@ -117,11 +161,11 @@ impl SeedBook {
         let text = std::fs::read_to_string(path)
             .map_err(|e| HyphaeError::Addr(format!("lendo {}: {e}", path.display())))?;
         let before = self.seeds.len();
-        self.parse_text(&text)?;
+        self.parse_text_with_source(&text, SeedSource::LocalFile)?;
         Ok(self.seeds.len() - before)
     }
 
-    /// Persiste o livro em disco.
+    /// Persiste o livro em disco (apenas addr, sem metadados internos).
     pub fn save_file(&self, path: impl AsRef<Path>) -> Result<(), HyphaeError> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -129,8 +173,8 @@ impl SeedBook {
                 .map_err(|e| HyphaeError::Addr(e.to_string()))?;
         }
         let mut body = String::from("# Mycelium seed book\n");
-        for s in &self.seeds {
-            body.push_str(s);
+        for entry in self.seeds.values() {
+            body.push_str(&entry.addr);
             body.push('\n');
         }
         std::fs::write(path, body).map_err(|e| HyphaeError::Addr(e.to_string()))?;
@@ -138,13 +182,18 @@ impl SeedBook {
     }
 
     pub fn parse_text(&mut self, text: &str) -> Result<(), HyphaeError> {
+        self.parse_text_with_source(text, SeedSource::LocalFile)
+    }
+
+    /// Parse com fonte explícita (usado por load_file e merge de gossip).
+    pub fn parse_text_with_source(&mut self, text: &str, source: SeedSource) -> Result<(), HyphaeError> {
         for line in text.lines() {
-            self.add(line)?;
+            self.add_with_source(line, source)?;
         }
         Ok(())
     }
 
-    /// Baixa um catálogo HTTP(S) de seeds.
+    /// Baixa um catálogo HTTP(S) de seeds (fonte HttpCatalog).
     /// Roda em thread OS própria (reqwest blocking não pode nestar no Tokio do daemon).
     pub fn fetch_url(&mut self, url: &str) -> Result<usize, HyphaeError> {
         let url = url.to_string();
@@ -163,11 +212,12 @@ impl SeedBook {
         .join()
         .map_err(|_| HyphaeError::Addr("fetch_url thread panicked".into()))??;
         let before = self.seeds.len();
-        self.parse_text(&text)?;
+        self.parse_text_with_source(&text, SeedSource::HttpCatalog)?;
         Ok(self.seeds.len() - before)
     }
 
-    /// Resolve registros TXT e importa multiaddrs (Spore Bank DNS).
+    /// Resolve registros TXT e importa multiaddrs (fonte DnsTxt).
+    /// Funciona para QUALQUER domínio, não só Spore Bank — qualquer nó pode publicar seeds.
     /// Hickory `Resolver::new` sobe um runtime Tokio — não pode correr no runtime do daemon.
     pub fn fetch_dns_txt(&mut self, name: &str) -> Result<usize, HyphaeError> {
         let name = name.to_string();
@@ -195,7 +245,7 @@ impl SeedBook {
         let before = self.seeds.len();
         for text in blobs {
             for part in text.split(|c: char| c == '\n' || c == ';' || c == ',') {
-                let _ = self.add(part.trim());
+                let _ = self.add_with_source(part.trim(), SeedSource::DnsTxt);
             }
         }
         Ok(self.seeds.len() - before)
@@ -240,10 +290,15 @@ impl SeedBook {
     }
 
     /// Multiaddrs para dial, filtrados/ordenados pela membrana local.
+    /// Ignora seeds expiradas (TTL).
     pub fn multiaddrs_for(&self, local: Membrane) -> Vec<Multiaddr> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let mut ranked: Vec<(u8, Multiaddr)> = Vec::new();
-        for entry in &self.seeds {
-            let (base, remote) = split_membrane_suffix(entry);
+        for entry in self.seeds.values() {
+            if now - entry.last_seen > SEED_TTL.as_secs() {
+                continue; // seed expirada
+            }
+            let (base, remote) = split_membrane_suffix(&entry.addr);
             let Some(rank) = seed_dial_rank(local, remote) else {
                 continue;
             };
@@ -264,11 +319,78 @@ impl SeedBook {
         self.multiaddrs_for(Membrane::Floresta)
     }
 
+    /// Retorna apenas os endereços brutos (para persistência/debug).
     pub fn as_strings(&self) -> Vec<String> {
-        self.seeds.iter().cloned().collect()
+        self.seeds.values().map(|e| e.addr.clone()).collect()
+    }
+
+    /// Merge descentralizado: recebe seeds de peer via gossip e mescla.
+    /// Fontes Gossip têm prioridade menor que CLI/LocalFile/DnsTxt/HttpCatalog.
+    /// Retorna número de seeds novas adicionadas.
+    pub fn merge_gossip(&mut self, peer_seeds: &[String]) -> Result<usize, HyphaeError> {
+        let before = self.seeds.len();
+        for s in peer_seeds {
+            self.add_with_source(s, SeedSource::Gossip)?;
+        }
+        Ok(self.seeds.len() - before)
+    }
+
+    /// Executa health check em todas as seeds (dial TCP rápido).
+    /// Atualiza last_seen em sucesso; incrementa health_failures em falha.
+    /// Remove seeds com >3 falhas consecutivas OU TTL expirado.
+    /// Deve rodar periodicamente (ex.: a cada 1h no organismo).
+    pub fn health_check(&mut self) -> Result<usize, HyphaeError> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let mut checked = 0;
+        let mut to_remove = Vec::new();
+
+        for (addr, entry) in &mut self.seeds {
+            // Rate limit: não checar a mesma seed mais que 1x/hora
+            if now - entry.last_seen < SEED_HEALTH_MIN_INTERVAL.as_secs() {
+                continue;
+            }
+            // Pula seeds expiradas por TTL
+            if now - entry.last_seen > SEED_TTL.as_secs() {
+                to_remove.push(addr.clone());
+                continue;
+            }
+            checked += 1;
+            let (base, _) = split_membrane_suffix(&entry.addr);
+            if let Ok(multiaddr) = base.parse::<Multiaddr>() {
+                // Tenta dial rápido (5s timeout) - só testa alcançabilidade
+                if health_dial(&multiaddr).is_ok() {
+                    entry.last_seen = now;
+                    entry.health_failures = 0;
+                } else {
+                    entry.health_failures += 1;
+                    if entry.health_failures >= 3 {
+                        to_remove.push(addr.clone());
+                    }
+                }
+            }
+        }
+        for addr in to_remove {
+            self.seeds.remove(&addr);
+        }
+        Ok(checked)
+    }
+
+    /// Remove seeds expiradas (TTL) sem fazer health check.
+    /// Chamado na inicialização e no tick periódico.
+    pub fn prune_expired(&mut self) -> usize {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let before = self.seeds.len();
+        self.seeds.retain(|_, e| now - e.last_seen <= SEED_TTL.as_secs());
+        before - self.seeds.len()
+    }
+
+    /// Serializa seeds para envio via gossip (apenas addr strings).
+    pub fn to_gossip_payload(&self) -> Vec<String> {
+        self.seeds.values().map(|e| e.addr.clone()).collect()
     }
 
     /// Monta o livro a partir das fontes padrão do nó.
+    /// Agora também faz prune de seeds expiradas e health check inicial.
     pub fn assemble(
         home: &Path,
         cli_seeds: &[String],
@@ -285,6 +407,9 @@ impl SeedBook {
         if let Some(path) = seed_file {
             book.load_file(path)?;
         }
+
+        // Prune seeds expiradas do disco
+        book.prune_expired();
 
         let dns_name = std::env::var("MYCELIUM_DNS_SEEDS").ok();
         if public_bootstrap || dns_name.is_some() {
@@ -310,8 +435,56 @@ impl SeedBook {
             }
         }
 
+        // Health check inicial das seeds carregadas
+        let _ = book.health_check();
+
         Ok(book)
     }
+}
+
+/// Tenta dial TCP rápido (5s) em qualquer endereço da multiaddr.
+/// Retorna Ok se pelo menos um endereço conectar.
+pub fn health_dial(multiaddr: &Multiaddr) -> Result<(), HyphaeError> {
+    use std::net::{IpAddr, SocketAddr};
+    use std::time::Duration;
+
+    // Extrai IP e porta da multiaddr (formato típico: /ip4/X/tcp/P ou /ip6/X/tcp/P)
+    let addr_str = multiaddr.to_string();
+    let parts: Vec<&str> = addr_str.split('/').collect();
+    let mut ip: Option<IpAddr> = None;
+    let mut port: Option<u16> = None;
+    for i in 0..parts.len() {
+        match parts.get(i) {
+            Some(&"ip4") if i + 1 < parts.len() => {
+                if let Ok(parsed) = parts[i + 1].parse::<std::net::Ipv4Addr>() {
+                    ip = Some(IpAddr::V4(parsed));
+                }
+            }
+            Some(&"ip6") if i + 1 < parts.len() => {
+                if let Ok(parsed) = parts[i + 1].parse::<std::net::Ipv6Addr>() {
+                    ip = Some(IpAddr::V6(parsed));
+                }
+            }
+            Some(&"tcp") if i + 1 < parts.len() => {
+                if let Ok(parsed) = parts[i + 1].parse::<u16>() {
+                    port = Some(parsed);
+                }
+            }
+            Some(&"udp") if i + 1 < parts.len() => {
+                if let Ok(parsed) = parts[i + 1].parse::<u16>() {
+                    port = Some(parsed);
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(ip) = ip else { return Err(HyphaeError::Addr("sem IP na multiaddr".into())) };
+    let Some(port) = port else { return Err(HyphaeError::Addr("sem porta na multiaddr".into())) };
+
+    let socket = SocketAddr::new(ip, port);
+    std::net::TcpStream::connect_timeout(&socket, Duration::from_secs(5))
+        .map(|_| ())
+        .map_err(|e| HyphaeError::Addr(e.to_string()))
 }
 
 #[cfg(test)]
@@ -377,5 +550,82 @@ mod tests {
         let (base, m) = split_membrane_suffix(&s);
         assert_eq!(base, "/ip6/2001:db8::1/tcp/4001");
         assert_eq!(m, Some(Membrane::Esporocarp));
+    }
+
+    #[test]
+    fn source_tracking_works() {
+        let mut book = SeedBook::new();
+        book.add_with_source("/ip4/1.2.3.4/tcp/4001", SeedSource::DnsTxt).unwrap();
+        book.add_with_source("/ip4/1.2.3.4/tcp/4001", SeedSource::Gossip).unwrap();
+        // Já existe; a fonte mais confiável (DnsTxt) deve permanecer.
+        let entry = book.seeds.values().next().unwrap();
+        assert_eq!(entry.source, SeedSource::DnsTxt);
+    }
+
+    #[test]
+    fn gossip_merge_adds_new_seeds_without_overwriting_confidence() {
+        let mut book = SeedBook::new();
+        book.add_with_source("/ip4/1.2.3.4/tcp/4001", SeedSource::Cli).unwrap();
+        let new_seeds = vec![
+            "/ip4/1.2.3.4/tcp/4001".to_string(), // já existe (Cli)
+            "/ip4/5.6.7.8/tcp/4001".to_string(), // nova
+        ];
+        let added = book.merge_gossip(&new_seeds).unwrap();
+        assert_eq!(added, 1, "só a nova deve ser adicionada");
+        assert_eq!(book.len(), 2);
+        // A seed existente mantém a fonte Cli (não rebaixada por gossip).
+        assert_eq!(
+            book.seeds.values().find(|e| e.addr.contains("1.2.3.4")).unwrap().source,
+            SeedSource::Cli
+        );
+        // A nova seed é fonte Gossip.
+        assert_eq!(
+            book.seeds.values().find(|e| e.addr.contains("5.6.7.8")).unwrap().source,
+            SeedSource::Gossip
+        );
+    }
+
+    #[test]
+    fn to_gossip_payload_round_trips() {
+        let mut book = SeedBook::new();
+        book.add("/ip4/1.2.3.4/tcp/4001").unwrap();
+        book.add("/ip6/::1/tcp/4001").unwrap();
+        let payload = book.to_gossip_payload();
+        let mut other = SeedBook::new();
+        let added = other.merge_gossip(&payload).unwrap();
+        assert_eq!(added, 2);
+        assert_eq!(other.len(), 2);
+    }
+
+    #[test]
+    fn prune_expired_removes_stale() {
+        let mut book = SeedBook::new();
+        book.add("/ip4/1.2.3.4/tcp/4001").unwrap();
+        book.add("/ip4/5.6.7.8/tcp/4001").unwrap();
+        // Re-baixar last_seen de uma seed para forçar expiração
+        let entry = book.seeds.values_mut().next().unwrap();
+        entry.last_seen = entry.first_seen; // já vai expirar
+        // Mas prune_expired só remove se now - last_seen > TTL.
+        // Manipulamos para o passado distante:
+        entry.last_seen = 0;
+        let removed = book.prune_expired();
+        assert!(removed >= 1);
+    }
+
+    #[test]
+    fn multiaddrs_skip_expired_seeds() {
+        let mut book = SeedBook::new();
+        book.add("/ip4/1.2.3.4/tcp/4001").unwrap();
+        let entry = book.seeds.values_mut().next().unwrap();
+        entry.last_seen = 0; // expirada
+        let addrs = book.multiaddrs_for(Membrane::Floresta);
+        assert!(addrs.is_empty(), "seed expirada não deve aparecer");
+    }
+
+    #[test]
+    fn health_dial_rejects_invalid_multiaddr() {
+        // /dnsaddr não tem IP/porta, deve falhar.
+        let addr: Multiaddr = "/dnsaddr/foo.bar".parse().unwrap();
+        assert!(health_dial(&addr).is_err());
     }
 }

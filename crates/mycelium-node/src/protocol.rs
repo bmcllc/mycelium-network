@@ -100,6 +100,13 @@ pub enum Envelope {
     /// Voucher de liquidação assinado pelo pagador (economia sem câmara
     /// de compensação: o beneficiário credita só com assinatura válida).
     VoucherRedeem { voucher: Voucher },
+    /// Anúncio do Ion que este nó expõe no seu Event Horizon —
+    /// alimenta o catálogo global da console ErgotOS.
+    IonAnnounce {
+        node_id: NodeId,
+        ion: String,
+        membrane: String,
+    },
     /// Overlay de zonas: entrega direcionada — só `to` processa `inner`.
     /// Nós intermediários replicam no gossip mas ignoram o conteúdo.
     Direct {
@@ -198,6 +205,24 @@ mod tests {
             Envelope::Direct { to, inner } => {
                 assert_eq!(to, NodeId::derive(b"destino"));
                 assert!(matches!(*inner, Envelope::LayerNeed { .. }));
+            }
+            _ => panic!("tipo errado"),
+        }
+    }
+
+    #[test]
+    fn ion_announce_roundtrip() {
+        let env = Envelope::IonAnnounce {
+            node_id: NodeId::derive(b"node"),
+            ion: "webapp".into(),
+            membrane: "floresta".into(),
+        };
+        let back = Envelope::decode(&env.encode().unwrap()).unwrap();
+        match back {
+            Envelope::IonAnnounce { node_id, ion, membrane } => {
+                assert_eq!(node_id, NodeId::derive(b"node"));
+                assert_eq!(ion, "webapp");
+                assert_eq!(membrane, "floresta");
             }
             _ => panic!("tipo errado"),
         }

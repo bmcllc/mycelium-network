@@ -1,0 +1,47 @@
+# ET-COSMIC — crawlers (incl. treino IA)
+# Ver AI-USE-RESERVATION.md e public/ai.txt
+
+User-agent: *
+Disallow: /src/
+Disallow: /quantum/
+Disallow: /void_runner/
+Disallow: /void_core/
+Disallow: /docs/archive/
+Disallow: /dist/
+
+# Bots de treino / scraping para modelos (lista não exaustiva)
+User-agent: GPTBot
+Disallow: /
+
+User-agent: ChatGPT-User
+Disallow: /
+
+User-agent: Google-Extended
+Disallow: /
+
+User-agent: anthropic-ai
+Disallow: /
+
+User-agent: ClaudeBot
+Disallow: /
+
+User-agent: CCBot
+Disallow: /
+
+User-agent: cohere-ai
+Disallow: /
+
+User-agent: PerplexityBot
+Disallow: /
+
+User-agent: Bytespider
+Disallow: /
+
+User-agent: meta-externalagent
+Disallow: /
+
+User-agent: Amazonbot
+Disallow: /
+
+# PWA pública — política IA em ai.txt
+Allow: /
