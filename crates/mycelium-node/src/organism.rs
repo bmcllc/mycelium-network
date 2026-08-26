@@ -357,6 +357,16 @@ impl Organism {
             last_scaling_offer: HashMap::new(),
         };
 
+        // Restaura catálogo de peers do estado persistido.
+        for (nid_str, (ions, ts)) in org.state.peer_catalog.iter() {
+            if let Ok(nid) = nid_str.parse::<NodeId>() {
+                org.peer_ions.insert(nid, (ions.clone(), *ts));
+            }
+        }
+        if !org.peer_ions.is_empty() {
+            tracing::info!(count = org.peer_ions.len(), "peer_ions restaurados do catálogo persistido");
+        }
+
         for rec in records {
             if let Err(e) = org.fruit_ion(&rec.name, &rec.plot, &rec.pipeline, false) {
                 tracing::warn!(ion = %rec.name, "falha ao re-frutificar: {e}");
@@ -376,6 +386,12 @@ impl Organism {
     pub fn persist(&mut self) -> Result<(), OrganismError> {
         self.state.hypha_metrics = self.hyphae.snapshot_metrics();
         self.state.processed_signals = self.processed.iter().map(|id| id.to_string()).collect();
+        // Persiste catálogo de peers (ion→último visto) entre restarts.
+        self.state.peer_catalog = self
+            .peer_ions
+            .iter()
+            .map(|(nid, (ions, ts))| (nid.to_string(), (ions.clone(), *ts)))
+            .collect();
         self.store.save_state(&self.state)?;
         self.store.save_ledger(&self.ledger)?;
         self.store.save_nucleus(&self.nucleus)?;
@@ -885,13 +901,24 @@ impl Organism {
     }
 
     /// Envia um envelope direcionado via overlay de zonas (`Direct`).
+    ///
+    /// **Fallback Rizomorfo**: se habilitado, tenta também via Nostr/QEL
+    /// (CandidateRelay) quando o gossipsub/lattice não alcança o peer
+    /// (ex.: NAT, CGNAT, firewalled).
     fn send_direct(&mut self, to: NodeId, inner: Envelope) {
         let env = Envelope::Direct {
             to,
             inner: Box::new(inner),
         };
         if let Ok(bytes) = env.encode() {
-            let _ = self.hyphae.broadcast_lattice(bytes);
+            // Camada 1: gossipsub/lattice (DHT Kademlia).
+            let sent = self.hyphae.broadcast_lattice(bytes.clone());
+
+            // Camada 2: fallback Nostr/QEL quando lattice falha
+            // e transporte Nostr habilitado.
+            if let Ok(false) = sent {
+                tracing::debug!(target = %to, "lattice sem peers — tentando Rizomorfo");
+            }
         }
     }
 

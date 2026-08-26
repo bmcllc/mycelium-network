@@ -7,6 +7,7 @@ use mycelium_hyphae::HyphaMetrics;
 use mycelium_nutrients::Ledger;
 use mycelium_pheromones::Gland;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use thefield::Field;
 
@@ -39,6 +40,10 @@ pub struct OrganismState {
     /// Porta do Event Horizon HTTP (default 7474).
     #[serde(default = "default_horizon_port")]
     pub horizon_port: u16,
+    /// Catálogo global de ions dos peers (node_id → (ions, último visto)).
+    /// Persiste entre restarts para manter visibilidade da rede.
+    #[serde(default)]
+    pub peer_catalog: HashMap<String, (Vec<String>, u64)>,
 }
 
 fn default_horizon_port() -> u16 {
