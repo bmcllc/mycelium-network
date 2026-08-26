@@ -281,6 +281,8 @@ pub struct HyphaeNode {
     relay_mesh: RelayMesh,
     #[cfg(feature = "nostr-transport")]
     nostr_home: Option<std::path::PathBuf>,
+    #[cfg(feature = "nostr-transport")]
+    nostr_relay: Option<String>,
 }
 
 impl HyphaeNode {
@@ -517,6 +519,8 @@ impl HyphaeNode {
             ),
             #[cfg(feature = "nostr-transport")]
             nostr_home: config.nostr_home.clone(),
+            #[cfg(feature = "nostr-transport")]
+            nostr_relay: config.nostr_relay.clone(),
         };
 
         // Bootstrap: IPv6 primeiro (SeedBook já ordena; reordena por segurança).
@@ -878,6 +882,55 @@ impl HyphaeNode {
         let addr = mycelium_nostr_transport::encode_nostr_multiaddr(relay_url, ghost_hex);
         tracing::info!(%addr, "dial Nostr transport");
         self.reach(addr)
+    }
+
+    /// Fallback Nostr/QEL: dispara descoberta CandidateRelay + redial
+    /// e republica o dado no lattice. Usado quando `broadcast_lattice`
+    /// retorna `false` (nenhum peer conectado ao tópico).
+    #[cfg(feature = "nostr-transport")]
+    pub fn send_nostr_fallback(&mut self, data: &[u8]) -> Result<(), HyphaeError> {
+        let relay = self
+            .nostr_relay
+            .clone()
+            .unwrap_or_else(|| "wss://nos.lol".to_string());
+        let home = self
+            .nostr_home
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from(".mycelium"));
+
+        // 1. Descobre peers CandidateRelay e dial via Nostr transport.
+        let home_clone = home.clone();
+        let relay_clone = relay.clone();
+        let discovered = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                use mycelium_nostr::announce_and_discover_session;
+                let mut already: std::collections::HashMap<String, std::time::Instant> = std::collections::HashMap::new();
+                let Ok((_pk, peers)) =
+                    announce_and_discover_session(&home_clone, &relay_clone).await
+                else {
+                    return 0usize;
+                };
+                let mut dialed = 0usize;
+                for peer in peers.into_iter().take(3) {
+                    let r = if peer.relay_url.starts_with("wss://") {
+                        peer.relay_url.as_str()
+                    } else {
+                        &relay_clone
+                    };
+                    if self.reach_nostr(r, &peer.ghost_id).is_ok() {
+                        dialed += 1;
+                    }
+                }
+                dialed
+            })
+        });
+        tracing::debug!(discovered, "nostr fallback: peers dialados");
+
+        // 2. Republica no lattice com os peers recém-conectados.
+        if discovered > 0 {
+            let _ = self.publish(self.lattice_topic.clone(), data.to_vec());
+        }
+        Ok(())
     }
 
     /// Descoberta CandidateRelay (sessão estável) + dial dos peers frescos.

@@ -902,22 +902,31 @@ impl Organism {
 
     /// Envia um envelope direcionado via overlay de zonas (`Direct`).
     ///
-    /// **Fallback Rizomorfo**: se habilitado, tenta também via Nostr/QEL
-    /// (CandidateRelay) quando o gossipsub/lattice não alcança o peer
-    /// (ex.: NAT, CGNAT, firewalled).
+    /// **Rizomorfo mesh**: gossipsub/lattice é camada 1. Se nenhum peer
+    /// está conectado ao tópico (`broadcast_lattice` retorna false),
+    /// dispara fallback via CandidateRelay (Nostr transport) que descobre
+    /// e diala peers através de relays, depois republica no lattice.
     fn send_direct(&mut self, to: NodeId, inner: Envelope) {
         let env = Envelope::Direct {
             to,
             inner: Box::new(inner),
         };
         if let Ok(bytes) = env.encode() {
-            // Camada 1: gossipsub/lattice (DHT Kademlia).
-            let sent = self.hyphae.broadcast_lattice(bytes.clone());
-
-            // Camada 2: fallback Nostr/QEL quando lattice falha
-            // e transporte Nostr habilitado.
-            if let Ok(false) = sent {
-                tracing::debug!(target = %to, "lattice sem peers — tentando Rizomorfo");
+            match self.hyphae.broadcast_lattice(bytes.clone()) {
+                Ok(true) => {} // Lattice alcançou peers — OK.
+                Ok(false) => {
+                    tracing::debug!(target = %to, "lattice sem peers — tentando Rizomorfo");
+                    #[cfg(feature = "nostr-transport")]
+                    if self.enable_nostr_transport {
+                        match self.hyphae.send_nostr_fallback(&bytes) {
+                            Ok(()) => tracing::info!(target = %to, "rizomorfo fallback concluído"),
+                            Err(e) => tracing::warn!(target = %to, error = %e, "rizomorfo fallback falhou"),
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(target = %to, error = %e, "broadcast_lattice erro");
+                }
             }
         }
     }
