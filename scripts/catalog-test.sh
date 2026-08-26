@@ -13,8 +13,8 @@ set -euo pipefail
 
 PORT_BASE=${PORT_BASE:-17500}
 NODE_HOME="${TMPDIR:-/tmp}/mycelium-catalog-test"
-CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
-MCLI="${CARGO_HOME}/bin/mycelium"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+MCLI="${ROOT}/target/debug/mycelium"
 
 export MYCELIUM_RATE_MAX=100000
 
