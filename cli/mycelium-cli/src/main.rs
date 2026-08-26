@@ -202,7 +202,23 @@ enum Commands {
     },
     /// Mostra zonas de crescimento conhecidas.
     Zones,
-    /// Anuncia um repositório Git via gossipsub (dados públicos, sem IPs/chaves).
+    /// Publica código-fonte diretamente na rede (sem git, sem GitHub).
+    /// Lê um diretório recursivamente e cria um Plot content-addressed.
+    SeedCode {
+        /// Caminho do diretório com o código-fonte.
+        #[arg(long)]
+        path: String,
+        /// Nome do projeto (ex: "meu-app").
+        #[arg(long)]
+        name: String,
+        /// Descrição curta.
+        #[arg(long)]
+        description: String,
+        /// Ion para sinalizar (default: "code").
+        #[arg(long, default_value = "code")]
+        ion: String,
+    },
+    /// Anuncia um repositório Git via gossipsub (URL pública, sem dados sensíveis).
     SeedRepo {
         /// Nome do repositório (ex: "mycelium-network").
         #[arg(long)]
@@ -216,6 +232,15 @@ enum Commands {
         /// Descrição curta do repositório.
         #[arg(long)]
         description: String,
+    },
+    /// Baixa código-fonte da rede via ContentId (sem git, sem GitHub).
+    RecallCode {
+        /// ContentId do plot (Qm...).
+        #[arg(long)]
+        plot: String,
+        /// Diretório de destino (default: ./<nome-do-plot>).
+        #[arg(long)]
+        output: Option<String>,
     },
     /// Lista repositórios anunciados via gossipsub por peers da rede.
     Repos,
@@ -570,6 +595,13 @@ fn main() {
         Commands::Zones => rt.block_on(rpc(&home, Request::Zones)),
         Commands::SeedRepo { name, url, commit, description } => {
             rt.block_on(rpc(&home, Request::SeedRepo { name, url, commit, description }))
+        }
+        Commands::SeedCode { path, name, description, ion } => {
+            rt.block_on(seed_code_cmd(&home, path, name, description, ion))
+        }
+        Commands::RecallCode { plot, output } => {
+            let _ = output; // TODO: output dir via recall
+            rt.block_on(rpc(&home, Request::RecallCode { plot }))
         }
         Commands::Repos => rt.block_on(rpc(&home, Request::Repos)),
         Commands::Entropy { action } => rt.block_on(entropy_cmd(&home, action)),
@@ -1416,6 +1448,36 @@ async fn recall_plot_nostr(home: &PathBuf, plot: &str, threshold: u8) -> Result<
         p.map(|x| x.message.as_str()).unwrap_or("?"),
         p.map(|x| x.leaves.len()).unwrap_or(0)
     ))
+}
+
+/// Lê recursivamente um diretório e envia os arquivos ao daemon via SeedCode.
+async fn seed_code_cmd(
+    home: &PathBuf,
+    path: String,
+    name: String,
+    description: String,
+    ion: String,
+) -> Result<(), String> {
+    use base64::Engine;
+    let dir = std::path::PathBuf::from(&path);
+    if !dir.is_dir() {
+        return Err(format!("'{path}' não é um diretório"));
+    }
+    let mut files: Vec<(String, String)> = Vec::new();
+    let mut total_bytes = 0usize;
+    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let file_path = entry.path();
+        if file_path.is_file() {
+            let relative = file_path.strip_prefix(&dir).unwrap_or(&file_path);
+            let content = std::fs::read(&file_path).map_err(|e| e.to_string())?;
+            total_bytes += content.len();
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&content);
+            files.push((relative.to_string_lossy().to_string(), b64));
+        }
+    }
+    println!("[🍄] seed-code: {} arquivos ({total_bytes} bytes) de '{}'", files.len(), path);
+    rpc(home, Request::SeedCode { name, description, ion, files }).await
 }
 
 async fn rpc(home: &PathBuf, request: Request) -> Result<(), String> {

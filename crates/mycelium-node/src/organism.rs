@@ -2354,6 +2354,73 @@ impl Organism {
                 }
                 Response::Ok { message: msg.trim().to_string() }
             }
+            Request::SeedCode { name, description, ion, files } => {
+                use giggs::Plot;
+                use base64::Engine;
+                let leaves: Vec<giggs::Leaf> = files.into_iter().map(|(path, b64)| {
+                    let content = base64::engine::general_purpose::STANDARD.decode(&b64).unwrap_or_default();
+                    giggs::Leaf { path, content }
+                }).collect();
+                let file_count = leaves.len();
+                let total_bytes: usize = leaves.iter().map(|l| l.content.len()).sum();
+                let plot = Plot {
+                    author: self.gland.node_id(),
+                    message: format!("{name}: {description}"),
+                    parents: vec![],
+                    leaves,
+                };
+                match self.bank.deposit(plot) {
+                    Ok(plot_id) => {
+                        // Frutifica como ion para acesso via Event Horizon.
+                        let _ = self.fruit_ion(&ion, &plot_id.to_string(), "", true);
+                        // Anuncia via gossipsub.
+                        let env = Envelope::RepoAnnounce {
+                            node_id: self.gland.node_id(),
+                            name: name.clone(),
+                            url: format!("mycelium://plot/{plot_id}"),
+                            commit: plot_id.to_string()[2..18].to_string(),
+                            description: description.clone(),
+                        };
+                        if let Ok(bytes) = env.encode() {
+                            let _ = self.hyphae.broadcast_lattice(bytes);
+                        }
+                        self.known_repos.insert(
+                            name.clone(),
+                            (format!("mycelium://plot/{plot_id}"), plot_id.to_string()[2..18].to_string(), description, self.gland.node_id()),
+                        );
+                        tracing::info!(repo = %name, %plot_id, files = file_count, bytes = total_bytes, "código semeado na rede");
+                        Response::Ok { message: format!("📦 '{name}' semead na rede: plot={plot_id}, {file_count} arquivos, {total_bytes} bytes\n\nPara baixar em outro nó:\n  mycelium recall-code --plot {plot_id}") }
+                    }
+                    Err(e) => Response::Err { message: format!("falha ao semear: {e}") },
+                }
+            }
+            Request::RecallCode { plot } => {
+                use std::io::Write;
+                match plot.parse::<mycelium_core::ContentId>() {
+                    Ok(plot_id) => {
+                        match self.bank.recall(&plot_id) {
+                            Some(plot) => {
+                                let out_dir = std::path::PathBuf::from(&plot.message.split(':').next().unwrap_or("code").trim());
+                                std::fs::create_dir_all(&out_dir).ok();
+                                let mut written = 0usize;
+                                for leaf in &plot.leaves {
+                                    let file_path = out_dir.join(&leaf.path);
+                                    if let Some(parent) = file_path.parent() {
+                                        std::fs::create_dir_all(parent).ok();
+                                    }
+                                    if let Ok(mut f) = std::fs::File::create(&file_path) {
+                                        let _ = f.write_all(&leaf.content);
+                                        written += 1;
+                                    }
+                                }
+                                Response::Ok { message: format!("📦 {written} arquivos extraídos em {}/", out_dir.display()) }
+                            }
+                            None => Response::Err { message: format!("plot {plot_id} não encontrado no Spore Bank local") },
+                        }
+                    }
+                    Err(e) => Response::Err { message: format!("ContentId inválido: {e}") },
+                }
+            }
             Request::Shutdown => Response::Ok {
                 message: "encerrando".into(),
             },

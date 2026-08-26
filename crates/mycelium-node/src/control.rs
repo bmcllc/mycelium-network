@@ -164,6 +164,18 @@ pub enum Request {
         commit: String,
         description: String,
     },
+    /// Publica código-fonte direto na rede (sem git, sem GitHub).
+    SeedCode {
+        name: String,
+        description: String,
+        ion: String,
+        /// Arquivos: (caminho, conteúdo em base64).
+        files: Vec<(String, String)>,
+    },
+    /// Baixa código-fonte da rede via ContentId.
+    RecallCode {
+        plot: String,
+    },
     /// Lista repositórios anunciados via gossipsub por peers da rede.
     Repos,
     Shutdown,

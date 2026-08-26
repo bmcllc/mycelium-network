@@ -2642,6 +2642,7 @@ name = "mycelium-cli"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "blake3",
  "clap",
  "directories",
@@ -2736,6 +2737,7 @@ name = "mycelium-node"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "entropy",
  "futures",
  "giggs",

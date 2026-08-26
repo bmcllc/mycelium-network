@@ -28,6 +28,7 @@ mycelium-store = { workspace = true }
 giggs = { workspace = true }
 hex = { workspace = true }
 blake3 = { workspace = true }
+base64 = "0.22"
 
 [features]
 default = ["nostr", "nostr-transport"]
