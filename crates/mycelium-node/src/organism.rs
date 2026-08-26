@@ -136,9 +136,12 @@ pub struct Organism {
     /// Réplicas remotas vivas por ion (anunciadas via IonReady).
     ion_replica_peers: HashMap<String, Vec<NodeId>>,
     /// Catálogo global de ions que pares expõem no seu Horizon.
-    peer_ions: HashMap<NodeId, Vec<String>>,
+    /// Chave = NodeId do peer, Valor = (ions, último anúncio Unix secs).
+    peer_ions: HashMap<NodeId, (Vec<String>, u64)>,
     /// Flag: a console ErgOTOS foi visitada desde o último tick (auto-semeadura).
     console_hit: bool,
+    /// Timestamp (unix secs) do último brotamento de ergot-seed (rate-limit 1/min).
+    last_brood: u64,
     /// Janelas consecutivas de carga zero por ion local (gatilho de recombine).
     zero_load_windows: HashMap<String, u32>,
     /// Cooldown do último IonOffer de auto-scaling por ion.
@@ -349,6 +352,7 @@ impl Organism {
             ion_replica_peers: HashMap::new(),
             peer_ions: HashMap::new(),
             console_hit: false,
+            last_brood: 0,
             zero_load_windows: HashMap::new(),
             last_scaling_offer: HashMap::new(),
         };
@@ -1456,7 +1460,10 @@ impl Organism {
                 tracing::info!(%ion, %node, "IonReady — rota adicionada no Horizon");
             }
             Envelope::ZoneAnnounce { prefix, custodian } => {
-                self.known_zones.entry(prefix).or_default().push(custodian);
+                let list = self.known_zones.entry(prefix).or_default();
+                if !list.contains(&custodian) {
+                    list.push(custodian);
+                }
             }
             Envelope::ValueTransfer { tx } => {
                 if let Err(e) = self.apply_incoming_transfer(tx, false) {
@@ -1470,15 +1477,26 @@ impl Organism {
             } => {
                 let ion_clone = ion.clone();
                 if node_id != self.gland.node_id() {
-                    let ions = self.peer_ions.entry(node_id).or_default();
-                    if !ions.contains(&ion) {
-                        ions.push(ion);
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let entry = self.peer_ions.entry(node_id).or_insert_with(|| (Vec::new(), now));
+                    if !entry.0.contains(&ion) {
+                        entry.0.push(ion);
                     }
+                    entry.1 = now; // atualiza timestamp
                 }
-                // Efeito manada sem intervencção: ao anunciar um `ergot-seed`
-                // pelo gossip, brota uma console ErgotOS autônoma neste nó.
+                // Efeito manada: brota ergot-seed com rate-limit 1/min.
                 if ion_clone == "ergot-seed" {
-                    self.try_brood_seed_ion();
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    if now.saturating_sub(self.last_brood) >= 60 {
+                        self.try_brood_seed_ion();
+                        self.last_brood = now;
+                    }
                 }
             }
             Envelope::VoucherRedeem { voucher } => {
@@ -2585,6 +2603,13 @@ impl Organism {
                     }
                     let mut table = self.horizon.write().unwrap();
                     table.set_metrics(prom);
+                    // Injeta peer_ions no catálogo global.
+                    let gossip_ions: HashMap<String, Vec<String>> = self
+                        .peer_ions
+                        .iter()
+                        .map(|(nid, (ions, _))| (nid.short(), ions.clone()))
+                        .collect();
+                    table.set_peer_ions(gossip_ions);
                     // Sinal da console: visita autônoma → auto-semeadura.
                     self.console_hit = table.take_console_hits() > 0;
                 }
@@ -2620,10 +2645,28 @@ impl Organism {
                             let _ = self.hyphae.broadcast_lattice(bytes);
                         }
                     }
-                    // Efeito manada: visita à console semeadura local autônoma.
+                    // Efeito manada: visita à console semeadura local autônoma (rate-limit 1/min).
                     if self.console_hit && self.chambers.get("ergot-seed").is_none() {
-                        self.try_brood_seed_ion();
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        if now.saturating_sub(self.last_brood) >= 60 {
+                            self.try_brood_seed_ion();
+                            self.last_brood = now;
+                        }
                         self.console_hit = false;
+                    }
+                    // Prune de peer_ions expirados (TTL 5 min sem anúncio).
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let before = self.peer_ions.len();
+                    self.peer_ions.retain(|_, (_, ts)| now.saturating_sub(*ts) < 300);
+                    let pruned = before.saturating_sub(self.peer_ions.len());
+                    if pruned > 0 {
+                        tracing::debug!(pruned, "peer_ions expirados removidos do catálogo");
                     }
                     if !self.state.ions.is_empty() {
                         let prefix = format!("Qm{}", self.gland.node_id().short());

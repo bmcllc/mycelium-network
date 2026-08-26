@@ -60,6 +60,9 @@ pub struct EventHorizon {
     /// Requisições proxyadas por ion na janela corrente (drenadas pelo
     /// organismo a cada tick de scaling → Plasma `sense`).
     ion_requests: HashMap<String, u64>,
+    /// Catálogo JSON de ions: locais + peer_ions via gossip.
+    /// O organismo injeta peer_ions a cada tick via `set_peer_ions`.
+    peer_ions: HashMap<String, Vec<String>>,
     /// Contador de visitas à console ErgotOS — gatilha auto-semeadura
     /// (efeito manada sem intervencção humana).
     console_hits: AtomicU64,
@@ -158,14 +161,40 @@ impl EventHorizon {
         self.console_hits.swap(0, Ordering::Relaxed)
     }
 
-    /// Catálogo JSON de ions routable por este Horizon (local + réplicas).
+    /// Catálogo JSON de ions: locais (via `by_ion`) + remotos (via gossip `peer_ions`).
     pub fn catalog_json(&self) -> String {
-        let ions: Vec<String> = self.by_ion.keys().cloned().collect();
+        let mut all_ions: Vec<String> = self.by_ion.keys().cloned().collect();
+        // Adiciona ions dos peers (gossip).
+        for peer_ions in self.peer_ions.values() {
+            for ion in peer_ions {
+                if !all_ions.contains(ion) {
+                    all_ions.push(ion.clone());
+                }
+            }
+        }
+        all_ions.sort();
+        all_ions.dedup();
+        let peers: Vec<serde_json::Value> = self
+            .peer_ions
+            .iter()
+            .map(|(node, ions)| {
+                serde_json::json!({
+                    "node_id": node,
+                    "ions": ions,
+                })
+            })
+            .collect();
         serde_json::to_string(&serde_json::json!({
-            "node_id": "",
-            "ions": ions,
+            "local_ions": self.by_ion.keys().cloned().collect::<Vec<_>>(),
+            "peer_ions": peers,
+            "all_ions": all_ions,
         }))
-        .unwrap_or_else(|_| r#"{"ions":[]}"#.to_string())
+        .unwrap_or_else(|_| r#"{"all_ions":[]}"#.to_string())
+    }
+
+    /// Injeta peer_ions do gossip (chamado pelo organismo no tick de zonas).
+    pub fn set_peer_ions(&mut self, peer_ions: HashMap<String, Vec<String>>) {
+        self.peer_ions = peer_ions;
     }
 
     /// Define o snapshot de métricas (chamado pelo organismo periodicamente).
