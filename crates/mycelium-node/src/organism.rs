@@ -146,6 +146,8 @@ pub struct Organism {
     zero_load_windows: HashMap<String, u32>,
     /// Cooldown do último IonOffer de auto-scaling por ion.
     last_scaling_offer: HashMap<String, Instant>,
+    /// Repositórios anunciados via gossipsub (nome → (url, commit, descrição, from)).
+    known_repos: HashMap<String, (String, String, String, NodeId)>,
 }
 
 impl Organism {
@@ -355,6 +357,7 @@ impl Organism {
             last_brood: 0,
             zero_load_windows: HashMap::new(),
             last_scaling_offer: HashMap::new(),
+            known_repos: HashMap::new(),
         };
 
         // Restaura catálogo de peers do estado persistido.
@@ -1535,6 +1538,19 @@ impl Organism {
                     }
                 }
             }
+            Envelope::RepoAnnounce { node_id, name, url, commit, description } => {
+                if node_id != self.gland.node_id() {
+                    self.known_repos.insert(
+                        name.clone(),
+                        (url, commit, description, node_id),
+                    );
+                    tracing::info!(
+                        repo = %name,
+                        from = %node_id,
+                        "repo anunciado via gossip — git clone disponível"
+                    );
+                }
+            }
             Envelope::VoucherRedeem { voucher } => {
                 if voucher.payee == self.gland.node_id() {
                     match self.ledger.redeem_voucher(&voucher) {
@@ -2309,6 +2325,34 @@ impl Organism {
                 Response::Ok {
                     message: format!("distribuído {} ATP como dividendo", paid),
                 }
+            Request::SeedRepo { name, url, commit, description } => {
+                let env = Envelope::RepoAnnounce {
+                    node_id: self.gland.node_id(),
+                    name: name.clone(),
+                    url: url.clone(),
+                    commit: commit.clone(),
+                    description: description.clone(),
+                };
+                if let Ok(bytes) = env.encode() {
+                    let _ = self.hyphae.broadcast_lattice(bytes);
+                }
+                // Armazena localmente também.
+                self.known_repos.insert(
+                    name.clone(),
+                    (url, commit, description, self.gland.node_id()),
+                );
+                tracing::info!(repo = %name, "repo anunciado via gossip");
+                Response::Ok { message: format!("repo '{name}' anunciado na rede") }
+            }
+            Request::Repos => {
+                let mut msg = String::new();
+                for (name, (url, commit, desc, from)) in &self.known_repos {
+                    msg.push_str(&format!("📦 {name}\n   url: {url}\n   commit: {commit}\n   desc: {desc}\n   from: {from}\n\n"));
+                }
+                if msg.is_empty() {
+                    msg = "nenhum repositório anunciado ainda".into();
+                }
+                Response::Ok { message: msg.trim().to_string() }
             }
             Request::Shutdown => Response::Ok {
                 message: "encerrando".into(),

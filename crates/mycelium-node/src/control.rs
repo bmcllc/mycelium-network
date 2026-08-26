@@ -157,6 +157,15 @@ pub enum Request {
         name: String,
         total: u64,
     },
+    /// Anuncia um repositório via gossipsub (URL pública, sem dados sensíveis).
+    SeedRepo {
+        name: String,
+        url: String,
+        commit: String,
+        description: String,
+    },
+    /// Lista repositórios anunciados via gossipsub por peers da rede.
+    Repos,
     Shutdown,
 }
 

@@ -107,6 +107,15 @@ pub enum Envelope {
         ion: String,
         membrane: String,
     },
+    /// Anúncio de repositório — informação pública de onde baixar código-fonte
+    /// via Mycelium Network (sem dados sensíveis como IPs ou chaves SSH).
+    RepoAnnounce {
+        node_id: NodeId,
+        name: String,
+        url: String,
+        commit: String,
+        description: String,
+    },
     /// Overlay de zonas: entrega direcionada — só `to` processa `inner`.
     /// Nós intermediários replicam no gossip mas ignoram o conteúdo.
     Direct {

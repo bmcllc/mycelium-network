@@ -202,6 +202,23 @@ enum Commands {
     },
     /// Mostra zonas de crescimento conhecidas.
     Zones,
+    /// Anuncia um repositório Git via gossipsub (dados públicos, sem IPs/chaves).
+    SeedRepo {
+        /// Nome do repositório (ex: "mycelium-network").
+        #[arg(long)]
+        name: String,
+        /// URL pública de clone (ex: "https://github.com/bmcc-DEV/mycelium-network.git").
+        #[arg(long)]
+        url: String,
+        /// Hash do commit atual (ex: "ad924b6").
+        #[arg(long)]
+        commit: String,
+        /// Descrição curta do repositório.
+        #[arg(long)]
+        description: String,
+    },
+    /// Lista repositórios anunciados via gossipsub por peers da rede.
+    Repos,
     /// Entropy: Shamir Secret Sharing com meia-vida.
     Entropy {
         #[command(subcommand)]
@@ -551,6 +568,10 @@ fn main() {
         Commands::Balance => rt.block_on(rpc(&home, Request::Balance)),
         Commands::IonMigrate { ion, target } => rt.block_on(rpc(&home, Request::IonMigrate { ion, target })),
         Commands::Zones => rt.block_on(rpc(&home, Request::Zones)),
+        Commands::SeedRepo { name, url, commit, description } => {
+            rt.block_on(rpc(&home, Request::SeedRepo { name, url, commit, description }))
+        }
+        Commands::Repos => rt.block_on(rpc(&home, Request::Repos)),
         Commands::Entropy { action } => rt.block_on(entropy_cmd(&home, action)),
         Commands::Candidate {
             cmd,
