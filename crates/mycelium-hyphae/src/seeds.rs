@@ -384,6 +384,131 @@ impl SeedBook {
         before - self.seeds.len()
     }
 
+    /// AlertManager acende um alerta sobre uma seed: registra uma falha
+    /// de saúde (alertmanager observou `MyceliumSemVizinhos`/`ExportadorMorto`
+    /// por exemplo). Não remove a seed diretamente — acumula falhas até que o
+    /// `health_check` ou o `resolved` limpe. Idempotente.
+    pub fn record_alert(&mut self, addr: &str) {
+        if let Some(entry) = self.seeds.get_mut(addr) {
+            entry.health_failures = entry.health_failures.saturating_add(1);
+        }
+    }
+
+    /// AlertManager resolve um alerta: limpa as falhas acumuladas de uma seed
+    /// (o problema desapareceu).
+    pub fn clear_alert(&mut self, addr: &str) {
+        if let Some(entry) = self.seeds.get_mut(addr) {
+            entry.health_failures = 0;
+            entry.last_seen = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+        }
+    }
+
+/// Normaliza uma seed `instance`/`addr` para a forma `ip:porta`, de modo
+/// que o `instance` label do AlertManager (`1.2.3.4:4001`) casse com o
+/// multiaddr da seed (`/ip4/1.2.3.4/tcp/4001`).
+fn normalize_instance(s: &str) -> String {
+    let s = s.trim();
+    // Multiaddr: /ip4/1.2.3.4/tcp/4001 → 1.2.3.4:4001
+    let cleaned = s.replace("/ip4/", " ").replace("/ip6/", " ").replace("/tcp/", ":").replace("/quic-v1/", ":").trim().to_string();
+    // Se ainda tem barra (outro formato), devolve como fallback lowercased.
+    let cleaned = cleaned.split_whitespace().next().unwrap_or(cleaned.as_str()).to_string();
+    cleaned
+}
+
+/// Processa um webhook payload do AlertManager (formato
+/// `WebhookHandler`: `{ receiver, status, alerts: [{status,labels,...}] }`).
+/// Cada alerta é casado com a seed cujo `addr` normaliza-para `ip:port`
+/// compatível com o `instance` label. Retorna o número de alerts aplicados.
+/// Fonte: recebido pelo `POST /seedwebhook` no Event Horizon.
+    pub fn ingest_alert_payload(&mut self, json: &[u8]) -> Result<usize, HyphaeError> {
+        #[derive(serde::Deserialize)]
+        struct AlertLabel {
+            instance: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Alert {
+            status: String,
+            labels: AlertLabel,
+        }
+        #[derive(serde::Deserialize)]
+        struct WebhookPayload {
+            #[allow(dead_code)]
+            receiver: String,
+            #[allow(dead_code)]
+            status: String,
+            alerts: Vec<Alert>,
+        }
+        let parsed: WebhookPayload = serde_json::from_slice(json)
+            .map_err(|e| HyphaeError::Addr(format!("alert webhook JSON inválido: {e}")))?;
+        let mut applied = 0usize;
+        for a in &parsed.alerts {
+            if let Some(instance_raw) = &a.labels.instance {
+                let inst = Self::normalize_instance(instance_raw);
+                // Match: o instance contém o ip:port da seed ou vice-versa.
+                let matched = self.seeds.keys().any(|seed_addr| {
+                    let s = Self::normalize_instance(seed_addr);
+                    inst.contains(&s) || s.contains(&inst)
+                });
+                if matched {
+                    let targets: Vec<String> = self
+                        .seeds
+                        .keys()
+                        .filter(|seed_addr| {
+                            let s = Self::normalize_instance(seed_addr);
+                            inst.contains(&s) || s.contains(&inst)
+                        })
+                        .cloned()
+                        .collect();
+                    for addr in &targets {
+                        if a.status == "firing" {
+                            self.record_alert(addr);
+                        } else {
+                            self.clear_alert(addr);
+                        }
+                    }
+                    applied += targets.len();
+                }
+            }
+        }
+        Ok(applied)
+    }
+
+    /// Persiste um feed de saúde (alerts do AlertManager) como JSONL em
+    /// `{home}/seeds.health.jsonl` — lido de volta por `load_health_feed`.
+    /// Permite que o organismo/seed book consome alerts externos sem acoplar
+    /// o receptor HTTP ao SeedBook em memória.
+    pub fn write_health_feed(home: &Path, json_lines: &str) -> Result<(), HyphaeError> {
+        let path = home.join("seeds.health.jsonl");
+        std::fs::create_dir_all(home).map_err(|e| HyphaeError::Addr(e.to_string()))?;
+        std::fs::write(&path, json_lines).map_err(|e| HyphaeError::Addr(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Carrega e aplica alerts do feed `{home}/seeds.health.jsonl`.
+    pub fn load_health_feed(&mut self, home: &Path) -> Result<usize, HyphaeError> {
+        let path = home.join("seeds.health.jsonl");
+        if !path.exists() {
+            return Ok(0);
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| HyphaeError::Addr(e.to_string()))?;
+        let mut total = 0;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            total += self.ingest_alert_payload(line.as_bytes())?;
+        }
+        if total > 0 {
+            tracing::info!(applied = total, "alerts do feed de saúde aplicados ao seed book");
+        }
+        Ok(total)
+    }
+
     /// Serializa seeds para envio via gossip (apenas addr strings).
     pub fn to_gossip_payload(&self) -> Vec<String> {
         self.seeds.values().map(|e| e.addr.clone()).collect()
@@ -627,5 +752,72 @@ mod tests {
         // /dnsaddr não tem IP/porta, deve falhar.
         let addr: Multiaddr = "/dnsaddr/foo.bar".parse().unwrap();
         assert!(health_dial(&addr).is_err());
+    }
+
+    // ── Seed-book webhook (AlertManager → SeedBook) ──────────────────
+
+    #[test]
+    fn record_alert_increments_health_failures() {
+        let mut book = SeedBook::new();
+        book.add("/ip4/1.2.3.4/tcp/4001").unwrap();
+        book.record_alert("/ip4/1.2.3.4/tcp/4001");
+        book.record_alert("/ip4/1.2.3.4/tcp/4001");
+        let entry = book.seeds.values().next().unwrap();
+        assert_eq!(entry.health_failures, 2);
+    }
+
+    #[test]
+    fn clear_alert_resets_failures() {
+        let mut book = SeedBook::new();
+        book.add("/ip4/1.2.3.4/tcp/4001").unwrap();
+        book.record_alert("/ip4/1.2.3.4/tcp/4001");
+        book.clear_alert("/ip4/1.2.3.4/tcp/4001");
+        let entry = book.seeds.values().next().unwrap();
+        assert_eq!(entry.health_failures, 0);
+    }
+
+    #[test]
+    fn record_alert_unknown_seed_is_noop() {
+        let mut book = SeedBook::new();
+        book.add("/ip4/1.2.3.4/tcp/4001").unwrap();
+        // seed não cadastrada: não deve panicar, nem alterar nada
+        book.record_alert("/ip4/9.9.9.9/tcp/4001");
+        let entry = book.seeds.values().next().unwrap();
+        assert_eq!(entry.health_failures, 0);
+    }
+
+    // Payload AlertManager WebhookHandler: {receiver,status,alerts:[{status,labels:{instance}}]}
+    #[test]
+    fn ingest_alert_payload_matches_instance_to_seed() {
+        let mut book = SeedBook::new();
+        book.add("/ip4/1.2.3.4/tcp/4001").unwrap();
+        book.add("/ip4/5.6.7.8/tcp/4001").unwrap();
+        let payload = r#"{"receiver":"mycelium","status":"firing","alerts":[{"status":"firing","labels":{"instance":"1.2.3.4:4001","alertname":"MyceliumSemVizinhos","severity":"critical"}}]}"#;
+        let applied = book.ingest_alert_payload(payload.as_bytes()).unwrap();
+        assert_eq!(applied, 1, "apenas a seed 1.2.3.4 deve ser marcada");
+        // 1.2.3.4 marcada, 5.6.7.8 imune.
+        let s1 = book.seeds.get("/ip4/1.2.3.4/tcp/4001").unwrap();
+        let s2 = book.seeds.get("/ip4/5.6.7.8/tcp/4001").unwrap();
+        assert_eq!(s1.health_failures, 1);
+        assert_eq!(s2.health_failures, 0);
+    }
+
+    #[test]
+    fn ingest_alert_payload_resolved_clears_failures() {
+        let mut book = SeedBook::new();
+        book.add("/ip4/1.2.3.4/tcp/4001").unwrap();
+        book.record_alert("/ip4/1.2.3.4/tcp/4001");
+        let payload = r#"{"receiver":"mycelium","status":"resolved","alerts":[{"status":"resolved","labels":{"instance":"1.2.3.4:4001"}}]}"#;
+        let applied = book.ingest_alert_payload(payload.as_bytes()).unwrap();
+        assert_eq!(applied, 1);
+        let entry = book.seeds.values().next().unwrap();
+        assert_eq!(entry.health_failures, 0);
+    }
+
+    #[test]
+    fn ingest_alert_payload_rejects_malformed_json() {
+        let mut book = SeedBook::new();
+        assert!(book.ingest_alert_payload(b"not json").is_err());
+        assert!(book.ingest_alert_payload(b"").is_err());
     }
 }

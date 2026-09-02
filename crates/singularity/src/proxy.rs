@@ -6,7 +6,7 @@ use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::{header, StatusCode, Uri};
 use axum::middleware::{from_fn, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::any;
+use axum::routing::{any, post};
 use axum::Router;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -124,6 +124,7 @@ pub async fn serve_horizon(
         .route("/metrics", any(metrics))
         .route("/plots/{id}", any(serve_plot))
         .route("/layers/{id}", any(serve_layer))
+        .route("/seedwebhook", post(seedwebhook))
         .fallback(any(proxy))
         .layer(from_fn(rate_gate))
         .with_state(table);
@@ -152,6 +153,47 @@ pub async fn serve_horizon(
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
+
+/// Recebedor webhook do AlertManager (`POST /seedwebhook`).
+///
+/// O AlertManager envia payloads no formato `WebhookHandler`
+/// (`{ receiver, status, alerts:[{status,labels:{instance,...},...}] }`).
+/// Cada payload é anexado (append) como JSONL em `{home}/seeds.health.jsonl`,
+/// de onde o `SeedBook` do organismo consome (`load_health_feed`) para marcar
+/// seeds saudáveis como `firing` e limpar quando `resolved`. O receptor HTTP
+/// grava bytes brutos — o parse de alertas é da responsabilidade do SeedBook
+/// (em `mycelium-hyphae`), mantendo singularity sem acoplamento ao state do
+/// seed book.
+async fn seedwebhook(
+    State(table): State<HorizonTable>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let home = match table.read().unwrap().get_home() {
+        Some(h) => h.to_path_buf(),
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "home não configurado"),
+    };
+    let path = home.join("seeds.health.jsonl");
+    let line = std::str::from_utf8(&body).unwrap_or("");
+    if let Err(e) = std::fs::create_dir_all(&home) {
+        tracing::warn!(error = %e, "webhook: mkdir home");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "home create failed");
+    }
+    use std::io::Write as _;
+    let mut f = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(error = %e, "webhook: abrir feed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "feed open failed");
+        }
+    };
+    if let Err(e) = writeln!(f, "{}", line.trim()) {
+        tracing::warn!(error = %e, "webhook: gravar feed");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "feed write failed");
+    }
+    tracing::debug!(bytes = body.len(), "AlertManager webhook aceito");
+    (StatusCode::OK, "ok")
+}
+
 
 async fn serve_plot(
     State(table): State<HorizonTable>,

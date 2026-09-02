@@ -2865,6 +2865,7 @@ impl Organism {
         let mut zone_tick = tokio::time::interval(Duration::from_secs(120));
         let mut scale_tick = tokio::time::interval(Duration::from_secs(45));
         let mut overlay_tick = tokio::time::interval(Duration::from_secs(90));
+        let mut seedwebhook_tick = tokio::time::interval(Duration::from_secs(30));
         // Primeiro tick imediato já foi coberto na germinação; atrasa o próximo.
         seed_tick.tick().await;
         // DuckDNS: espera um pouco para ter listen addrs.
@@ -2876,6 +2877,7 @@ impl Organism {
         zone_tick.tick().await;
         scale_tick.tick().await;
         overlay_tick.tick().await;
+        seedwebhook_tick.tick().await;
 
         if self.sporocarp {
             tracing::info!("sporocarp ativo — relay + DNS (se DUCKDNS_*) — sem UPnP");
@@ -3117,6 +3119,14 @@ impl Organism {
 
                 _ = overlay_tick.tick() => {
                     self.dht_overlay_tick();
+                }
+
+                _ = seedwebhook_tick.tick() => {
+                    // Consome o feed de saúde do AlertManager webhook
+                    // (seeds.health.jsonl) e reflete falhas/saúde no seed book.
+                    if let Err(e) = self.seed_book.load_health_feed(&self.store.root) {
+                        tracing::debug!(error = %e, "load_health_feed");
+                    }
                 }
 
                 _ = heartbeat.tick() => {

@@ -1,0 +1,48 @@
+# Prometheus — coleta de /metrics dos nós Mycelium Network.
+#
+# Cada nó expõe /metrics no seu Event Horizon (porta --horizon-port,
+# default 7474). Os alvos podem ser fixos (static_configs) ou descobertos
+# via arquivo JSON (`/etc/prometheus/targets.json` — útil para malhas dinâmicas).
+#
+# Instale via docker-compose: docker compose -f deploy/prometheus/docker-compose.yml up
+
+global:
+  scrape_interval: 30s          # alinhado ao tick de métricas do organismo
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+
+# Regra de retenção: mantenha 7 dias de dados para análise de ciclos
+# carga/ociosidade do Plasma reativo.
+storage:
+  tsdb:
+    retention.time: 168h
+    retention.size: 512MB
+
+rule_files:
+  - /etc/prometheus/alerts.yml     # deploy/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: 'mycelium'
+    static_configs:
+      # Nós conhecidos (seed book público / esporocarp). Extenda com sua malha.
+      - targets:
+          - 127.0.0.1:18700   # nó 0 (seed)
+          - 127.0.0.1:18701   # nó 1
+          - 127.0.0.1:18702   # nó 2
+          - 127.0.0.1:18703   # nó 3
+          - 127.0.0.1:18704   # nó 4
+        labels:
+          group: 'substrato'
+          rede: 'default'
+      # --- uso alternativo: file-based service discovery ---
+      # - job_name: 'mycelium-dinamico'
+      #   metrics_path: /metrics
+      #   file_sd_configs:
+      #     - files:
+      #         - /etc/prometheus/targets.json
+      #       refresh_interval: 60s
+
+  # AlertManager (auto-observa; opcional mas recomendado)
+  - job_name: 'mycelium-alerts'
+    static_configs:
+      - targets: ['mycelium-alerts:9093']

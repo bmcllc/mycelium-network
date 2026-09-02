@@ -1,0 +1,55 @@
+# AlertManager — roteamento de alertas do Prometheus para o seed book.
+#
+# O receiver `seedwebhook` POSTa cada payload AlertManager WebhookHandler para
+# o Event Horizon de cada nó Mycelium (`POST /seedwebhook`), que grava em
+# `{home}/seeds.health.jsonl`. O organismo consome esse feed a cada 30s
+# (`seedwebhook_tick`) e marca/limpa health_failures no SeedBook.
+#
+# Instale via docker-compose: docker compose -f deploy/prometheus/docker-compose.yml up
+
+global:
+  resolve_timeout: 30s
+  smtp_smarthost: 'localhost:25'
+  smtp_from: 'mycelium@noreply'
+
+route:
+  group_by: ['alertname', 'instance']
+  group_wait: 20s
+  group_interval: 1m
+  repeat_interval: 4h
+  # Receivers de fallback: webhook do seed book + (opcional) slack/email.
+  receiver: 'seedwebhook'
+  routes:
+    - matchers:
+        - severity = 'critical'
+      # Crítico: também notifica (pode trocar por slack/email).
+      receiver: 'seedwebhook'
+      continue: true
+    - matchers:
+        - severity = 'warning'
+      receiver: 'seedwebhook'
+      continue: true
+    - matchers:
+        - severity = 'info'
+      receiver: 'seedwebhook'
+
+inhibit_rules:
+  # Silencia avisos enquanto o AlertManager está caído.
+  - source_match: { alertname: 'MyceliumExportadorMorto' }
+    target_match: { alertname: 'MyceliumSemVizinhos' }
+    equal: ['instance']
+
+receivers:
+  - name: 'seedwebhook'
+    webhook_configs:
+      - url: 'http://mycelium-0:18700/seedwebhook'
+        send_resolved: true
+        http_config:
+          # Cada nó publica seu próprio webhook; aqui apontamos para o seed 0.
+          # Para malhas maiores, rode um alertmanager por nó ou use o file-based
+          # receiver. `send_resolved: true` limpa falhas quando o alerta resolve.
+      # Replica o mesmo receiver em cada nó visível (Docker network names).
+      - url: 'http://mycelium-1:18701/seedwebhook'
+        send_resolved: true
+      - url: 'http://mycelium-2:18702/seedwebhook'
+        send_resolved: true

@@ -1,0 +1,111 @@
+# docker-compose — stack Mycelium Network + observabilidade (Prometheus + AlertManager).
+#
+# Levanta 5 nós formando uma malha (1 seed sporocarp + 4 folhas), Prometheus
+# coletando /metrics de cada nó a cada 30s, e AlertManager encaminhando
+# alertas para o webhook do seed book de cada nó (`POST /seedwebhook`).
+#
+# Uso:
+#   docker compose -f deploy/prometheus/docker-compose.yml up --build
+
+services:
+  mycelium-0:
+    image: mycelium-node:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: >
+      daemon -home /home/mycelium/home
+      --listen /ip4/0.0.0.0/tcp/4000
+      --listen /ip6/::/tcp/4000
+      --horizon-port 7700
+      --sporocarp
+      --contribute 2cpu,4gb,100gb
+    ports:
+      - "4000:4000"
+      - "4000:4000/udp"
+      - "7700:7700"
+      - "7700:7700"
+    volumes:
+      - ./data/mycelium-0:/home/mycelium/home
+
+  mycelium-1:
+    image: mycelium-node:latest
+    command: >
+      daemon -home /home/mycelium/home
+      --listen /ip4/0.0.0.0/tcp/4001
+      --listen /ip6/::/tcp/4001
+      --horizon-port 7701
+      --contribute 1cpu,2gb,50gb
+      --bootstrap /ip4/127.0.0.1/tcp/4000/p2p/${SEED_PEER_ID:-}
+    ports: ["4001:4001", "7701:7701"]
+    volumes:
+      - ./data/mycelium-1:/home/mycelium/home
+    depends_on: [mycelium-0]
+
+  mycelium-2:
+    image: mycelium-node:latest
+    command: >
+      daemon -home /home/mycelium/home
+      --listen /ip4/0.0.0.0/tcp/4002
+      --listen /ip6/::/tcp/4002
+      --horizon-port 7702
+      --contribute 1cpu,2gb,50gb
+      --bootstrap /ip4/127.0.0.1/tcp/4000/p2p/${SEED_PEER_ID:-}
+    ports: ["4002:4002", "7702:7702"]
+    volumes:
+      - ./data/mycelium-2:/home/mycelium/home
+    depends_on: [mycelium-0]
+
+  mycelium-3:
+    image: mycelium-node:latest
+    command: >
+      daemon -home /home/mycelium/home
+      --listen /ip4/0.0.0.0/tcp/4003
+      --listen /ip6/::/tcp/4003
+      --horizon-port 7703
+      --contribute 1cpu,2gb,50gb
+      --bootstrap /ip4/127.0.0.1/tcp/4000/p2p/${SEED_PEER_ID:-}
+    ports: ["4003:4003", "7703:7703"]
+    volumes:
+      - ./data/mycelium-3:/home/mycelium/home
+    depends_on: [mycelium-0]
+
+  mycelium-4:
+    image: mycelium-node:latest
+    command: >
+      daemon -home /home/mycelium/home
+      --listen /ip4/0.0.0.0/tcp/4004
+      --listen /ip6/::/tcp/4004
+      --horizon-port 7704
+      --contribute 1cpu,2gb,50gb
+      --bootstrap /ip4/127.0.0.1/tcp/4000/p2p/${SEED_PEER_ID:-}
+    ports: ["4004:4004", "7704:7704"]
+    volumes:
+      - ./data/mycelium-4:/home/mycelium/home
+    depends_on: [mycelium-0]
+
+  # Prometheus: coleta /metrics dos 5 nós.
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=168h"
+      - "--storage.tsdb.retention.size=1GB"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.enable-lifecycle"
+    ports: ["9090:9090"]
+    depends_on: [mycelium-0]
+
+  # AlertManager: encaminha alertas para o webhook do seed book de cada nó.
+  mycelium-alerts:
+    image: prom/alertmanager:latest
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/config.yml:ro
+    command:
+      - "--config.file=/etc/alertmanager/config.yml"
+      - "--storage.path=/alertmanager-data"
+    ports: ["9093:9093"]
+    depends_on: [prometheus]

@@ -105,3 +105,49 @@ O ciclo completo roda sem operador humano:
 - **Snapshot:** `mycelium-node/src/organism.rs` → `metrics_tick` + `plasma_scale_tick`
 - **Endpoint:** `singularity/src/proxy.rs` → rota `/metrics` + `note_request`
 - **Armazenamento:** `singularity/src/lib.rs` → `EventHorizon.metrics` + `ion_requests`
+
+## AlertManager + webhook do seed book (produção)
+
+O exportador Prometheus (`/metrics`) é a metade de observação. A outra metade —
+**ação corretiva descentralizada** — vem do AlertManager rebobinando o *seed book*:
+um alerta de isolamento/exportador-morto faz o peer ser marcado como saudável
+falho e descoberto novamente.
+
+### Como funciona
+
+1. **AlertManager** (via `deploy/prometheus/alertmanager.yml`) dispara um
+   `WebhookHandler` POSTando para o Event Horizon de cada nó:
+   `POST http://<nó>:7474/seedwebhook`.
+2. **Horizon** (`singularity/src/proxy.rs → seedwebhook`) grava o payload como
+   uma linha JSONL em `{home}/seeds.health.jsonl` (append-only). O receptor
+   grava bytes brutos — não precisa carregar o state do seed book.
+3. **Organismo** consome o feed a cada 30s (`seedwebhook_tick`) chamando
+   `SeedBook::load_health_feed`, que casa o `instance` label do alerta
+   (`1.2.3.4:4001`) com a multiaddr da seed (`/ip4/1.2.3.4/tcp/4001`) e
+   chama `record_alert`/`clear_alert`:
+   - `status: firing` → `health_failures += 1` (a seed acumula falhas).
+   - `status: resolved` → `health_failures = 0` + `last_seen` renovado.
+4. O `health_check` existente remove seeds com `>= 3` falhas consecutivas —
+   agora o AlertManager acelera esse processo: um nó que cai de fato é
+   **desconectado do seed book** sem intervenção humana.
+
+### Arquivos
+
+| Arquivo | Papel |
+|--------|-------|
+| `deploy/prometheus/alerts.yml` | Regras (7 alertas fisiológicos) |
+| `deploy/prometheus/prometheus.yml` | Scrape dos `/metrics` dos nós |
+| `deploy/prometheus/alertmanager.yml` | Receivers webhook → `/seedwebhook` |
+| `deploy/prometheus/docker-compose.yml` | Stack: 5 nós + prometheus + alertmanager |
+| `deploy/Dockerfile` | Build multi-stage do daemon |
+| `singularity/src/proxy.rs` | Rota `POST /seedwebhook` |
+| `mycelium-hyphae/src/seeds.rs` | `record_alert`/`clear_alert`/`ingest_alert_payload`/`load_health_feed` |
+
+### Teste rápido
+
+```bash
+bash scripts/webhook-smoke.sh   # POST real de payload AlertManager → /seedwebhook
+```
+
+Valida: HTTP 200, `seeds.health.jsonl` criado com o alerta, e a match de
+`instance` (`1.2.3.4:4001`) × multiaddr (`/ip4/1.2.3.4/tcp/4001`).
