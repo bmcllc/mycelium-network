@@ -41,7 +41,7 @@ pub enum Envelope {
     /// Anúncio: este nó tem a layer content-addressed.
     LayerOffer { id: ContentId },
     /// Pedido: preciso desta layer (vizinhos com blob respondem via DHT/offer).
-    LayerNeed { id: ContentId },
+    LayerNeed { id: ContentId, hop: u8 },
     /// Consulta Isotope: preciso deste átomo (Decay pelas hifas).
     DecayQuery { key: String, asker: NodeId },
     /// Resposta Isotope a um Decay.
@@ -163,6 +163,7 @@ mod tests {
     fn roundtrip_versioned_frame() {
         let env = Envelope::LayerNeed {
             id: ContentId::of(b"layer"),
+            hop: 0,
         };
         let bytes = env.encode().unwrap();
         let s = std::str::from_utf8(&bytes).unwrap();
@@ -170,7 +171,10 @@ mod tests {
         assert!(s.contains("\"msg\""));
         let back = Envelope::decode(&bytes).unwrap();
         match back {
-            Envelope::LayerNeed { id } => assert_eq!(id, ContentId::of(b"layer")),
+            Envelope::LayerNeed { id, hop } => {
+                assert_eq!(id, ContentId::of(b"layer"));
+                assert_eq!(hop, 0);
+            }
             _ => panic!("tipo errado"),
         }
     }
@@ -189,6 +193,7 @@ mod tests {
     fn unknown_version_is_rejected() {
         let env = Envelope::LayerNeed {
             id: ContentId::of(b"layer"),
+            hop: 0,
         };
         let mut frame = EnvelopeFrame {
             v: 99,
@@ -204,6 +209,7 @@ mod tests {
     fn direct_envelope_roundtrip() {
         let inner = Envelope::LayerNeed {
             id: ContentId::of(b"layer-xor"),
+            hop: 1,
         };
         let direct = Envelope::Direct {
             to: NodeId::derive(b"destino"),

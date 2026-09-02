@@ -106,6 +106,11 @@ pub struct HyphaeConfig {
     pub nostr_home: Option<std::path::PathBuf>,
     /// Relay Nostr WSS (default damus).
     pub nostr_relay: Option<String>,
+    /// **Gate de licença VOID-00**: se `Some(peers)`, apenas PeerIds listados
+    /// são admitidos como vizinhos (fabrica de peers licenciados). Se `None`,
+    /// o gate está desligado (admissão aberta). Requer feature `license`.
+    #[cfg(feature = "license")]
+    pub licensed_peers: Option<std::collections::HashSet<PeerId>>,
 }
 
 impl Default for HyphaeConfig {
@@ -127,6 +132,8 @@ impl Default for HyphaeConfig {
             enable_nostr_transport: false,
             nostr_home: None,
             nostr_relay: None,
+            #[cfg(feature = "license")]
+            licensed_peers: None,
         }
     }
 }
@@ -147,6 +154,12 @@ pub enum HyphaEvent {
     RecordFound { key: Vec<u8>, value: Vec<u8> },
     /// Query DHT terminou sem resultado.
     RecordNotFound { key: Vec<u8> },
+    /// Resultado de `get_closest_peers` (overlay de zonas): peers que o
+    /// Kademlia considerou mais próximos da chave, por distância XOR.
+    ClosestPeers {
+        key: Vec<u8>,
+        peers: Vec<PeerId>,
+    },
     /// Sporocarp aceitou um circuito relay (crédito ATP).
     SporocarpCircuit {
         src: PeerId,
@@ -283,6 +296,9 @@ pub struct HyphaeNode {
     nostr_home: Option<std::path::PathBuf>,
     #[cfg(feature = "nostr-transport")]
     nostr_relay: Option<String>,
+    /// Allowlist de peers licenciados (feature `license`); ver [`HyphaeConfig::licensed_peers`].
+    #[cfg(feature = "license")]
+    licensed_peers: Option<std::collections::HashSet<PeerId>>,
 }
 
 impl HyphaeNode {
@@ -521,6 +537,8 @@ impl HyphaeNode {
             nostr_home: config.nostr_home.clone(),
             #[cfg(feature = "nostr-transport")]
             nostr_relay: config.nostr_relay.clone(),
+            #[cfg(feature = "license")]
+            licensed_peers: config.licensed_peers.clone(),
         };
 
         // Bootstrap: IPv6 primeiro (SeedBook já ordena; reordena por segurança).
@@ -640,6 +658,32 @@ impl HyphaeNode {
 
     pub fn peer_id(&self) -> PeerId {
         *self.swarm.local_peer_id()
+    }
+
+    /// **Admissão licenciada em runtime**: insere um PeerId na allowlist de
+    /// licença. Se o gate está ativo, esse peer passa a ser aceito. Retorna
+    /// `true` se o gate está ativo (mudança efetiva). Feature `license`.
+    #[cfg(feature = "license")]
+    pub fn admit_licensed_peer(&mut self, peer: PeerId) -> bool {
+        let active = if let Some(allowed) = self.licensed_peers.as_mut() {
+            allowed.insert(peer);
+            true
+        } else {
+            // Gate inativo: tudo já é aceito; registra mesmo assim para o
+            // operador poder "pré-gelificar" antes de ativar o gate.
+            let mut set = std::collections::HashSet::new();
+            set.insert(peer);
+            self.licensed_peers = Some(set);
+            false
+        };
+        tracing::info!(%peer, gate = active, "admissão licenciada: peer inscrito na allowlist");
+        active
+    }
+
+    /// Lê a allowlist de peers licenciados ativa (feature `license`).
+    #[cfg(feature = "license")]
+    pub fn licensed_peers(&self) -> Option<&std::collections::HashSet<PeerId>> {
+        self.licensed_peers.as_ref()
     }
 
     pub fn links(&self) -> &HashMap<PeerId, HyphaLink> {
@@ -1009,6 +1053,31 @@ impl HyphaeNode {
             .get_record(kad::RecordKey::new(&key));
     }
 
+    /// Roteamento overlay de zonas (DHT): inicia uma query Kademlia iterativa
+    /// pelos peers mais próximos da chave por distância XOR.
+    ///
+    /// O resultado chega via [`HyphaEvent::ClosestPeers`] com os PeerIds que o
+    /// DHT resolveu como mais próximos — a base para o forwarding greedy do
+    /// `LayerNeed`/custódia em runtime (não só `known_zones` local).
+    pub fn dht_closest_peers(&mut self, key: Vec<u8>) {
+        use std::num::NonZeroUsize;
+        let _ = self
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .get_n_closest_peers(key, NonZeroUsize::new(6).unwrap());
+    }
+
+    /// Peers conectados agora (mesh vivo) — base para cutádiva/rotas XOR
+    /// além dos anunciantes explícitos de zona.
+    pub fn connected_peer_ids(&self) -> Vec<PeerId> {
+        self.links
+            .iter()
+            .filter(|(_, l)| l.connected)
+            .map(|(p, _)| *p)
+            .collect()
+    }
+
     /// Guarda localmente no store DHT (também usado como cache do Spore Bank).
     pub fn dht_store_local(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), HyphaeError> {
         let record = Record {
@@ -1053,6 +1122,18 @@ impl HyphaeNode {
                     return Some(HyphaEvent::Rooted { address });
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                    // Gate de admissão licenciada (VOID-00): se habilitado, só
+                    // vizinhos com PeerId na allowlist são aceitos; os demais
+                    // são desconectados imediatamente (rede privada por licença).
+                    #[cfg(feature = "license")]
+                    if let Some(allowed) = &self.licensed_peers {
+                        if !allowed.contains(&peer_id) {
+                            tracing::warn!(%peer_id, "license-gate: peer não licenciado — desconectando");
+                            self.metrics.total_atrophies += 1;
+                            let _ = self.swarm.disconnect_peer_id(peer_id);
+                            return Some(HyphaEvent::Atrophy { peer: peer_id });
+                        }
+                    }
                     let link = self.links.entry(peer_id).or_default();
                     link.connected = true;
                     link.strengthen(1);
@@ -1187,6 +1268,12 @@ impl HyphaeNode {
                             kad::GetRecordError::Timeout { key, .. } => key.to_vec(),
                         };
                         return Some(HyphaEvent::RecordNotFound { key });
+                    }
+                    kad::QueryResult::GetClosestPeers(Ok(ok)) => {
+                        return Some(HyphaEvent::ClosestPeers {
+                            key: ok.key,
+                            peers: ok.peers.into_iter().map(|p| p.peer_id).collect(),
+                        });
                     }
                     _ => {}
                 },

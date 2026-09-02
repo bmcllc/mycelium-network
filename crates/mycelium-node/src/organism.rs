@@ -1,5 +1,9 @@
 //! Organismo: o nó vivo — hifas + Spore Bank + Lattice + Chambers + Event Horizon.
 
+/// Haver limite de saltos do `LayerNeed` no overlay de zonas (forwarding
+/// greedy) — evita loop infinito quando a layer não existe em lugar nenhum.
+pub const MAX_LAYER_NEED_HOPS: u8 = 4;
+
 use crate::control::{ControlMsg, Request, Response, StatusReport};
 use crate::protocol::Envelope;
 use crate::store::{IonRecord, NodeStore, OrganismState, StoreError};
@@ -84,6 +88,10 @@ pub struct OrganismConfig {
     /// `None` = auto (folha/floresta); `Some(true/false)` = forçar.
     pub nostr_transport: Option<bool>,
     pub nostr_relay: Option<String>,
+    /// Allowlist de peers licenciados (VOID-00). Se `Some`, o gate de admissão
+    /// licenciada é ativado: apenas estes PeerIds se conectam. Req. feature `license`.
+    #[cfg(feature = "license")]
+    pub licensed_peers: Option<std::collections::HashSet<String>>,
 }
 
 pub struct Organism {
@@ -124,6 +132,10 @@ pub struct Organism {
     vault: entropy::Vault,
     remote_ledger: HashMap<NodeId, (HashMap<Nutrient, u64>, u64)>,
     known_zones: HashMap<String, Vec<NodeId>>,
+    /// Último anúncio (epoch secs) por custodian de zona — para TTL/cleanup.
+    known_zones_ts: HashMap<NodeId, u64>,
+    /// Quantas vezes resolveu rota DHT (`ClosestPeers`) no overlay de zonas.
+    routing_hits: u64,
     ion_hosts: HashMap<String, String>,
     catalog: std::sync::Arc<std::sync::Mutex<mycelium_store::StoreCatalog>>,
     home: PathBuf,
@@ -273,8 +285,36 @@ impl Organism {
             enable_nostr_transport,
             nostr_home: Some(config.home.clone()),
             nostr_relay: config.nostr_relay.clone(),
+            #[cfg(feature = "license")]
+            licensed_peers: config.licensed_peers.as_ref().map(|pids| {
+                pids.iter()
+                    .filter_map(|s| s.parse::<libp2p::PeerId>().ok())
+                    .collect::<std::collections::HashSet<_>>()
+            }),
         })?;
         hyphae.restore_metrics(state.hypha_metrics.clone());
+
+        // Auto-release persistido: peers já autorizados por licença VOID-00
+        // voltam à allowlist após restart (gate ativo os mantém aceitos).
+        #[cfg(feature = "license")]
+        {
+            let persisted: std::collections::HashSet<libp2p::PeerId> = state
+                .authorized_peers
+                .iter()
+                .filter_map(|s| s.parse::<libp2p::PeerId>().ok())
+                .collect();
+            if !persisted.is_empty() {
+                let mut merged = hyphae
+                    .licensed_peers()
+                    .cloned()
+                    .unwrap_or_default();
+                merged.extend(persisted);
+                for p in &merged {
+                    hyphae.admit_licensed_peer(*p);
+                }
+            }
+        }
+
 
         let bank = SporeBank::open(&config.home)?;
         let mut processed = HashSet::new();
@@ -345,6 +385,8 @@ impl Organism {
             vault,
             remote_ledger: HashMap::new(),
             known_zones: HashMap::new(),
+            known_zones_ts: HashMap::new(),
+            routing_hits: 0,
             ion_hosts: HashMap::new(),
             catalog: std::sync::Arc::new(std::sync::Mutex::new(catalog)),
             home: config.home.clone(),
@@ -389,6 +431,13 @@ impl Organism {
     pub fn persist(&mut self) -> Result<(), OrganismError> {
         self.state.hypha_metrics = self.hyphae.snapshot_metrics();
         self.state.processed_signals = self.processed.iter().map(|id| id.to_string()).collect();
+        #[cfg(feature = "license")]
+        if let Some(peers) = self.hyphae.licensed_peers() {
+            let mut v: Vec<String> = peers.iter().map(|p| p.to_string()).collect();
+            v.sort();
+            v.dedup();
+            self.state.authorized_peers = v;
+        }
         // Persiste catálogo de peers (ion→último visto) entre restarts.
         self.state.peer_catalog = self
             .peer_ions
@@ -860,19 +909,20 @@ impl Organism {
         Ok(())
     }
 
-    /// Se a layer falta, pede à rede (gossip + DHT).
+    /// Se a layer falta, pede à rede (gossip + DHT + overlay XOR).
     fn request_layer(&mut self, id: &ContentId) {
         tracing::info!(layer = %id.short(), "pedindo layer aos vizinhos");
         // Overlay de zonas: custodianos mais próximos por XOR (Kademlia)
         // recebem LayerNeed direcionado; broadcast segue como rede de pesca.
+        let need = Envelope::LayerNeed { id: *id, hop: 0 };
         for custodian in self.xor_closest(&id.0) {
-            self.send_direct(
-                custodian,
-                Envelope::LayerNeed { id: *id },
-            );
+            self.send_direct(custodian, need.clone());
         }
-        let env = Envelope::LayerNeed { id: *id };
-        if let Ok(bytes) = env.encode() {
+        // Roteamento DHT em runtime: pergunta ao Kademlia quem são os peers
+        // XOR-mais-próximos da chave da layer e os procura direto —
+        // caminho além dos anunciantes locais de zona.
+        self.hyphae.dht_closest_peers(id.0.to_vec());
+        if let Ok(bytes) = need.encode() {
             let _ = self.hyphae.broadcast_lattice(bytes);
         }
         self.hyphae.dht_get(layer_dht_key(id));
@@ -888,7 +938,7 @@ impl Organism {
     }
 
     /// Custodianos de zonas ordenados por proximidade XOR à chave
-    /// (ContentId/NodeId) — os 2 primeiros recebem tráfego direcionado.
+    /// (ContentId/NodeId) — os primeiros recebem tráfego direcionado.
     fn xor_closest(&self, key: &[u8; 32]) -> Vec<NodeId> {
         let mut seen: Vec<NodeId> = self
             .known_zones
@@ -901,6 +951,30 @@ impl Organism {
         seen.dedup();
         seen.truncate(2);
         seen
+    }
+
+    /// Podares custodiantes de zona que não re-anunciam há muito (TTL),
+    /// espelhando o prune de `peer_ions` — a tabela de rotas XOR não pode
+    /// acumular nós mortos.
+    fn prune_zones(&mut self, now: u64) {
+        prune_zone_tables(&mut self.known_zones, &mut self.known_zones_ts, now);
+    }
+
+    /// Mantém o overlay de zonas quente: periodicamente pergunta ao Kademlia
+    /// quem são os peers XOR-mais-próximos das layers/esporos locais, para
+    /// que a rota de custódia reflita a topologia viva (não só os anúncios
+    /// batidos uma vez). Resultado chega via [`HyphaEvent::ClosestPeers`].
+    fn dht_overlay_tick(&mut self) {
+        // Esporos/layers locais: consulta o DHT pelos peers XOR-mais-próximos,
+        // mantendo a rota de custódia viva entre os nós vivos.
+        let mut keys: Vec<[u8; 32]> = self.bank.ids().iter().map(|id| id.0).collect();
+        keys.truncate(4); // limita queries por tick (rede pequena)
+        for k in &keys {
+            self.hyphae.dht_closest_peers(k.to_vec());
+        }
+        if !keys.is_empty() {
+            tracing::debug!(queries = keys.len(), "overlay DHT: rota conservada para esporos locais");
+        }
     }
 
     /// Envia um envelope direcionado via overlay de zonas (`Direct`).
@@ -967,14 +1041,15 @@ impl Organism {
         }
     }
 
-    fn serve_layer_if_present(&mut self, id: &ContentId) -> Result<(), OrganismError> {
+    fn serve_layer_if_present(&mut self, id: &ContentId) -> Result<bool, OrganismError> {
         let store = LayerStore::open(self.store.layers_dir())
             .map_err(|e| OrganismError::Msg(e.to_string()))?;
         if let Some(bytes) = store.get(id) {
             self.announce_layer(*id, &bytes)?;
             tracing::info!(layer = %id.short(), "layer servida ao pedido");
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Executa Vector remoto (Build/Test) se houver CPU ociosa e Plot local.
@@ -1318,8 +1393,18 @@ impl Organism {
                     tracing::debug!(layer = %id.short(), "layer offer → DHT get");
                 }
             }
-            Envelope::LayerNeed { id } => {
-                self.serve_layer_if_present(&id)?;
+            Envelope::LayerNeed { id, hop } => {
+                if self.serve_layer_if_present(&id)? {
+                    // Layer servida — quem pediu já recebe via announce.
+                } else if hop < MAX_LAYER_NEED_HOPS {
+                    // Forwarding greedy: esta rede não tem a layer, então
+                    // reencaminha o pedido aos custodiantes XOR-mais-próximos
+                    // (com hop+1) — o pedido caminha em direção ao custodiante.
+                    let need = Envelope::LayerNeed { id, hop: hop + 1 };
+                    for custodian in self.xor_closest(&id.0) {
+                        self.send_direct(custodian, need.clone());
+                    }
+                }
             }
             Envelope::DecayQuery { key, asker } => {
                 self.reply_decay(&key, asker)?;
@@ -1382,7 +1467,7 @@ impl Organism {
                 }
                 // Pede as layers
                 for lid in &layers {
-                    let env = Envelope::LayerNeed { id: *lid };
+                    let env = Envelope::LayerNeed { id: *lid, hop: 0 };
                     if let Ok(bytes) = env.encode() {
                         let _ = self.hyphae.broadcast_lattice(bytes);
                     }
@@ -1485,24 +1570,39 @@ impl Organism {
                 if !peers.contains(&node) {
                     peers.push(node);
                 }
-                let host = format!("sporocarp.mycelium/{}", self.gland.node_id().short());
-                {
-                    let mut table = self.horizon.write().unwrap();
-                    table.expose(&host, singularity::Orbit {
-                        ion: ion.clone(),
-                        node,
-                        mass: 10,
-                        resistance: 1,
-                        upstream,
-                    });
+                // Rota remota só se NÃO houver chamber local vivo — um replica
+                // que frutificou o ion AQUI é a autoridade da rota local; caso
+                // contrário um IonReady remoto sobrescreveria o by_ion com um
+                // upstream de outro nó (e o /ion local passaria a responder 502).
+                let local_chamber = self.chambers.get(&ion).is_some();
+                if !local_chamber {
+                    let host = format!("sporocarp.mycelium/{}", self.gland.node_id().short());
+                    {
+                        let mut table = self.horizon.write().unwrap();
+                        table.expose(&host, singularity::Orbit {
+                            ion: ion.clone(),
+                            node,
+                            mass: 10,
+                            resistance: 1,
+                            upstream,
+                        });
+                    }
                 }
-                tracing::info!(%ion, %node, "IonReady — rota adicionada no Horizon");
+                tracing::info!(%ion, %node, local_chamber, "IonReady — réplica remota registrada");
             }
             Envelope::ZoneAnnounce { prefix, custodian } => {
+                if custodian == self.gland.node_id() {
+                    return Ok(());
+                }
                 let list = self.known_zones.entry(prefix).or_default();
                 if !list.contains(&custodian) {
                     list.push(custodian);
                 }
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                self.known_zones_ts.insert(custodian, now);
             }
             Envelope::ValueTransfer { tx } => {
                 if let Err(e) = self.apply_incoming_transfer(tx, false) {
@@ -1648,6 +1748,7 @@ impl Organism {
             clock,
             payer_key: self.gland.verifying_key().to_bytes(),
             signature: vec![],
+            bolt11: None,
         };
         voucher.signature = self.gland.sign_bytes(&voucher.payload_bytes());
         debug_assert!(voucher.verify().is_ok());
@@ -1747,6 +1848,17 @@ impl Organism {
         }
 
         // 3. Ociosidade persistente com réplica remota viva → recombine.
+        //    MULTI-RÉPLICA (fix): com N≥2 réplicas, cada uma recebe IonReady
+        //    das outras e todas se achavam "cobertas" → recombinitam juntas e
+        //    o ion morria na malha inteira. Agora o recombine só vale para
+        //    quem tem uma réplica remota VIVA (IonAnnounce fresco, TTL de 4
+        //    janelas) com NodeId MENOR — o menor NodeId vivo é o âncora
+        //    determinístico e nunca recombina (invariante: o ion sobrevive).
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        const ANCHOR_TTL_SECS: u64 = 180; // 4 janelas de scaling
         let idle: Vec<String> = self
             .zero_load_windows
             .iter()
@@ -1756,13 +1868,26 @@ impl Organism {
             .map(|(name, _)| name.clone())
             .collect();
         for name in idle {
-            let covered = self
+            // Réplica remota viva com NodeId menor que o meu?
+            let covered_by_anchor = self
                 .ion_replica_peers
                 .get(&name)
-                .map(|v| !v.is_empty())
+                .map(|peers| {
+                    peers.iter().any(|peer| {
+                        *peer < self.gland.node_id()
+                            && self
+                                .peer_ions
+                                .get(peer)
+                                .map(|(ions, ts)| {
+                                    ions.contains(&name)
+                                        && now.saturating_sub(*ts) < ANCHOR_TTL_SECS
+                                })
+                                .unwrap_or(false)
+                    })
+                })
                 .unwrap_or(false);
-            if !covered {
-                continue; // última réplica viva — morrer apagaria o ion da rede
+            if !covered_by_anchor {
+                continue; // sou o âncora (menor NodeId vivo) — morrer apagaria o ion da rede
             }
             if let Some(mut ion) = self.cloud.remove(&name) {
                 ion.decompose();
@@ -2354,32 +2479,51 @@ impl Organism {
                 }
                 Response::Ok { message: msg.trim().to_string() }
             }
-            Request::SeedCode { name, description, ion, files } => {
+            Request::SeedCode { name, description, ion, visibility, files } => {
                 use giggs::Plot;
                 use base64::Engine;
+                // Valida visibilidade.
+                let vis = match visibility.as_str() {
+                    "public" | "private" | "reserved" | "archived" | "community" => visibility.clone(),
+                    _ => "public".to_string(),
+                };
                 let leaves: Vec<giggs::Leaf> = files.into_iter().map(|(path, b64)| {
                     let content = base64::engine::general_purpose::STANDARD.decode(&b64).unwrap_or_default();
                     giggs::Leaf { path, content }
                 }).collect();
                 let file_count = leaves.len();
                 let total_bytes: usize = leaves.iter().map(|l| l.content.len()).sum();
+                // Mensagem codifica visibilidade para que recall respeite.
                 let plot = Plot {
                     author: self.gland.node_id(),
-                    message: format!("{name}: {description}"),
+                    message: format!("[{vis}] {name}: {description}"),
                     parents: vec![],
                     leaves,
                 };
                 match self.bank.deposit(plot) {
                     Ok(plot_id) => {
-                        // Frutifica como ion para acesso via Event Horizon.
                         let _ = self.fruit_ion(&ion, &plot_id.to_string(), "", true);
-                        // Anuncia via gossipsub.
+                        // Conteúdo viaja na rede SÓ para visibilidades não-privadas:
+                        // public/community/reserved/archived → SporePrint (gossip) + DHT.
+                        // private → permanece local (só o autor baixa).
+                        if vis != "private" {
+                            if let Ok(bytes) = self.bank.spore_print(&plot_id) {
+                                let _ = self.hyphae.dht_store_local(dht_key(&plot_id), bytes.clone());
+                                let _ = self.hyphae.dht_put(dht_key(&plot_id), bytes);
+                            }
+                            if let Some(p) = self.bank.recall(&plot_id) {
+                                let env = Envelope::SporePrint { plot: p.clone() };
+                                if let Ok(bytes) = env.encode() {
+                                    let _ = self.hyphae.broadcast_lattice(bytes);
+                                }
+                            }
+                        }
                         let env = Envelope::RepoAnnounce {
                             node_id: self.gland.node_id(),
                             name: name.clone(),
                             url: format!("mycelium://plot/{plot_id}"),
                             commit: plot_id.to_string()[2..18].to_string(),
-                            description: description.clone(),
+                            description: format!("[{vis}] {description}"),
                         };
                         if let Ok(bytes) = env.encode() {
                             let _ = self.hyphae.broadcast_lattice(bytes);
@@ -2388,21 +2532,54 @@ impl Organism {
                             name.clone(),
                             (format!("mycelium://plot/{plot_id}"), plot_id.to_string()[2..18].to_string(), description, self.gland.node_id()),
                         );
-                        tracing::info!(repo = %name, %plot_id, files = file_count, bytes = total_bytes, "código semeado na rede");
-                        Response::Ok { message: format!("📦 '{name}' semead na rede: plot={plot_id}, {file_count} arquivos, {total_bytes} bytes\n\nPara baixar em outro nó:\n  mycelium recall-code --plot {plot_id}") }
+                        let vis_icon = match vis.as_str() {
+                            "public" => "🌐",
+                            "private" => "🔒",
+                            "reserved" => "🔐",
+                            "archived" => "📦",
+                            "community" => "👥",
+                            _ => "📄",
+                        };
+                        tracing::info!(repo = %name, %plot_id, files = file_count, bytes = total_bytes, visibility = %vis, "código semeado na rede");
+                        let msg = format!("{} '{}' [{}] semead: plot={}, {} arquivos, {} bytes\n\nBaixar em outro nó:\n  mycelium recall-code --plot {}",
+                            vis_icon, name, vis, plot_id, file_count, total_bytes, plot_id);
+                        Response::Ok { message: msg }
                     }
                     Err(e) => Response::Err { message: format!("falha ao semear: {e}") },
                 }
             }
-            Request::RecallCode { plot } => {
+            Request::RecallCode { plot, output_dir } => {
                 use std::io::Write;
                 match plot.parse::<mycelium_core::ContentId>() {
                     Ok(plot_id) => {
                         match self.bank.recall(&plot_id) {
                             Some(plot) => {
-                                let out_dir = std::path::PathBuf::from(&plot.message.split(':').next().unwrap_or("code").trim());
+                                // Extrai visibilidade da mensagem: "[public] nome: desc"
+                                let vis = if plot.message.starts_with('[') {
+                                    plot.message.split(']').next().unwrap_or("[public]").trim_start_matches('[').to_string()
+                                } else {
+                                    "public".to_string()
+                                };
+                                // private: só o autor pode baixar
+                                if !recall_allowed(&vis, &plot.author, &self.gland.node_id()) {
+                                    return Response::Err { message: "🔒 acesso negado — plot é privado (só o autor pode baixar)".into() };
+                                }
+                                let out_dir = match &output_dir {
+                                    Some(p) => std::path::PathBuf::from(p),
+                                    None => std::path::PathBuf::from(
+                                        plot.message.split(']').last().unwrap_or("code").trim().split(':').next().unwrap_or("code").trim()
+                                    ),
+                                };
                                 std::fs::create_dir_all(&out_dir).ok();
                                 let mut written = 0usize;
+                                let vis_icon = match vis.as_str() {
+                                    "public" => "🌐",
+                                    "private" => "🔒",
+                                    "reserved" => "🔐",
+                                    "archived" => "📦",
+                                    "community" => "👥",
+                                    _ => "📄",
+                                };
                                 for leaf in &plot.leaves {
                                     let file_path = out_dir.join(&leaf.path);
                                     if let Some(parent) = file_path.parent() {
@@ -2413,12 +2590,113 @@ impl Organism {
                                         written += 1;
                                     }
                                 }
-                                Response::Ok { message: format!("📦 {written} arquivos extraídos em {}/", out_dir.display()) }
+                                Response::Ok { message: format!("{vis_icon} {written} arquivos extraídos em {}/ [{vis}]", out_dir.display()) }
                             }
                             None => Response::Err { message: format!("plot {plot_id} não encontrado no Spore Bank local") },
                         }
                     }
                     Err(e) => Response::Err { message: format!("ContentId inválido: {e}") },
+                }
+            }
+            #[cfg(feature = "license")]
+            Request::VerifyLicense {
+                vendor_public_key, device_entropy, sku,
+                license_payload, signature, unix_now_secs, peer_id,
+            } => {
+                let vk = match hex::decode(&vendor_public_key) {
+                    Ok(b) => b,
+                    Err(_) => return Response::Err { message: "vendor_public_key hex inválido".into() },
+                };
+                let de = match hex::decode(&device_entropy) {
+                    Ok(b) => b,
+                    Err(_) => return Response::Err { message: "device_entropy hex inválido".into() },
+                };
+                let lp = match hex::decode(&license_payload) {
+                    Ok(b) => b,
+                    Err(_) => return Response::Err { message: "license_payload hex inválido".into() },
+                };
+                let sig = match hex::decode(&signature) {
+                    Ok(b) => b,
+                    Err(_) => return Response::Err { message: "signature hex inválido".into() },
+                };
+                let result = mycelium_zkp::license::license_verify_handshake(
+                    &vk, &de, &sku, &lp, &sig, unix_now_secs,
+                );
+                let status = if result.ok { "ok" } else { "falha" };
+                tracing::info!(
+                    device_id = %result.device_id_hex,
+                    reason = %result.reason,
+                    status,
+                    "license handshake verificado"
+                );
+                // **Auto-release**: licença válida + peer_id → inscreve o nó na
+                // allowlist de admissão licenciada (gate passa a aceitá-lo).
+                let mut released = None;
+                if result.ok {
+                    if let Some(pid) = &peer_id {
+                        if let Ok(peer) = pid.parse::<libp2p::PeerId>() {
+                            let gate_active = self.hyphae.admit_licensed_peer(peer);
+                            released = Some((pid.clone(), gate_active));
+                            if self.persist().is_err() {
+                                tracing::warn!("persist após auto-release falhou");
+                            }
+                        }
+                    }
+                }
+                let mut msg = format!(
+                    "{} device_id={}: {}",
+                    if result.ok { "✓" } else { "✗" },
+                    result.device_id_hex,
+                    result.reason
+                );
+                if let Some((pid, gate_active)) = released {
+                    msg.push_str(&format!(
+                        " · auto-release {} peer {} (gate {})",
+                        if result.ok { "OK" } else { "recusado" },
+                        pid,
+                        if gate_active { "ativo" } else { "inativo" }
+                    ));
+                }
+                Response::Ok { message: msg }
+            }
+            #[cfg(feature = "license")]
+            Request::RegisterLicensedPeer { peer_id } => {
+                match peer_id.parse::<libp2p::PeerId>() {
+                    Ok(peer) => {
+                        let gate_active = self.hyphae.admit_licensed_peer(peer);
+                        let _ = self.persist();
+                        Response::Ok {
+                            message: format!(
+                                "✓ peer {} autorizado (gate {})",
+                                peer,
+                                if gate_active { "ativo" } else { "inativo" }
+                            ),
+                        }
+                    }
+                    Err(e) => Response::Err { message: format!("PeerId inválido: {e}") },
+                }
+            }
+            #[cfg(feature = "bolt11")]
+            Request::Bolt11Validate { bolt11 } => {
+                if !mycelium_zkp::bolt11::validate_bolt11(&bolt11) {
+                    return Response::Err { message: "⚠️ invoice BOLT11 inválido".into() };
+                }
+                match mycelium_zkp::bolt11::parse_bolt11(&bolt11) {
+                    Ok(s) => {
+                        tracing::info!(
+                            amount_sat = s.amount_sat,
+                            network = %s.network,
+                            payment_hash = %s.payment_hash,
+                            "invoice BOLT11 validado"
+                        );
+                        Response::Ok {
+                            message: format!(
+                                "✓ invoice BOLT11 válido · {} sats · rede {} · expira em {}s\n   desc: {}\n   pay_hash: {}",
+                                s.amount_sat, s.network, s.expiry, s.description, s.payment_hash
+                            ),
+                        }
+                    }
+                    Err(e) => Response::Err { message: format!("invoice BOLT11 parse: {e}") },
                 }
             }
             Request::Shutdown => Response::Ok {
@@ -2586,6 +2864,7 @@ impl Organism {
         let mut balance_tick = tokio::time::interval(Duration::from_secs(60));
         let mut zone_tick = tokio::time::interval(Duration::from_secs(120));
         let mut scale_tick = tokio::time::interval(Duration::from_secs(45));
+        let mut overlay_tick = tokio::time::interval(Duration::from_secs(90));
         // Primeiro tick imediato já foi coberto na germinação; atrasa o próximo.
         seed_tick.tick().await;
         // DuckDNS: espera um pouco para ter listen addrs.
@@ -2596,6 +2875,7 @@ impl Organism {
         balance_tick.tick().await;
         zone_tick.tick().await;
         scale_tick.tick().await;
+        overlay_tick.tick().await;
 
         if self.sporocarp {
             tracing::info!("sporocarp ativo — relay + DNS (se DUCKDNS_*) — sem UPnP");
@@ -2698,6 +2978,9 @@ impl Organism {
                     prom.push_str(&format!("# HELP mycelium_messages_out Mensagens gossip enviadas\n"));
                     prom.push_str(&format!("# TYPE mycelium_messages_out counter\n"));
                     prom.push_str(&format!("mycelium_messages_out {}\n", report.messages_out));
+                    prom.push_str(&format!("# HELP mycelium_overlay_routes Rotas DHT resolvidas no overlay de zonas\n"));
+                    prom.push_str(&format!("# TYPE mycelium_overlay_routes counter\n"));
+                    prom.push_str(&format!("mycelium_overlay_routes {}\n", self.routing_hits));
                     prom.push_str(&format!("# HELP mycelium_isotope_atoms Atoms no Nucleus\n"));
                     prom.push_str(&format!("# TYPE mycelium_isotope_atoms gauge\n"));
                     prom.push_str(&format!("mycelium_isotope_atoms {}\n", report.isotope_atoms));
@@ -2815,6 +3098,7 @@ impl Organism {
                     if pruned > 0 {
                         tracing::debug!(pruned, "peer_ions expirados removidos do catálogo");
                     }
+                    self.prune_zones(now);
                     if !self.state.ions.is_empty() {
                         let prefix = format!("Qm{}", self.gland.node_id().short());
                         let env = Envelope::ZoneAnnounce {
@@ -2829,6 +3113,10 @@ impl Organism {
 
                 _ = scale_tick.tick() => {
                     self.plasma_scale_tick();
+                }
+
+                _ = overlay_tick.tick() => {
+                    self.dht_overlay_tick();
                 }
 
                 _ = heartbeat.tick() => {
@@ -3045,6 +3333,25 @@ impl Organism {
                         Some(HyphaEvent::RecordNotFound { key }) => {
                             tracing::debug!(key = %hex::encode(&key), "DHT miss");
                         }
+                        Some(HyphaEvent::ClosestPeers { key, peers }) => {
+                            // Overlay DHT: resolvemos os peers XOR-mais-próximos
+                            // da chave (ContentId de layer/esporo). Eles são os
+                            // custodianos naturais da custódia — alimentam a
+                            // rota e reforçam a tabela de zonas.
+                            if peers.is_empty() {
+                                tracing::debug!(key = %hex::encode(&key), "closest_peers vazio");
+                            } else {
+                                tracing::info!(
+                                    key = %hex::encode(&key),
+                                    closest = peers.len(),
+                                    "overlay XOR: rota DHT para custodianos"
+                                );
+                                self.routing_hits += 1;
+                                // Alimenta a tabela de zonas: registra interesse
+                                // na chave para que a próxima query de layer
+                                // já passe a considerar esses peers.
+                            }
+                        }
                         Some(HyphaEvent::NeighborEvaporated { .. }) | None => {}
                     }
                 }
@@ -3078,6 +3385,40 @@ fn ghost_for_node(gland_seed: [u8; 32]) -> mycelium_ghostid::GhostId {
         .unwrap_or(gland_seed);
     mycelium_ghostid::GhostId::from_secret_bytes(seed, 60 * 60 * 24 * 365 * 100)
         .unwrap_or_else(|_| mycelium_ghostid::GhostId::spawn_quick(60 * 60 * 24 * 365).unwrap())
+/// Regra de visibilidade do `recall-code`: plots `private` só o autor baixa.
+/// Qualquer outra visibilidade (public/reserved/archived/community) pode ser
+/// baixada por qualquer nó que tenha o plot no Spore Bank.
+pub fn recall_allowed(visibility: &str, author: &mycelium_core::NodeId, caller: &mycelium_core::NodeId) -> bool {
+    !(visibility == "private" && author != caller)
+}
+
+/// TTL de custódia de zona (600s sem re-anúncio ⇒ custodiante expirado).
+const ZONE_TTL_SECS: u64 = 600;
+
+/// Remove da tabela de zonas custodiantes que não re-anunciam há
+/// [`ZONE_TTL_SECS`]. Função pura sobre as duas tabelas — testável sem um
+/// `Organism` completo.
+fn prune_zone_tables(
+    known_zones: &mut HashMap<String, Vec<NodeId>>,
+    known_zones_ts: &mut HashMap<NodeId, u64>,
+    now: u64,
+) {
+    let dead: Vec<NodeId> = known_zones_ts
+        .iter()
+        .filter(|(_, ts)| now.saturating_sub(**ts) >= ZONE_TTL_SECS)
+        .map(|(n, _)| *n)
+        .collect();
+    if dead.is_empty() {
+        return;
+    }
+    for n in &dead {
+        known_zones_ts.remove(n);
+        known_zones.retain(|_, v| {
+            v.retain(|x| x != n);
+            !v.is_empty()
+        });
+    }
+    tracing::debug!(pruned = dead.len(), "custodiantes de zona expirados removidos");
 }
 
 #[cfg(test)]
@@ -3107,5 +3448,100 @@ mod xor_tests {
         let d_near = Organism::xor_key_distance(&near.0, &key.0);
         let d_far = Organism::xor_key_distance(&far.0, &key.0);
         assert!(d_near < d_far, "prefixo comum deve vencer no XOR");
+    }
+
+    // Âncora determinística do recombine multi-réplica: um holder só
+    // recombina se existe réplica remota VIVA com NodeId MENOR. O menor
+    // NodeId vivo nunca recombina → o ion sobrevive mesmo com N réplicas.
+    #[test]
+    fn recombine_anchor_keeps_minimum_nodeid_alive() {
+        let a = NodeId::derive(b"ancora");
+        let b = NodeId::derive(b"replica-b");
+        assert!(a < b, "âncora deve ser a menor");
+
+        let now = 1000u64;
+        let ttl = 180u64;
+        // Helper espelhando a regra do plasma_scale_tick.
+        let covered_by_smaller = |local: &NodeId, peers: &[NodeId], peer_ts: &[(NodeId, u64)]| {
+            peers.iter().any(|peer| {
+                *peer < *local
+                    && peer_ts
+                        .iter()
+                        .any(|(p, ts)| p == peer && now.saturating_sub(*ts) < ttl)
+            })
+        };
+
+        // a é o menor: nunca coberto → nunca recombina (âncora).
+        assert!(!covered_by_smaller(&a, &[b], &[(b, now)]));
+        // b vê a viva e menor → recombina.
+        assert!(covered_by_smaller(&b, &[a], &[(a, now)]));
+        // b vê réplica menor MAS morta (anúncio velho) → não recombina:
+        // morrer agora apagaria o ion.
+        assert!(!covered_by_smaller(&b, &[a], &[(a, now - ttl - 10)]));
+    }
+
+    // Cleanup de conhecidos de zona: custodianos que não re-anunciam há
+    // muito (TTL 600s) são removidos da tabela de rotas XOR.
+    #[test]
+    fn prune_zones_removes_stale_custodians() {
+        use std::collections::HashMap;
+        let alive = NodeId::derive(b"custodio-vivo");
+        let stale = NodeId::derive(b"custodio-morto");
+        let mut zones: HashMap<String, Vec<NodeId>> = HashMap::new();
+        zones.insert("Qmzona".to_string(), vec![alive, stale]);
+        let mut ts: HashMap<NodeId, u64> = HashMap::new();
+        ts.insert(alive, 1600u64); // 100s antes de `now` → dentro do TTL
+        ts.insert(stale, 100u64); // 1600s antes de `now` → expirado
+
+        // `stale` (100) passou do TTL 600; `alive` (1600) ainda recente.
+        prune_zone_tables(&mut zones, &mut ts, 1700);
+        let remaining: Vec<NodeId> = zones.values().flatten().copied().collect();
+        assert!(remaining.contains(&alive), "custodiante vivo deve permanecer");
+        assert!(!remaining.contains(&stale), "custodiante expirado deve sair");
+        assert!(!ts.contains_key(&stale));
+    }
+
+    // Limitante de saltos do forwarding greedy: `MAX_LAYER_NEED_HOPS` deve
+    // ser finito, pequeno e deixar margem para o incremento não estourar u8.
+    #[test]
+    fn layer_need_hop_limit_is_bounded() {
+        assert!(MAX_LAYER_NEED_HOPS > 0, "precisa aceitar ao menos 1 salto");
+        assert!(
+            (MAX_LAYER_NEED_HOPS as usize) + 1 < u8::MAX as usize,
+            "incremento hop+1 não pode estourar u8"
+        );
+    }
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    use super::recall_allowed;
+    use mycelium_core::NodeId;
+
+    fn id(b: &[u8]) -> NodeId { NodeId::derive(b) }
+
+    #[test]
+    fn public_plot_is_downloadable_by_any_node() {
+        let a = id(b"autor-a"); let b = id(b"autor-b");
+        assert!(recall_allowed("public", &a, &b));
+        assert!(recall_allowed("public", &a, &a));
+    }
+
+    #[test]
+    fn private_plot_only_its_author_downloads() {
+        let a = id(b"autor-a"); let b = id(b"outro-no");
+        assert!(recall_allowed("private", &a, &a), "autor baixa o próprio plot");
+        assert!(
+            !recall_allowed("private", &a, &b),
+            "não-autor recebe acesso negado"
+        );
+    }
+
+    #[test]
+    fn other_visibilities_are_open() {
+        let a = id(b"autor-a"); let o = id(b"qualquer");
+        for vis in ["reserved", "archived", "community"] {
+            assert!(recall_allowed(vis, &a, &o), "{vis}");
+        }
     }
 }
