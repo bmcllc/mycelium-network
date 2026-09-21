@@ -383,6 +383,12 @@ enum RepoCmd {
         /// Diretório raiz do repositório a publicar.
         #[arg(short, long)]
         dir: PathBuf,
+        /// Nome persistente do repositório no Giggs.
+        #[arg(long)]
+        repository: Option<String>,
+        /// Branch atualizada por compare-and-swap.
+        #[arg(long, default_value = "main")]
+        branch: String,
         /// Mensagem/descrição do commit (ex.: "v0.1.0 — store P2P").
         #[arg(short, long, default_value = "mycelium-launcher-store")]
         message: String,
@@ -2436,7 +2442,7 @@ async fn store_cmd_async(home: &PathBuf, action: StoreCmd) -> Result<(), String>
 
 async fn repo_cmd(home: &PathBuf, action: RepoCmd) -> Result<(), String> {
     match action {
-        RepoCmd::Publish { dir, message } => {
+        RepoCmd::Publish { dir, repository, branch, message } => {
             if !dir.is_dir() {
                 return Err(format!("diretório não encontrado: {:?}", dir));
             }
@@ -2447,7 +2453,13 @@ async fn repo_cmd(home: &PathBuf, action: RepoCmd) -> Result<(), String> {
             let bytes: usize = leaves.iter().map(|l| l.content.len()).sum();
             println!("[🍄 Repo] Empacotando {} arquivos ({} bytes) de {:?}", leaves.len(), bytes, dir);
             println!("[🍄 Repo] Enviando para o daemon (SporeBank + DHT + gossip)...");
-            let resp = call(&home.join("mycelium.sock"), Request::RepoPublish { message, leaves }).await?;
+            let repository = repository.or_else(|| dir.file_name().map(|v| v.to_string_lossy().into_owned()));
+            let resp = call(&home.join("mycelium.sock"), Request::RepoPublish {
+                repository,
+                branch: Some(branch),
+                message,
+                leaves,
+            }).await?;
             match resp {
                 Response::RepoPublished { cid, leaves, bytes } => {
                     println!("[🍄 Repo] ✅ Publicado!");

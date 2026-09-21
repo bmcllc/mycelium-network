@@ -7,7 +7,7 @@ pub const MAX_LAYER_NEED_HOPS: u8 = 4;
 use crate::control::{ControlMsg, Request, Response, StatusReport};
 use crate::protocol::Envelope;
 use crate::store::{IonRecord, NodeStore, OrganismState, StoreError};
-use giggs::{Leaf, Plot};
+use giggs::{Leaf, Plot, RefStore, RefUpdate, SignedRefUpdate};
 use inertia::{Flywheel, Momentum, Thrust, Vector};
 use isotope::{Atom, Nucleus, DEFAULT_RING_SIZE};
 use mycelium_core::{ContentId, FruitingBody, Membrane, NodeId, Nutrient, Resources};
@@ -596,14 +596,40 @@ impl Organism {
         message: String,
         leaves: Vec<giggs::Leaf>,
     ) -> Result<ContentId, OrganismError> {
+        self.publish_repo_ref("default", "main", message, leaves)
+    }
+
+    /// Publica um snapshot e avança uma referência assinada por CAS. O pai é
+    /// sempre a ponta verificada da branch, portanto publicações concorrentes
+    /// não podem sobrescrever histórico silenciosamente.
+    pub fn publish_repo_ref(
+        &mut self,
+        repository: &str,
+        branch: &str,
+        message: String,
+        leaves: Vec<giggs::Leaf>,
+    ) -> Result<ContentId, OrganismError> {
+        let refs = RefStore::open(self.home.join("giggs/refs"))
+            .map_err(|e| OrganismError::Msg(e.to_string()))?;
+        let current = refs.read(repository, branch)
+            .map_err(|e| OrganismError::Msg(e.to_string()))?;
+        let parent = current.as_ref().map(|value| value.update.target);
         let plot = Plot {
             author: self.gland.node_id(),
             message,
-            parents: vec![],
+            parents: parent.into_iter().collect(),
             leaves,
         };
         ensure_repo_publishable(&plot)?;
         let id = self.bank.deposit(plot.clone())?;
+        let update = SignedRefUpdate::sign(RefUpdate {
+            repository: repository.into(),
+            name: branch.into(),
+            target: id,
+            previous: parent,
+            sequence: current.map_or(0, |value| value.update.sequence + 1),
+        }, &self.ghost).map_err(|e| OrganismError::Msg(e.to_string()))?;
+        refs.compare_and_swap(update).map_err(|e| OrganismError::Msg(e.to_string()))?;
         let bytes = self.bank.public_spore_print(&id).ok_or_else(|| {
             OrganismError::Msg("política pública recusou o Plot antes da distribuição".into())
         })?;
@@ -2474,10 +2500,15 @@ impl Organism {
                     message: format!("erro ao salvar catálogo: {}", e),
                 })
             }
-            Request::RepoPublish { message, leaves } => {
+            Request::RepoPublish { repository, branch, message, leaves } => {
                 let n = leaves.len();
                 let bytes: usize = leaves.iter().map(|l| l.content.len()).sum();
-                match self.publish_repo(message, leaves) {
+                match self.publish_repo_ref(
+                    repository.as_deref().unwrap_or("default"),
+                    branch.as_deref().unwrap_or("main"),
+                    message,
+                    leaves,
+                ) {
                     Ok(id) => Response::RepoPublished {
                         cid: id.to_string(),
                         leaves: n,

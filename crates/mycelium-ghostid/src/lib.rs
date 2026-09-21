@@ -185,6 +185,12 @@ impl GhostId {
         self.sign_nostr_event(&hash)
     }
 
+    /// Verifica uma assinatura criada por [`GhostId::sign`].
+    pub fn verify(pubkey: &[u8; 32], data: &[u8], sig: &[u8; 64]) -> Result<(), GhostError> {
+        let hash: [u8; 32] = Sha256::digest(data).into();
+        Self::verify_nostr_event(pubkey, &hash, sig)
+    }
+
     /// Verifica assinatura Schnorr sobre um event id.
     pub fn verify_nostr_event(
         pubkey: &[u8; 32],

@@ -109,6 +109,10 @@ pub enum Request {
     },
     /// Publica uma árvore de código (repo) como Plot multi-leaf no SporeBank.
     RepoPublish {
+        #[serde(default)]
+        repository: Option<String>,
+        #[serde(default)]
+        branch: Option<String>,
         message: String,
         leaves: Vec<giggs::Leaf>,
     },

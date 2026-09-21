@@ -9,7 +9,9 @@
 
 use mycelium_core::{ContentId, NodeId};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use mycelium_ghostid::GhostId;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
 pub enum GiggsError {
@@ -17,6 +19,117 @@ pub enum GiggsError {
     PlotNotFound(ContentId),
     #[error("falha de serialização: {0}")]
     Codec(#[from] serde_json::Error),
+    #[error("falha de armazenamento: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("referência inválida: {0}")]
+    InvalidRef(String),
+    #[error("assinatura da referência inválida")]
+    BadSignature,
+    #[error("conflito de compare-and-swap: esperado {expected:?}, atual {actual:?}")]
+    RefConflict { expected: Option<ContentId>, actual: Option<ContentId> },
+}
+
+/// Atualização imutável e assinável de uma referência mutável.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RefUpdate {
+    pub repository: String,
+    pub name: String,
+    pub target: ContentId,
+    pub previous: Option<ContentId>,
+    pub sequence: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SignedRefUpdate {
+    pub update: RefUpdate,
+    pub signer: String,
+    pub signature: String,
+}
+
+impl SignedRefUpdate {
+    pub fn sign(update: RefUpdate, identity: &GhostId) -> Result<Self, GiggsError> {
+        let payload = serde_json::to_vec(&update)?;
+        Ok(Self { update, signer: identity.nostr_pubkey_hex(), signature: hex::encode(identity.sign(&payload)) })
+    }
+
+    pub fn verify(&self) -> Result<(), GiggsError> {
+        let pubkey: [u8; 32] = hex::decode(&self.signer).map_err(|_| GiggsError::BadSignature)?.try_into().map_err(|_| GiggsError::BadSignature)?;
+        let signature: [u8; 64] = hex::decode(&self.signature).map_err(|_| GiggsError::BadSignature)?.try_into().map_err(|_| GiggsError::BadSignature)?;
+        GhostId::verify(&pubkey, &serde_json::to_vec(&self.update)?, &signature).map_err(|_| GiggsError::BadSignature)
+    }
+}
+
+/// Referências persistentes atualizadas atomicamente por compare-and-swap.
+#[derive(Clone, Debug)]
+pub struct RefStore { root: PathBuf }
+
+impl RefStore {
+    pub fn open(root: impl AsRef<Path>) -> Result<Self, GiggsError> {
+        std::fs::create_dir_all(root.as_ref())?;
+        Ok(Self { root: root.as_ref().to_path_buf() })
+    }
+
+    fn component(value: &str) -> Result<&str, GiggsError> {
+        if value.is_empty() || value.len() > 128 || value.contains("..") || !value.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
+            return Err(GiggsError::InvalidRef(value.into()));
+        }
+        Ok(value)
+    }
+
+    fn path(&self, repository: &str, name: &str) -> Result<PathBuf, GiggsError> {
+        Ok(self.root.join(Self::component(repository)?).join(format!("{}.json", Self::component(name)?)))
+    }
+
+    pub fn read(&self, repository: &str, name: &str) -> Result<Option<SignedRefUpdate>, GiggsError> {
+        let path = self.path(repository, name)?;
+        if !path.exists() { return Ok(None); }
+        let value: SignedRefUpdate = serde_json::from_slice(&std::fs::read(path)?)?;
+        value.verify()?;
+        Ok(Some(value))
+    }
+
+    pub fn compare_and_swap(&self, value: SignedRefUpdate) -> Result<(), GiggsError> {
+        value.verify()?;
+        let current = self.read(&value.update.repository, &value.update.name)?;
+        let actual = current.as_ref().map(|v| v.update.target);
+        if actual != value.update.previous {
+            return Err(GiggsError::RefConflict { expected: value.update.previous, actual });
+        }
+        let expected_sequence = current.map_or(0, |v| v.update.sequence + 1);
+        if value.update.sequence != expected_sequence {
+            return Err(GiggsError::InvalidRef("sequência não monotônica".into()));
+        }
+        let path = self.path(&value.update.repository, &value.update.name)?;
+        std::fs::create_dir_all(path.parent().expect("ref parent"))?;
+        let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&value)?)?;
+        std::fs::rename(tmp, path)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MergeConflict { pub path: String, pub base: Option<Vec<u8>>, pub ours: Option<Vec<u8>>, pub theirs: Option<Vec<u8>> }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MergeOutcome { pub leaves: Vec<Leaf>, pub conflicts: Vec<MergeConflict> }
+
+/// Merge de três vias. Conflitos permanecem explícitos e nunca são sobrescritos.
+pub fn merge_three_way(base: &[Leaf], ours: &[Leaf], theirs: &[Leaf]) -> MergeOutcome {
+    fn map(leaves: &[Leaf]) -> BTreeMap<String, Vec<u8>> { leaves.iter().map(|l| (l.path.clone(), l.content.clone())).collect() }
+    let (base, ours, theirs) = (map(base), map(ours), map(theirs));
+    let paths: BTreeSet<_> = base.keys().chain(ours.keys()).chain(theirs.keys()).cloned().collect();
+    let mut output = MergeOutcome { leaves: Vec::new(), conflicts: Vec::new() };
+    for path in paths {
+        let (b, o, t) = (base.get(&path), ours.get(&path), theirs.get(&path));
+        let selected = if o == t { Some(o) } else if o == b { Some(t) } else if t == b { Some(o) } else { None };
+        match selected {
+            Some(Some(content)) => output.leaves.push(Leaf { path, content: content.clone() }),
+            Some(None) => {}
+            None => output.conflicts.push(MergeConflict { path, base: b.cloned(), ours: o.cloned(), theirs: t.cloned() }),
+        }
+    }
+    output
 }
 
 /// Um arquivo dentro de um Plot.
@@ -163,5 +276,40 @@ mod tests {
             item.message = format!("{label} secret");
             assert!(!item.is_public(), "{label} não pode ser replicado em claro");
         }
+    }
+
+    #[test]
+    fn signed_refs_persist_and_reject_stale_updates() {
+        let dir = std::env::temp_dir().join(format!("giggs-refs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = RefStore::open(&dir).unwrap();
+        let id = GhostId::from_secret_bytes([7; 32], 3600).unwrap();
+        let first = ContentId::of(b"first");
+        store.compare_and_swap(SignedRefUpdate::sign(RefUpdate { repository: "repo".into(), name: "main".into(), target: first, previous: None, sequence: 0 }, &id).unwrap()).unwrap();
+        assert_eq!(store.read("repo", "main").unwrap().unwrap().update.target, first);
+        let stale = SignedRefUpdate::sign(RefUpdate { repository: "repo".into(), name: "main".into(), target: ContentId::of(b"other"), previous: None, sequence: 0 }, &id).unwrap();
+        assert!(matches!(store.compare_and_swap(stale), Err(GiggsError::RefConflict { .. })));
+        drop(store);
+        assert_eq!(RefStore::open(&dir).unwrap().read("repo", "main").unwrap().unwrap().update.target, first);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tampered_ref_is_fail_closed() {
+        let id = GhostId::from_secret_bytes([9; 32], 3600).unwrap();
+        let mut signed = SignedRefUpdate::sign(RefUpdate { repository: "repo".into(), name: "main".into(), target: ContentId::of(b"one"), previous: None, sequence: 0 }, &id).unwrap();
+        signed.update.target = ContentId::of(b"tampered");
+        assert!(matches!(signed.verify(), Err(GiggsError::BadSignature)));
+    }
+
+    #[test]
+    fn merge_requires_explicit_resolution_of_conflicts() {
+        let leaf = |path: &str, value: &str| Leaf { path: path.into(), content: value.as_bytes().to_vec() };
+        let result = merge_three_way(&[leaf("a", "base")], &[leaf("a", "ours")], &[leaf("a", "theirs")]);
+        assert!(result.leaves.is_empty());
+        assert_eq!(result.conflicts.len(), 1);
+        let clean = merge_three_way(&[leaf("a", "base")], &[leaf("a", "ours")], &[leaf("a", "base")]);
+        assert_eq!(clean.leaves, vec![leaf("a", "ours")]);
+        assert!(clean.conflicts.is_empty());
     }
 }
