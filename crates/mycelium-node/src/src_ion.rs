@@ -10,6 +10,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 use giggs::Plot;
+use mycelium_core::ContentId;
 use serde_json::Value;
 use std::path::{Path as FsPath, PathBuf};
 
@@ -32,10 +33,12 @@ fn plots_dir(home: &FsPath) -> PathBuf {
     home.join("sporebank").join("plots")
 }
 
-fn read_plot(home: &FsPath, cid: &str) -> Option<Plot> {
-    let path = plots_dir(home).join(format!("{cid}.json"));
+fn read_public_plot(home: &FsPath, cid: &str) -> Option<Plot> {
+    let id = cid.parse::<ContentId>().ok()?;
+    let path = plots_dir(home).join(format!("{}.json", hex::encode(id.0)));
     let bytes = std::fs::read(&path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let plot: Plot = serde_json::from_slice(&bytes).ok()?;
+    plot.is_public().then_some(plot)
 }
 
 fn cids(home: &FsPath) -> Vec<String> {
@@ -58,7 +61,7 @@ async fn index(State(state): State<SrcState>) -> impl IntoResponse {
     let entries: Vec<Value> = cids(&state.home)
         .iter()
         .filter_map(|cid| {
-            let plot = read_plot(&state.home, cid)?;
+            let plot = read_public_plot(&state.home, cid)?;
             Some(serde_json::json!({
                 "cid": cid,
                 "message": plot.message,
@@ -76,7 +79,7 @@ async fn index(State(state): State<SrcState>) -> impl IntoResponse {
 }
 
 async fn list(State(state): State<SrcState>, Path(cid): Path<String>) -> impl IntoResponse {
-    match read_plot(&state.home, &cid) {
+    match read_public_plot(&state.home, &cid) {
         Some(plot) => {
             let files: Vec<Value> = plot
                 .leaves
@@ -113,7 +116,7 @@ async fn file(
     State(state): State<SrcState>,
     Path((cid, path)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    match read_plot(&state.home, &cid) {
+    match read_public_plot(&state.home, &cid) {
         Some(plot) => {
             match plot
                 .leaves
@@ -168,5 +171,60 @@ fn mime_for(path: &str) -> &'static str {
         "text/plain; charset=utf-8"
     } else {
         "application/octet-stream"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{plots_dir, read_public_plot};
+    use giggs::Plot;
+    use mycelium_core::NodeId;
+
+    fn store_plot(home: &std::path::Path, plot: &Plot) -> String {
+        let id = plot.id().expect("plot válido");
+        let cid = id.to_string();
+        std::fs::create_dir_all(plots_dir(home)).expect("diretório de teste");
+        std::fs::write(
+            plots_dir(home).join(format!("{}.json", hex::encode(id.0))),
+            serde_json::to_vec(plot).expect("serialização de teste"),
+        )
+        .expect("gravação de teste");
+        cid
+    }
+
+    fn plot(message: &str) -> Plot {
+        Plot {
+            author: NodeId::derive(b"src-ion-test"),
+            message: message.into(),
+            parents: vec![],
+            leaves: vec![],
+        }
+    }
+
+    #[test]
+    fn src_ion_exposes_only_public_plots() {
+        let home = tempfile::tempdir().expect("home temporário");
+        let public_cid = store_plot(home.path(), &plot("[public] repo"));
+        let private_cid = store_plot(home.path(), &plot("[private] repo"));
+
+        assert!(read_public_plot(home.path(), &public_cid).is_some());
+        assert!(read_public_plot(home.path(), &private_cid).is_none());
+    }
+
+    #[test]
+    fn src_ion_rejects_malformed_cids_before_filesystem_access() {
+        let home = tempfile::tempdir().expect("home temporário");
+        assert!(read_public_plot(home.path(), "../../segredo").is_none());
+        assert!(read_public_plot(home.path(), "not-a-content-id").is_none());
+    }
+
+    #[test]
+    fn src_ion_fails_closed_for_corrupt_plot_data() {
+        let home = tempfile::tempdir().expect("home temporário");
+        let cid = "a".repeat(64);
+        std::fs::create_dir_all(plots_dir(home.path())).expect("diretório de teste");
+        std::fs::write(plots_dir(home.path()).join(format!("{cid}.json")), b"not json")
+            .expect("gravação de teste");
+        assert!(read_public_plot(home.path(), &cid).is_none());
     }
 }

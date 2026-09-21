@@ -9,7 +9,7 @@ use mycelium_node::{call, run_daemon, DaemonOptions, NodeStore, Request, Respons
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
 #[derive(Parser)]
@@ -2512,12 +2512,69 @@ async fn repo_cmd(home: &PathBuf, action: RepoCmd) -> Result<(), String> {
 
 fn write_tree(dest: &PathBuf, leaves: &[giggs::Leaf]) -> Result<(), String> {
     std::fs::create_dir_all(dest).map_err(|e| e.to_string())?;
+    let root = std::fs::canonicalize(dest).map_err(|e| format!("resolver destino: {e}"))?;
+    let mut paths = std::collections::HashSet::new();
     for leaf in leaves {
-        let target = dest.join(&leaf.path);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        let relative = safe_repo_path(&leaf.path)?;
+        if !paths.insert(relative.clone()) {
+            return Err(format!("caminho duplicado no Plot: {}", leaf.path));
+        }
+        let target = root.join(&relative);
+        let parent = target
+            .parent()
+            .ok_or_else(|| format!("caminho sem diretório pai: {}", leaf.path))?;
+        create_safe_directories(&root, parent)?;
+        if let Ok(metadata) = std::fs::symlink_metadata(&target) {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(format!("destino inseguro ou não regular: {}", leaf.path));
+            }
         }
         std::fs::write(&target, &leaf.content).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn safe_repo_path(path: &str) -> Result<PathBuf, String> {
+    let candidate = Path::new(path);
+    if path.is_empty() || candidate.is_absolute() {
+        return Err(format!("caminho inseguro no Plot: {path:?}"));
+    }
+    let mut clean = PathBuf::new();
+    for component in candidate.components() {
+        match component {
+            Component::Normal(part) => clean.push(part),
+            _ => return Err(format!("caminho inseguro no Plot: {path:?}")),
+        }
+    }
+    if clean.as_os_str().is_empty() {
+        return Err(format!("caminho inseguro no Plot: {path:?}"));
+    }
+    Ok(clean)
+}
+
+fn create_safe_directories(root: &Path, parent: &Path) -> Result<(), String> {
+    let relative = parent
+        .strip_prefix(root)
+        .map_err(|_| "diretório pai escapou do destino".to_string())?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(format!("componente inseguro no destino: {:?}", current));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current)
+                    .map_err(|e| format!("criar diretório {:?}: {e}", current))?;
+            }
+            Err(error) => return Err(format!("inspecionar {:?}: {error}", current)),
+        }
+        let resolved = std::fs::canonicalize(&current)
+            .map_err(|e| format!("resolver {:?}: {e}", current))?;
+        if !resolved.starts_with(root) {
+            return Err(format!("diretório escapou do destino: {:?}", current));
+        }
     }
     Ok(())
 }
@@ -2538,6 +2595,55 @@ fn pack_tree(dir: &PathBuf) -> Result<Vec<giggs::Leaf>, String> {
                 | "__pycache__" | ".venv" | "coverage" | ".data" | "graphify-out"
         )
     }
+    fn sensitive_name(name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        lower == ".env"
+            || lower.starts_with(".env.")
+            || matches!(
+                lower.as_str(),
+                ".npmrc" | ".pypirc" | ".netrc" | "credentials" | "credentials.json"
+                    | "id_rsa" | "id_ed25519" | "secrets.yml" | "secrets.yaml"
+            )
+            || lower.ends_with(".pem")
+            || lower.ends_with(".key")
+            || lower.ends_with(".p12")
+            || lower.ends_with(".pfx")
+    }
+    fn contains_secret(content: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(content);
+        let lower = text.to_ascii_lowercase();
+        if lower.contains("-----begin private key-----")
+            || lower.contains("-----begin rsa private key-----")
+            || lower.contains("-----begin openssh private key-----")
+            || text.contains("github_pat_")
+            || text.contains("ghp_")
+            || text.contains("AKIA")
+            || text.contains("xoxb-")
+        {
+            return true;
+        }
+        text.lines().any(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                return false;
+            }
+            let Some((key, value)) = trimmed.split_once('=').or_else(|| trimmed.split_once(':')) else {
+                return false;
+            };
+            let key = key.trim().to_ascii_lowercase().replace('-', "_");
+            let value = value.trim().trim_matches(['\'', '"']);
+            let secret_key = ["password", "passwd", "secret", "api_key", "private_key", "access_key"]
+                .iter()
+                .any(|needle| key.contains(needle))
+                || key == "token"
+                || key.ends_with("_token");
+            let placeholder = value.is_empty()
+                || value.starts_with('$')
+                || value.starts_with("{{")
+                || matches!(value.to_ascii_lowercase().as_str(), "changeme" | "example" | "placeholder" | "redacted");
+            secret_key && !placeholder
+        })
+    }
     fn walk(dir: &PathBuf, prefix: &str, out: &mut Vec<giggs::Leaf>) -> Result<(), String> {
         let entries = std::fs::read_dir(dir).map_err(|e| format!("ler {:?}: {e}", dir))?;
         for entry in entries {
@@ -2552,11 +2658,25 @@ fn pack_tree(dir: &PathBuf) -> Result<Vec<giggs::Leaf>, String> {
                 format!("{prefix}/{name}")
             };
             let path = entry.path();
-            if path.is_dir() {
+            let file_type = entry
+                .file_type()
+                .map_err(|e| format!("inspecionar {:?}: {e}", path))?;
+            if file_type.is_symlink() {
+                return Err(format!("link simbólico não pode ser publicado: {rel}"));
+            }
+            if file_type.is_dir() {
                 walk(&path, &rel, out)?;
-            } else {
+            } else if file_type.is_file() {
+                if sensitive_name(&name) {
+                    return Err(format!("arquivo sensível não pode ser publicado: {rel}"));
+                }
                 let content = std::fs::read(&path).map_err(|e| format!("ler {:?}: {e}", path))?;
+                if contains_secret(&content) {
+                    return Err(format!("possível segredo detectado em: {rel}"));
+                }
                 out.push(giggs::Leaf { path: rel, content });
+            } else {
+                return Err(format!("entrada especial não pode ser publicada: {rel}"));
             }
         }
         Ok(())
@@ -2564,6 +2684,81 @@ fn pack_tree(dir: &PathBuf) -> Result<Vec<giggs::Leaf>, String> {
     let mut out = Vec::new();
     walk(dir, "", &mut out)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod repo_security_tests {
+    use super::*;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "mycelium-repo-security-{label}-{}-{}",
+            std::process::id(),
+            distribution_now()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn clone_rejects_traversal_and_absolute_paths() {
+        let home = temp_dir("traversal");
+        for path in ["../escape", "nested/../../escape", "/tmp/escape", "./file"] {
+            let leaves = vec![giggs::Leaf { path: path.into(), content: b"x".to_vec() }];
+            assert!(write_tree(&home, &leaves).is_err(), "accepted {path}");
+        }
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clone_rejects_symlinked_destination_components() {
+        use std::os::unix::fs::symlink;
+        let home = temp_dir("clone-symlink");
+        let outside = temp_dir("clone-outside");
+        symlink(&outside, home.join("linked")).unwrap();
+        let leaves = vec![giggs::Leaf { path: "linked/file".into(), content: b"x".to_vec() }];
+        assert!(write_tree(&home, &leaves).is_err());
+        assert!(!outside.join("file").exists());
+        std::fs::remove_dir_all(home).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn pack_rejects_sensitive_names_and_secret_content() {
+        let named = temp_dir("secret-name");
+        std::fs::write(named.join(".env"), "SAFE=value").unwrap();
+        assert!(pack_tree(&named).is_err());
+        std::fs::remove_dir_all(named).unwrap();
+
+        let content = temp_dir("secret-content");
+        std::fs::write(content.join("config.txt"), "api_key = real-sensitive-value").unwrap();
+        assert!(pack_tree(&content).is_err());
+        std::fs::remove_dir_all(content).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pack_rejects_symlinks_without_following_them() {
+        use std::os::unix::fs::symlink;
+        let home = temp_dir("pack-symlink");
+        let outside = temp_dir("pack-outside");
+        std::fs::write(outside.join("secret"), "not scanned through link").unwrap();
+        symlink(outside.join("secret"), home.join("linked")).unwrap();
+        assert!(pack_tree(&home).is_err());
+        std::fs::remove_dir_all(home).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn pack_allows_safe_hidden_metadata() {
+        let home = temp_dir("safe-hidden");
+        std::fs::write(home.join(".gitignore"), "target\n").unwrap();
+        let leaves = pack_tree(&home).unwrap();
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(leaves[0].path, ".gitignore");
+        std::fs::remove_dir_all(home).unwrap();
+    }
 }
 
 fn mycelium_store_list_local(home: &PathBuf) -> Result<Vec<String>, String> {

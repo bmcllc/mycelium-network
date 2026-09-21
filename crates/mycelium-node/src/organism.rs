@@ -168,6 +168,16 @@ pub struct Organism {
     pending_accepted_migrations: HashSet<String>,
 }
 
+fn ensure_repo_publishable(plot: &Plot) -> Result<(), OrganismError> {
+    if plot.is_public() {
+        Ok(())
+    } else {
+        Err(OrganismError::Msg(
+            "RepoPublish recusado: Plot privado não pode sair do nó".into(),
+        ))
+    }
+}
+
 impl Organism {
     pub fn awaken(config: OrganismConfig) -> Result<Self, OrganismError> {
         let store = NodeStore::open(&config.home)?;
@@ -592,8 +602,11 @@ impl Organism {
             parents: vec![],
             leaves,
         };
+        ensure_repo_publishable(&plot)?;
         let id = self.bank.deposit(plot.clone())?;
-        let bytes = self.bank.spore_print(&id)?;
+        let bytes = self.bank.public_spore_print(&id).ok_or_else(|| {
+            OrganismError::Msg("política pública recusou o Plot antes da distribuição".into())
+        })?;
         let _ = self.hyphae.dht_store_local(dht_key(&id), bytes.clone());
         let _ = self.hyphae.dht_put(dht_key(&id), bytes);
         let env = Envelope::SporePrint { plot };
@@ -612,7 +625,7 @@ impl Organism {
 
     pub fn wallet_pubkey_hex(&self) -> String {
         self.ghost.nostr_pubkey_hex()
-}
+    }
 
 /// Cria, assina, aplica e propaga uma transferência de nutrientes.
 
@@ -2638,6 +2651,7 @@ impl Organism {
                 Response::Ok {
                     message: format!("distribuído {} ATP como dividendo", paid),
                 }
+            }
             Request::SeedRepo { name, url, commit, description } => {
                 let env = Envelope::RepoAnnounce {
                     node_id: self.gland.node_id(),
@@ -3756,7 +3770,8 @@ mod xor_tests {
 
 #[cfg(test)]
 mod visibility_tests {
-    use super::recall_allowed;
+    use super::{ensure_repo_publishable, recall_allowed};
+    use giggs::Plot;
     use mycelium_core::NodeId;
 
     fn id(b: &[u8]) -> NodeId { NodeId::derive(b) }
@@ -3785,5 +3800,27 @@ mod visibility_tests {
             assert!(!recall_allowed(vis, &a, &o), "{vis}");
             assert!(recall_allowed(vis, &a, &a), "autor local pode restaurar {vis}");
         }
+    }
+
+    #[test]
+    fn repo_publication_fails_closed_for_restricted_plots() {
+        let plot = Plot {
+            author: id(b"autor"),
+            message: "[private] código reservado".into(),
+            parents: vec![],
+            leaves: vec![],
+        };
+        assert!(ensure_repo_publishable(&plot).is_err());
+    }
+
+    #[test]
+    fn repo_publication_accepts_explicit_public_plots() {
+        let plot = Plot {
+            author: id(b"autor"),
+            message: "[public] código aberto".into(),
+            parents: vec![],
+            leaves: vec![],
+        };
+        assert!(ensure_repo_publishable(&plot).is_ok());
     }
 }

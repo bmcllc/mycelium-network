@@ -136,6 +136,7 @@ impl SignedTransfer {
             self.sig.clone()
         }
     }
+}
 
 /// Um lançamento no ledger.
 #[derive(Clone, Debug, Serialize, Deserialize)]
