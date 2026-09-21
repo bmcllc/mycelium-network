@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 use mycelium_core::Resources;
 use mycelium_hyphae::{SeedBook, DEFAULT_BOOTSTRAP_URL, DEFAULT_DNS_SEED_NAME};
 use mycelium_node::{call, run_daemon, DaemonOptions, NodeStore, Request, Response};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -89,6 +90,10 @@ enum Commands {
         /// Relay Nostr WSS para o transporte (default nos.lol).
         #[arg(long = "nostr-relay", env = "MYCELIUM_NOSTR_RELAY")]
         nostr_relay: Option<String>,
+        /// **Licença VOID-00**: only accept peers com estes PeerIds (virgula,
+        /// repetível). Ativa o gate de admissão licenciada. Req. feature `license`.
+        #[arg(long = "licensed-peers", value_delimiter = ',')]
+        licensed_peers: Vec<String>,
         /// Depreciado: ignorado (Política de Membrana — sem UPnP).
         #[arg(long = "upnp")]
         upnp: bool,
@@ -116,6 +121,21 @@ enum Commands {
         /// Hybrid Theory: QEL + Nostr + blockstore local (ipfs-blocks/).
         #[arg(long)]
         hybrid: bool,
+    },
+    /// Publica pela mailbox Nostr um plot que já existe no SporeBank.
+    PublishExisting {
+        #[arg(long)]
+        plot: String,
+        #[arg(long)]
+        nostr: bool,
+        #[arg(long, value_name = "K,N", default_value = "3,7")]
+        qel: String,
+        #[arg(long, default_value_t = 4)]
+        max_attempts: u32,
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+        #[arg(long, default_value_t = 500, hide = true)]
+        backoff_ms: u64,
     },
     Signal {
         #[arg(long)]
@@ -203,12 +223,11 @@ enum Commands {
     /// Mostra zonas de crescimento conhecidas.
     Zones,
     /// Publica código-fonte diretamente na rede (sem git, sem GitHub).
-    /// Lê um diretório recursivamente e cria um Plot content-addressed.
     SeedCode {
-        /// Caminho do diretório com o código-fonte.
+        /// Caminho do diretório.
         #[arg(long)]
         path: String,
-        /// Nome do projeto (ex: "meu-app").
+        /// Nome do projeto.
         #[arg(long)]
         name: String,
         /// Descrição curta.
@@ -217,6 +236,9 @@ enum Commands {
         /// Ion para sinalizar (default: "code").
         #[arg(long, default_value = "code")]
         ion: String,
+        /// Visibilidade: public, private, reserved, archived, community.
+        #[arg(long, default_value = "public")]
+        visibility: String,
     },
     /// Anuncia um repositório Git via gossipsub (URL pública, sem dados sensíveis).
     SeedRepo {
@@ -244,6 +266,42 @@ enum Commands {
     },
     /// Lista repositórios anunciados via gossipsub por peers da rede.
     Repos,
+    /// Verifica uma licença VOID-00 (ML-DSA-87 + device binding).
+    LicenseVerify {
+        /// Chave pública do vendor (hex, 2592 bytes).
+        #[arg(long)]
+        vendor_key: String,
+        /// Entropia do dispositivo (hex).
+        #[arg(long)]
+        device_entropy: String,
+        /// SKU do produto.
+        #[arg(long)]
+        sku: String,
+        /// Payload canónico da licença (hex, 121 bytes).
+        #[arg(long)]
+        payload: String,
+        /// Assinatura ML-DSA-87 (hex, 4627 bytes).
+        #[arg(long)]
+        signature: String,
+        /// Timestamp Unix em segundos (default: agora).
+        #[arg(long)]
+        now: Option<u64>,
+        /// Auto-release: se a licença passar, inscreve este PeerId na allowlist
+        /// de admissão licenciada (gate passa a aceitá-lo).
+        #[arg(long = "peer-id")]
+        peer_id: Option<String>,
+    },
+    /// Inscreve um PeerId na allowlist de admissão licenciada (runtime).
+    RegisterPeer {
+        /// PeerId do nó a autorizar.
+        #[arg(long)]
+        peer_id: String,
+    },
+    /// Valida um invoice BOLT11 (Lightning) e mostra resumo.
+    Bolt11 {
+        /// Invoice BOLT11 (string completa `lnbc...`).
+        invoice: String,
+    },
     /// Entropy: Shamir Secret Sharing com meia-vida.
     Entropy {
         #[command(subcommand)]
@@ -489,8 +547,12 @@ fn main() {
             nostr_transport,
             no_nostr_transport,
             nostr_relay,
+            licensed_peers,
             upnp,
-        } => rt.block_on(daemon(
+        } => {
+            #[cfg(not(feature = "license"))]
+            let _ = licensed_peers;
+            rt.block_on(daemon(
             &home,
             &contribute,
             DaemonOptions {
@@ -518,9 +580,16 @@ fn main() {
                     None
                 },
                 nostr_relay,
+                #[cfg(feature = "license")]
+                licensed_peers: if licensed_peers.is_empty() {
+                    None
+                } else {
+                    Some(licensed_peers.into_iter().collect())
+                },
             },
             upnp,
-        )),
+            ))
+        }
         Commands::Status => rt.block_on(status(&home)),
         Commands::Sow {
             message,
@@ -533,6 +602,22 @@ fn main() {
             hybrid,
         } => rt.block_on(sow_cmd(
             &home, message, path, content, qel, nostr, ghost, recipient, hybrid,
+        )),
+        Commands::PublishExisting {
+            plot,
+            nostr,
+            qel,
+            max_attempts,
+            timeout,
+            backoff_ms,
+        } => rt.block_on(publish_existing_cmd(
+            &home,
+            plot,
+            nostr,
+            qel,
+            max_attempts,
+            timeout,
+            backoff_ms,
         )),
         Commands::Signal {
             plot,
@@ -596,14 +681,62 @@ fn main() {
         Commands::SeedRepo { name, url, commit, description } => {
             rt.block_on(rpc(&home, Request::SeedRepo { name, url, commit, description }))
         }
-        Commands::SeedCode { path, name, description, ion } => {
-            rt.block_on(seed_code_cmd(&home, path, name, description, ion))
+        Commands::SeedCode { path, name, description, ion, visibility } => {
+            rt.block_on(seed_code_cmd(&home, path, name, description, ion, visibility))
         }
         Commands::RecallCode { plot, output } => {
-            let _ = output; // TODO: output dir via recall
-            rt.block_on(rpc(&home, Request::RecallCode { plot }))
+            rt.block_on(recall_code_cmd(&home, plot, output))
         }
         Commands::Repos => rt.block_on(rpc(&home, Request::Repos)),
+        Commands::LicenseVerify { vendor_key, device_entropy, sku, payload, signature, now, peer_id } => {
+            #[cfg(feature = "license")]
+            {
+                let unix_now = now.unwrap_or_else(|| std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0));
+                let req = Request::VerifyLicense {
+                    vendor_public_key: vendor_key,
+                    device_entropy,
+                    sku,
+                    license_payload: payload,
+                    signature,
+                    unix_now_secs: unix_now,
+                    peer_id,
+                };
+                rt.block_on(rpc(&home, req))
+            }
+            #[cfg(not(feature = "license"))]
+            {
+                let _ = (vendor_key, device_entropy, sku, payload, signature, now, peer_id);
+                eprintln!("licença exige feature `license`. Compile com --features license.");
+                std::process::exit(1);
+            }
+        }
+        Commands::RegisterPeer { peer_id } => {
+            #[cfg(feature = "license")]
+            {
+                rt.block_on(rpc(&home, Request::RegisterLicensedPeer { peer_id }))
+            }
+            #[cfg(not(feature = "license"))]
+            {
+                let _ = peer_id;
+                eprintln!("admissão licenciada exige feature `license`. Compile com --features license.");
+                std::process::exit(1);
+            }
+        }
+        Commands::Bolt11 { invoice } => {
+            #[cfg(feature = "bolt11")]
+            {
+                rt.block_on(rpc(&home, Request::Bolt11Validate { bolt11: invoice }))
+            }
+            #[cfg(not(feature = "bolt11"))]
+            {
+                let _ = invoice;
+                eprintln!("BOLT11 exige feature `bolt11`. Compile com --features bolt11.");
+                std::process::exit(1);
+            }
+        }
         Commands::Entropy { action } => rt.block_on(entropy_cmd(&home, action)),
         Commands::Candidate {
             cmd,
@@ -1151,8 +1284,8 @@ async fn sow_cmd(
                 )
                 .await
                 {
-                    Ok(extra) => {
-                        println!("[🍄] {msg}{extra}");
+                    Ok(result) => {
+                        println!("[🍄] {msg}{}", result.summary);
                         return Ok(());
                     }
                     Err(e) => {
@@ -1168,13 +1301,326 @@ async fn sow_cmd(
 }
 
 #[cfg(feature = "nostr")]
+#[derive(Debug)]
+struct NostrPublishResult {
+    summary: String,
+    relay_acks: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum DistributionPhase {
+    Local,
+    Distributing,
+    Distributed,
+    DistributionFailed,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct DistributionRecord {
+    version: u8,
+    plot: String,
+    state: DistributionPhase,
+    qel: String,
+    attempts: u32,
+    max_attempts: u32,
+    relay_acks: usize,
+    /// Relay ACK confirma aceitação de evento, não armazenamento por uma réplica.
+    replicas_stored: usize,
+    last_error: Option<String>,
+    updated_at_unix: u64,
+}
+
+fn distribution_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn distribution_path(home: &std::path::Path, plot: &str) -> PathBuf {
+    home.join("distributions").join(format!("{plot}.json"))
+}
+
+fn write_distribution(home: &std::path::Path, record: &DistributionRecord) -> Result<(), String> {
+    use std::io::Write;
+    let dir = home.join("distributions");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = distribution_path(home, &record.plot);
+    let tmp = dir.join(format!(".{}.{}.tmp", record.plot, std::process::id()));
+    let bytes = serde_json::to_vec_pretty(record).map_err(|e| e.to_string())?;
+    let result = (|| -> Result<(), std::io::Error> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        std::fs::File::open(&dir)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    result.map_err(|e| e.to_string())
+}
+
+fn retry_backoff_ms(initial_ms: u64, attempt: u32) -> u64 {
+    initial_ms.saturating_mul(1u64 << attempt.saturating_sub(1).min(16))
+}
+
+fn should_retry_distribution(error: &str, attempt: u32, max_attempts: u32) -> bool {
+    attempt < max_attempts && !error.starts_with("deterministic: ")
+}
+
+fn acquire_distribution_lock(path: PathBuf) -> Result<Option<DistributionLock>, String> {
+    use std::io::Write;
+    let open = || std::fs::OpenOptions::new().write(true).create_new(true).open(&path);
+    match open() {
+        Ok(mut file) => {
+            writeln!(file, "{}", std::process::id()).map_err(|e| e.to_string())?;
+            file.sync_all().map_err(|e| e.to_string())?;
+            Ok(Some(DistributionLock { file: Some(file), path }))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let owner = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok());
+            let owner_alive = owner
+                .map(|pid| std::path::Path::new("/proc").join(pid.to_string()).exists())
+                .unwrap_or(false);
+            if owner_alive {
+                return Ok(None);
+            }
+            // O processo anterior caiu: remove somente o lock órfão e retoma
+            // a partir do journal persistente, sem tocar no plot ou identidade.
+            std::fs::remove_file(&path).map_err(|remove| remove.to_string())?;
+            let mut file = open().map_err(|retry| retry.to_string())?;
+            writeln!(file, "{}", std::process::id()).map_err(|write| write.to_string())?;
+            file.sync_all().map_err(|sync| sync.to_string())?;
+            Ok(Some(DistributionLock { file: Some(file), path }))
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(feature = "nostr")]
+async fn publish_existing_cmd(
+    home: &PathBuf,
+    plot: String,
+    nostr: bool,
+    qel: String,
+    max_attempts: u32,
+    timeout_secs: u64,
+    backoff_ms: u64,
+) -> Result<(), String> {
+    use mycelium_core::ContentId;
+    use mycelium_sporebank::SporeBank;
+    if !nostr {
+        return Err("publish-existing requer --nostr".into());
+    }
+    if max_attempts == 0 {
+        return Err("--max-attempts deve ser maior que zero".into());
+    }
+    parse_qel_kn(Some(&qel))?;
+    let id = ContentId::from_str(&plot).map_err(|e| e.to_string())?;
+    let canonical = id.to_string();
+    // O nome do journal faz parte do contrato com o chamador. ContentId::to_string()
+    // pode acrescentar um prefixo (por exemplo, `Qm`) e criar um segundo registro
+    // que o consumidor do CID original nunca lê.
+    let journal_plot = plot.clone();
+    // Leitura explícita do spore print: não há novo sow nem mutação do plot.
+    SporeBank::open(home)
+        .and_then(|bank| bank.spore_print(&id))
+        .map_err(|e| format!("plot existente indisponível: {e}"))?;
+
+    let path = distribution_path(home, &journal_plot);
+    if let Ok(bytes) = std::fs::read(&path) {
+        if let Ok(existing) = serde_json::from_slice::<DistributionRecord>(&bytes) {
+            if existing.state == DistributionPhase::Distributed && existing.qel == qel {
+                println!("[🍄] plot {canonical} já distribuído (idempotente)");
+                return Ok(());
+            }
+        }
+    }
+
+    std::fs::create_dir_all(home.join("distributions")).map_err(|e| e.to_string())?;
+    let lock_path = home
+        .join("distributions")
+        .join(format!("{journal_plot}.lock"));
+    let _lock = match acquire_distribution_lock(lock_path)? {
+        Some(lock) => lock,
+        None => {
+            println!("[🍄] plot {canonical} já está em distribuição (idempotente)");
+            return Ok(());
+        }
+    };
+
+    let mut record = DistributionRecord {
+        version: 1,
+        plot: journal_plot,
+        state: DistributionPhase::Local,
+        qel: qel.clone(),
+        attempts: 0,
+        max_attempts,
+        relay_acks: 0,
+        replicas_stored: 0,
+        last_error: None,
+        updated_at_unix: distribution_now(),
+    };
+    write_distribution(home, &record)?;
+    for attempt in 1..=max_attempts {
+        record.state = DistributionPhase::Distributing;
+        record.attempts = attempt;
+        record.updated_at_unix = distribution_now();
+        write_distribution(home, &record)?;
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs.max(1)),
+            publish_plot_nostr(home, &canonical, Some(&qel), None, false),
+        )
+        .await;
+        match outcome {
+            Ok(Ok(result)) => {
+                record.state = DistributionPhase::Distributed;
+                record.relay_acks = result.relay_acks;
+                record.last_error = None;
+                record.updated_at_unix = distribution_now();
+                write_distribution(home, &record)?;
+                println!("[🍄] plot {canonical}{}; replicas_stored=0", result.summary);
+                return Ok(());
+            }
+            Ok(Err(error)) => record.last_error = Some(error),
+            Err(_) => record.last_error = Some(format!("timeout após {}s", timeout_secs.max(1))),
+        }
+        record.state = DistributionPhase::DistributionFailed;
+        record.updated_at_unix = distribution_now();
+        write_distribution(home, &record)?;
+        if !record.last_error.as_deref().is_some_and(|error| should_retry_distribution(error, attempt, max_attempts)) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(retry_backoff_ms(backoff_ms, attempt))).await;
+    }
+    Err(format!(
+        "distribuição Nostr falhou após {} tentativa(s): {}",
+        record.attempts,
+        record.last_error.unwrap_or_else(|| "erro desconhecido".into())
+    ))
+}
+
+#[cfg(not(feature = "nostr"))]
+async fn publish_existing_cmd(
+    _home: &PathBuf, _plot: String, _nostr: bool, _qel: String,
+    _max_attempts: u32, _timeout_secs: u64, _backoff_ms: u64,
+) -> Result<(), String> {
+    Err("publish-existing requer build com feature nostr".into())
+}
+
+struct DistributionLock {
+    file: Option<std::fs::File>,
+    path: PathBuf,
+}
+
+impl Drop for DistributionLock {
+    fn drop(&mut self) {
+        self.file.take();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod distribution_tests {
+    use super::*;
+
+    fn temporary_home(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "mycelium-{label}-{}-{}",
+            std::process::id(),
+            distribution_now()
+        ))
+    }
+
+    #[test]
+    fn distribution_journal_survives_reopen() {
+        let home = temporary_home("distribution-journal");
+        let record = DistributionRecord {
+            version: 1,
+            plot: "a".repeat(64),
+            state: DistributionPhase::DistributionFailed,
+            qel: "3,7".into(),
+            attempts: 4,
+            max_attempts: 4,
+            relay_acks: 0,
+            replicas_stored: 0,
+            last_error: Some("relay indisponível".into()),
+            updated_at_unix: distribution_now(),
+        };
+        write_distribution(&home, &record).unwrap();
+        let reopened: DistributionRecord = serde_json::from_slice(
+            &std::fs::read(distribution_path(&home, &record.plot)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reopened.state, DistributionPhase::DistributionFailed);
+        assert_eq!(reopened.attempts, 4);
+        assert_eq!(reopened.replicas_stored, 0);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn distribution_path_preserves_the_callers_plot_identifier() {
+        let home = temporary_home("distribution-path");
+        let original = "1ed9d092dd06298b8a8bb4ed02feac6116482114e435331853e0e5e0bb58d90d";
+        assert_eq!(
+            distribution_path(&home, original),
+            home.join("distributions").join(format!("{original}.json"))
+        );
+    }
+
+    #[test]
+    fn retry_backoff_is_exponential_and_saturating() {
+        assert_eq!(retry_backoff_ms(500, 1), 500);
+        assert_eq!(retry_backoff_ms(500, 2), 1_000);
+        assert_eq!(retry_backoff_ms(500, 3), 2_000);
+        assert_eq!(retry_backoff_ms(u64::MAX, 17), u64::MAX);
+    }
+
+    #[test]
+    fn deterministic_oversize_is_not_retried_even_with_four_attempts() {
+        assert!(!should_retry_distribution(
+            "deterministic: evento Nostr excede limite",
+            1,
+            4
+        ));
+        assert!(should_retry_distribution("relay timeout", 1, 4));
+    }
+
+    #[test]
+    fn orphaned_distribution_lock_is_recovered() {
+        let home = temporary_home("distribution-lock");
+        std::fs::create_dir_all(&home).unwrap();
+        let path = home.join("plot.lock");
+        std::fs::write(&path, "4294967295\n").unwrap();
+        let lock = acquire_distribution_lock(path.clone()).unwrap().unwrap();
+        assert!(path.exists());
+        drop(lock);
+        assert!(!path.exists());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(feature = "nostr")]
+    #[test]
+    fn reconstructed_content_id_mismatch_is_rejected() {
+        let expected = mycelium_core::ContentId::of(b"expected plot");
+        let error = verify_reconstructed_content_id(&expected, b"different plot").unwrap_err();
+        assert!(error.contains("não confere"), "{error}");
+    }
+}
+
+#[cfg(feature = "nostr")]
 async fn publish_plot_nostr(
     home: &PathBuf,
     id_str: &str,
     qel_spec: Option<&str>,
     recipient: Option<&str>,
     hybrid: bool,
-) -> Result<String, String> {
+) -> Result<NostrPublishResult, String> {
     use mycelium_core::ContentId;
     use mycelium_sporebank::SporeBank;
     use std::str::FromStr;
@@ -1191,9 +1637,9 @@ async fn publish_plot_nostr(
     };
     let ghost = mycelium_ghostid::GhostId::spawn_quick(cfg.ttl_secs).map_err(|e| e.to_string())?;
     let mut shards = if hybrid {
-        mycelium_qel::fragment_hybrid(&bytes, &id.to_string(), &cfg).map_err(|e| e.to_string())?
+        mycelium_qel::fragment_hybrid(&bytes, &id.to_string(), &cfg).map_err(|e| format!("deterministic: {e}"))?
     } else {
-        mycelium_qel::fragment(&bytes, &id.to_string(), &cfg).map_err(|e| e.to_string())?
+        mycelium_qel::fragment(&bytes, &id.to_string(), &cfg).map_err(|e| format!("deterministic: {e}"))?
     };
 
     let mut landscape_note = String::new();
@@ -1245,7 +1691,7 @@ async fn publish_plot_nostr(
         recipient,
     )
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| if e.is_deterministic() { format!("deterministic: {e}") } else { e.to_string() })?;
 
     let mut extra = format!(
         "; qel={threshold},{total} nostr_publishes={published} ghost={}",
@@ -1277,7 +1723,7 @@ async fn publish_plot_nostr(
         ));
     }
 
-    Ok(extra)
+    Ok(NostrPublishResult { summary: extra, relay_acks: published })
 }
 
 #[cfg(feature = "nostr")]
@@ -1404,27 +1850,18 @@ async fn recall_cmd(
 #[cfg(feature = "nostr")]
 async fn recall_plot_ipfs(home: &PathBuf, plot: &str) -> Result<String, String> {
     use mycelium_core::ContentId;
-    use mycelium_sporebank::SporeBank;
     use std::str::FromStr;
 
     let id = ContentId::from_str(plot).map_err(|e| e.to_string())?;
     let store = mycelium_ipfs::BlockStore::open(home).map_err(|e| e.to_string())?;
     let bytes = store.get(&id).map_err(|e| e.to_string())?;
-    let mut bank = SporeBank::open(home).map_err(|e| e.to_string())?;
-    let absorbed = bank.absorb(&bytes).map_err(|e| e.to_string())?;
-    let p = bank.recall(&absorbed);
-    Ok(format!(
-        "plot {} reconstruído via ipfs-blocks — \"{}\" ({} leaves)",
-        absorbed.short(),
-        p.map(|x| x.message.as_str()).unwrap_or("?"),
-        p.map(|x| x.leaves.len()).unwrap_or(0)
-    ))
+    import_spore_via_daemon(home, &id, &bytes).await?;
+    Ok(format!("plot {} reconstruído via ipfs-blocks", id.short()))
 }
 
 #[cfg(feature = "nostr")]
 async fn recall_plot_nostr(home: &PathBuf, plot: &str, threshold: u8) -> Result<String, String> {
     use mycelium_core::ContentId;
-    use mycelium_sporebank::SporeBank;
     use std::str::FromStr;
 
     let id = ContentId::from_str(plot).map_err(|e| e.to_string())?;
@@ -1439,15 +1876,72 @@ async fn recall_plot_nostr(home: &PathBuf, plot: &str, threshold: u8) -> Result<
         ));
     }
     let bytes = mycelium_qel::reconstruct(&shards).map_err(|e| e.to_string())?;
-    let mut bank = SporeBank::open(home).map_err(|e| e.to_string())?;
-    let absorbed = bank.absorb(&bytes).map_err(|e| e.to_string())?;
-    let p = bank.recall(&absorbed);
-    Ok(format!(
-        "plot {} reconstruído via Nostr/QEL — \"{}\" ({} leaves)",
-        absorbed.short(),
-        p.map(|x| x.message.as_str()).unwrap_or("?"),
-        p.map(|x| x.leaves.len()).unwrap_or(0)
-    ))
+    verify_reconstructed_content_id(&id, &bytes)?;
+    import_spore_via_daemon(home, &id, &bytes).await?;
+    Ok(format!("plot {} reconstruído via Nostr/QEL", id.short()))
+}
+
+#[cfg(feature = "nostr")]
+fn verify_reconstructed_content_id(
+    expected: &mycelium_core::ContentId,
+    bytes: &[u8],
+) -> Result<(), String> {
+    if mycelium_core::ContentId::of(bytes) != *expected {
+        return Err("ContentId reconstruído não confere com o plot solicitado".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "nostr")]
+async fn import_spore_via_daemon(
+    home: &PathBuf,
+    expected: &mycelium_core::ContentId,
+    bytes: &[u8],
+) -> Result<(), String> {
+    use base64::Engine;
+    let response = call(
+        &home.join("mycelium.sock"),
+        Request::ImportSpore {
+            spore_print_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            expected_plot: expected.to_string(),
+        },
+    )
+    .await?;
+    match response {
+        Response::Ok { .. } => Ok(()),
+        Response::Err { message } => Err(message),
+        _ => Err("resposta inesperada ao importar spore print".into()),
+    }
+}
+
+/// Coleta arquivos recursivamente, ignorando metadados e artefatos de build
+/// (`.git`, `target`, `node_modules`, entradas ocultas).
+fn collect_code_files(
+    dir: &std::path::Path,
+    root: &std::path::Path,
+    files: &mut Vec<(String, String)>,
+    total_bytes: &mut usize,
+) -> Result<(), String> {
+    use base64::Engine;
+    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let file_path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if file_path.is_dir() {
+            if name == ".git" || name == "target" || name == "node_modules" || (name.starts_with('.') && name.len() > 1) {
+                continue;
+            }
+            collect_code_files(&file_path, root, files, total_bytes)?;
+        } else if file_path.is_file() {
+            let relative = file_path.strip_prefix(root).unwrap_or(&file_path);
+            let content = std::fs::read(&file_path).map_err(|e| e.to_string())?;
+            *total_bytes += content.len();
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&content);
+            files.push((relative.to_string_lossy().to_string(), b64));
+        }
+    }
+    Ok(())
 }
 
 /// Lê recursivamente um diretório e envia os arquivos ao daemon via SeedCode.
@@ -1457,27 +1951,78 @@ async fn seed_code_cmd(
     name: String,
     description: String,
     ion: String,
+    visibility: String,
 ) -> Result<(), String> {
-    use base64::Engine;
     let dir = std::path::PathBuf::from(&path);
     if !dir.is_dir() {
         return Err(format!("'{path}' não é um diretório"));
     }
     let mut files: Vec<(String, String)> = Vec::new();
     let mut total_bytes = 0usize;
-    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let file_path = entry.path();
-        if file_path.is_file() {
-            let relative = file_path.strip_prefix(&dir).unwrap_or(&file_path);
-            let content = std::fs::read(&file_path).map_err(|e| e.to_string())?;
-            total_bytes += content.len();
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&content);
-            files.push((relative.to_string_lossy().to_string(), b64));
-        }
+    collect_code_files(&dir, &dir, &mut files, &mut total_bytes)?;
+    if files.is_empty() {
+        return Err(format!("'{path}' não contém arquivos (ou todos foram ignorados)"));
     }
-    println!("[🍄] seed-code: {} arquivos ({total_bytes} bytes) de '{}'", files.len(), path);
-    rpc(home, Request::SeedCode { name, description, ion, files }).await
+    println!("[🍄] seed-code: {} arquivos ({} bytes) de '{}' [{}]", files.len(), total_bytes, path, visibility);
+    rpc(home, Request::SeedCode { name, description, ion, visibility, files }).await
+}
+
+/// Baixa código-fonte da rede. `--output` resolve relativo ao CWD do CLI;
+/// sem `--output`, descobre o nome do plot via `recall` e extrai em ./<nome>.
+async fn recall_code_cmd(home: &PathBuf, plot: String, output: Option<String>) -> Result<(), String> {
+    let dest: Option<std::path::PathBuf> = match output {
+        Some(o) => {
+            let p = std::path::PathBuf::from(&o);
+            Some(if p.is_absolute() {
+                p
+            } else {
+                std::env::current_dir().unwrap_or_default().join(p)
+            })
+        }
+        None => {
+            // O nome do plot vive no daemon; a extração deve cair no CWD do CLI.
+            let sock = home.join("mycelium.sock");
+            let resp = call(
+                &sock,
+                Request::Recall {
+                    plot: plot.clone(),
+                    qel: false,
+                    nostr: false,
+                    qel_threshold: None,
+                },
+            )
+            .await?;
+            let msg = match resp {
+                mycelium_node::Response::Ok { message } => message,
+                mycelium_node::Response::Err { message } => return Err(message),
+                _ => return Err("resposta inesperada do daemon".into()),
+            };
+            // message: "plot Qm… — \"[vis] nome: desc\" (N leaves)"
+            let name = msg
+                .split('"')
+                .nth(1)
+                .map(|s| s.trim().split(':').next().unwrap_or("code").trim().to_string())
+                .map(|n| {
+                    // remove o prefixo de visibilidade "[vis] nome"
+                    if n.starts_with('[') {
+                        n.split(']').last().unwrap_or("code").trim().to_string()
+                    } else {
+                        n
+                    }
+                })
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "code".to_string());
+            Some(std::env::current_dir().unwrap_or_default().join(name))
+        }
+    };
+    rpc(
+        home,
+        Request::RecallCode {
+            plot,
+            output_dir: dest.map(|p| p.display().to_string()),
+        },
+    )
+    .await
 }
 
 async fn rpc(home: &PathBuf, request: Request) -> Result<(), String> {
@@ -1729,7 +2274,7 @@ async fn chamber_serve(port: u16, ion: String, root: PathBuf) -> Result<(), Stri
             }),
         );
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| e.to_string())?;

@@ -147,6 +147,10 @@ pub struct Organism {
     transfer_nonce: u64,
     /// Réplicas remotas vivas por ion (anunciadas via IonReady).
     ion_replica_peers: HashMap<String, Vec<NodeId>>,
+    /// Último heartbeat de réplica por (Ion, NodeId) (epoch secs) — refresh via
+    /// `IonHeartbeat`, usado para podar réplicas caídas antes do TTL do
+    /// `peer_ions` (detecção de falha mais rápida no WAN).
+    ion_replica_heartbeat: HashMap<(String, NodeId), u64>,
     /// Catálogo global de ions que pares expõem no seu Horizon.
     /// Chave = NodeId do peer, Valor = (ions, último anúncio Unix secs).
     peer_ions: HashMap<NodeId, (Vec<String>, u64)>,
@@ -160,6 +164,8 @@ pub struct Organism {
     last_scaling_offer: HashMap<String, Instant>,
     /// Repositórios anunciados via gossipsub (nome → (url, commit, descrição, from)).
     known_repos: HashMap<String, (String, String, String, NodeId)>,
+    /// Migrações aceitas pendentes de IonMigrate (autenticação de fluxo).
+    pending_accepted_migrations: HashSet<String>,
 }
 
 impl Organism {
@@ -394,12 +400,14 @@ impl Organism {
             assets,
             transfer_nonce: 0,
             ion_replica_peers: HashMap::new(),
+            ion_replica_heartbeat: HashMap::new(),
             peer_ions: HashMap::new(),
             console_hit: false,
             last_brood: 0,
             zero_load_windows: HashMap::new(),
             last_scaling_offer: HashMap::new(),
             known_repos: HashMap::new(),
+            pending_accepted_migrations: HashSet::new(),
         };
 
         // Restaura catálogo de peers do estado persistido.
@@ -559,13 +567,14 @@ impl Organism {
             }],
         };
         let id = self.bank.deposit(plot.clone())?;
-        let bytes = self.bank.spore_print(&id)?;
-        let _ = self.hyphae.dht_store_local(dht_key(&id), bytes.clone());
-        let _ = self.hyphae.dht_put(dht_key(&id), bytes);
-        let env = Envelope::SporePrint { plot };
-        let _ = self
-            .hyphae
-            .broadcast_lattice(env.encode().map_err(|e| OrganismError::Msg(e.to_string()))?);
+        if let Some(bytes) = self.bank.public_spore_print(&id) {
+            let _ = self.hyphae.dht_store_local(dht_key(&id), bytes.clone());
+            let _ = self.hyphae.dht_put(dht_key(&id), bytes);
+            let env = Envelope::SporePrint { plot };
+            let _ = self
+                .hyphae
+                .broadcast_lattice(env.encode().map_err(|e| OrganismError::Msg(e.to_string()))?);
+        }
         self.persist()?;
         Ok(id)
     }
@@ -702,10 +711,14 @@ impl Organism {
         ion: String,
         name: String,
     ) -> Result<ContentId, OrganismError> {
-        if self.bank.recall(&plot).is_none() {
-            return Err(OrganismError::Msg(format!(
+        match self.bank.recall(&plot) {
+            None => return Err(OrganismError::Msg(format!(
                 "plot {plot} ausente do Spore Bank local"
-            )));
+            ))),
+            Some(p) if !p.is_public() => return Err(OrganismError::Msg(
+                "signal de Plot restrito exige transporte criptografado ainda não implementado".into()
+            )),
+            Some(_) => {}
         }
         let id = self.state.field.emit(
             self.gland.node_id(),
@@ -967,7 +980,9 @@ impl Organism {
     fn dht_overlay_tick(&mut self) {
         // Esporos/layers locais: consulta o DHT pelos peers XOR-mais-próximos,
         // mantendo a rota de custódia viva entre os nós vivos.
-        let mut keys: Vec<[u8; 32]> = self.bank.ids().iter().map(|id| id.0).collect();
+        let mut keys: Vec<[u8; 32]> = self.bank.ids().iter()
+            .filter(|id| self.bank.public_spore_print(id).is_some())
+            .map(|id| id.0).collect();
         keys.truncate(4); // limita queries por tick (rede pequena)
         for k in &keys {
             self.hyphae.dht_closest_peers(k.to_vec());
@@ -1052,6 +1067,22 @@ impl Organism {
         Ok(false)
     }
 
+    fn advertised_chamber_upstream(&self, port: u16) -> String {
+        if let Ok(host) = std::env::var("MYCELIUM_PUBLIC_HOST") {
+            let host = host.trim();
+            if !host.is_empty() {
+                return format!("http://{host}:{port}");
+            }
+        }
+        if let Ok(host) = std::env::var("MYCELIUM_PUBLIC_ADDR") {
+            let host = host.trim();
+            if !host.is_empty() {
+                return format!("http://{host}:{port}");
+            }
+        }
+        format!("http://127.0.0.1:{port}")
+    }
+
     /// Executa Vector remoto (Build/Test) se houver CPU ociosa e Plot local.
     fn accept_remote_vector(&mut self, vector: Vector) -> Result<(), OrganismError> {
         if self.resources.cpu_cores == 0 || self.flywheel.pending() > 2 {
@@ -1061,6 +1092,14 @@ impl Organism {
             return Ok(());
         }
         if vector.emitter == self.gland.node_id() {
+            return Ok(());
+        }
+        if !inertia::is_sandbox_available() {
+            tracing::warn!(
+                emitter = %vector.emitter.short(),
+                plot = %vector.plot.short(),
+                "vector remoto rejeitado: sandbox Bubblewrap indisponível no host (política fail-closed)"
+            );
             return Ok(());
         }
         let fp = Self::vector_fingerprint(&vector);
@@ -1114,6 +1153,15 @@ impl Organism {
         persist_record: bool,
     ) -> Result<(), OrganismError> {
         let plot_id: ContentId = plot.parse().map_err(OrganismError::Msg)?;
+        // A frutificação anuncia layers em claro na DHT. Não permitir que
+        // um Plot privado/reservado vaze por esta rota indireta.
+        if let Some(plot) = self.bank.recall(&plot_id) {
+            if !plot.is_public() {
+                return Err(OrganismError::Msg(
+                    "deploy de Plot restrito exige layers criptografadas; operação recusada".into(),
+                ));
+            }
+        }
         let message = self
             .bank
             .recall(&plot_id)
@@ -1185,6 +1233,7 @@ impl Organism {
                 isolation: Isolation::Auto,
                 memory_mib: mem,
                 cpu_cores: cpu,
+                ..FruitOptions::default()
             },
         )?;
 
@@ -1326,8 +1375,13 @@ impl Organism {
                 return self.handle_envelope(*inner);
             }
             Envelope::SporePrint { plot } => {
-                let id = self.bank.deposit(plot)?;
-                let bytes = self.bank.spore_print(&id)?;
+                if !plot.is_public() {
+                    tracing::warn!("spore print restrito recebido em claro: descartando sem persistir");
+                    return Ok(());
+                }
+                let bytes = serde_json::to_vec(&plot)
+                    .map_err(|e| OrganismError::Msg(e.to_string()))?;
+                let id = self.bank.absorb_public(&bytes)?;
                 let _ = self.hyphae.dht_store_local(dht_key(&id), bytes.clone());
                 let _ = self.hyphae.dht_put(dht_key(&id), bytes);
                 tracing::info!(plot = %id.short(), "spore print absorvido");
@@ -1458,6 +1512,7 @@ impl Organism {
                     return Ok(());
                 }
                 // Aceita se tem recursos ociosos
+                self.pending_accepted_migrations.insert(ion.clone());
                 let env = Envelope::IonAccept {
                     ion: ion.clone(),
                     acceptor: self.gland.node_id(),
@@ -1481,7 +1536,7 @@ impl Organism {
                 // Auto-scaling: o peer aceitou a réplica → envia Void + layers
                 // e paga o voucher de hospedagem (economia do substrato).
                 if self.chambers.contains_key(&ion) {
-                    match self.send_ion_migrate(&ion) {
+                    match self.send_ion_migrate(&ion, acceptor) {
                         Ok(n) => {
                             tracing::info!(
                                 %ion, %acceptor, layers = n,
@@ -1500,14 +1555,36 @@ impl Organism {
                 }
             }
             Envelope::IonMigrate { ion, void, layers } => {
+                if !self.pending_accepted_migrations.remove(&ion) {
+                    tracing::warn!(%ion, "IonMigrate rejeitado: migração não autorizada/não solicitada por este nó");
+                    return Ok(());
+                }
+                if void.name != ion || layers.len() > 32 {
+                    tracing::warn!(%ion, "IonMigrate rejeitado: nome inconsistente ou layers em excesso");
+                    return Ok(());
+                }
+                if let Err(e) = vacuum::validate_ion_name(&void.name) {
+                    tracing::warn!(error = %e, "IonMigrate rejeitado: nome de ion inválido");
+                    return Ok(());
+                }
                 let layer_store = match vacuum::LayerStore::open(self.store.layers_dir()) {
                     Ok(s) => s,
                     Err(_) => return Ok(()),
                 };
+                // Validação integral ANTES de gravar qualquer blob recebido.
+                // Um anúncio de ContentId não autentica a origem, mas deve
+                // sempre vincular os bytes ao hash prometido.
+                if layers.iter().any(|(lid, data)| {
+                    data.len() > 10 * 1024 * 1024
+                        || !void.layers.contains(lid)
+                        || ContentId::of(data) != *lid
+                }) {
+                    tracing::warn!(%ion, "IonMigrate rejeitado: layer fora do manifesto, excessiva ou hash inválido");
+                    return Ok(());
+                }
                 for (lid, data) in &layers {
-                    let p = layer_store.path_of(lid);
-                    if !p.exists() {
-                        let _ = std::fs::write(&p, data);
+                    if !layer_store.has(lid) {
+                        layer_store.put(data)?;
                     }
                 }
                 let missing: Vec<ContentId> = void.layers.iter().filter(|lid| !layer_store.has(lid)).copied().collect();
@@ -1527,13 +1604,17 @@ impl Organism {
                         }
                     }
                 }
+                let fruit_opts = vacuum::FruitOptions {
+                    fail_closed: true, // Migração remota sempre exige isolamento estrito
+                    ..vacuum::FruitOptions::default()
+                };
                 match vacuum::ChamberProcess::fruit_void(
                     &self.mycelium_bin,
                     &self.store.chambers_dir(),
                     &void,
                     &layer_store,
                     &name,
-                    vacuum::FruitOptions::default(),
+                    fruit_opts,
                 ) {
                     Ok(proc) => {
                         let host = format!("sporocarp.mycelium/{}", self.gland.node_id().short());
@@ -1548,11 +1629,12 @@ impl Organism {
                                 upstream: upstream.clone(),
                             });
                         }
+                        let advertised_upstream = self.advertised_chamber_upstream(proc.port);
                         self.chambers.insert(ion.clone(), proc);
                         let env = Envelope::IonReady {
                             ion: ion.clone(),
                             node: self.gland.node_id(),
-                            upstream,
+                            upstream: advertised_upstream,
                         };
                         if let Ok(bytes) = env.encode() {
                             let _ = self.hyphae.broadcast_lattice(bytes);
@@ -1566,29 +1648,49 @@ impl Organism {
                 if node == self.gland.node_id() {
                     return Ok(());
                 }
-                let peers = self.ion_replica_peers.entry(ion.clone()).or_default();
-                if !peers.contains(&node) {
-                    peers.push(node);
-                }
-                // Rota remota só se NÃO houver chamber local vivo — um replica
-                // que frutificou o ion AQUI é a autoridade da rota local; caso
-                // contrário um IonReady remoto sobrescreveria o by_ion com um
-                // upstream de outro nó (e o /ion local passaria a responder 502).
                 let local_chamber = self.chambers.get(&ion).is_some();
-                if !local_chamber {
+                let is_loopback = upstream.contains("127.0.0.1") || upstream.contains("localhost");
+                if !is_loopback {
+                    let peers = self.ion_replica_peers.entry(ion.clone()).or_default();
+                    if !peers.contains(&node) {
+                        peers.push(node);
+                    }
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH)
+                        .unwrap_or_default().as_secs();
+                    self.ion_replica_heartbeat.insert((ion.clone(), node), now);
                     let host = format!("sporocarp.mycelium/{}", self.gland.node_id().short());
+                    let mass = if local_chamber { 5 } else { 10 };
+                    let resistance = 2;
                     {
                         let mut table = self.horizon.write().unwrap();
                         table.expose(&host, singularity::Orbit {
                             ion: ion.clone(),
                             node,
-                            mass: 10,
-                            resistance: 1,
+                            mass,
+                            resistance,
                             upstream,
                         });
                     }
+                    tracing::info!(%ion, %node, local_chamber, "IonReady — réplica remota alcançável registrada");
+                } else {
+                    tracing::warn!(%ion, %node, "IonReady recebido com upstream loopback (127.0.0.1) — rota remota não exposta no proxy para evitar 502");
                 }
-                tracing::info!(%ion, %node, local_chamber, "IonReady — réplica remota registrada");
+            }
+            Envelope::IonHeartbeat { node_id, ion } => {
+                if node_id == self.gland.node_id() {
+                    return Ok(()); // eco local: ignora.
+                }
+                // Um heartbeat para outro Ion não pode manter rota morta viva.
+                if !self.ion_replica_peers.get(&ion)
+                    .map(|peers| peers.contains(&node_id)).unwrap_or(false) {
+                    return Ok(());
+                }
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                self.ion_replica_heartbeat.insert((ion.clone(), node_id), now);
+                tracing::debug!(%ion, %node_id, "IonHeartbeat — replica viva renovada");
             }
             Envelope::ZoneAnnounce { prefix, custodian } => {
                 if custodian == self.gland.node_id() {
@@ -1672,11 +1774,39 @@ impl Organism {
         Ok(())
     }
 
-    /// Empacota Void + layers do ion local e envia `IonMigrate` pelas hifas.
+    /// Inicia o handshake de migração enviando `IonOffer` unicast ao acceptor.
+    fn initiate_ion_migration(&mut self, ion: &str, acceptor: NodeId) -> Result<(), String> {
+        let chamber = match self.chambers.get(ion) {
+            Some(c) => c,
+            None => return Err(format!("ion `{ion}` não está neste nó")),
+        };
+        let layers: Vec<ContentId> = chamber
+            .void_layers()
+            .iter()
+            .filter_map(|s| s.parse::<ContentId>().ok())
+            .collect();
+        let env = Envelope::IonOffer {
+            ion: ion.to_string(),
+            host: self.gland.node_id(),
+            charge: plasma::Charge::Positive,
+            desired_replicas: 2,
+            layers,
+        };
+        self.send_direct(acceptor, env);
+        Ok(())
+    }
+
+    /// Empacota Void + layers do ion local e envia `IonMigrate` **direcionado**
+    /// ao acceptor (unicast via `Envelope::Direct{to}` sobre a lattice).
+    ///
+    /// Antes este método dava broadcast do IonMigrate em toda a lattice — na
+    /// WAN isso inunda a rede com camadas de ion para quem não é o
+    /// destinatário. Agora o envelope é lacrado (`Direct{to:acceptor}`) e só
+    /// o acceptor o processa; intermediários apenas replicam o gossip.
     ///
     /// Usado pelo comando manual (`mycelium ion-migrate`) e pelo auto-scaling
     /// do Plasma (quando um peer responde `IonAccept` a um `IonOffer`).
-    fn send_ion_migrate(&mut self, ion: &str) -> Result<usize, String> {
+    fn send_ion_migrate(&mut self, ion: &str, acceptor: NodeId) -> Result<usize, String> {
         let chamber = match self.chambers.get(ion) {
             Some(c) => c,
             None => return Err(format!("ion `{ion}` não está neste nó")),
@@ -1705,9 +1835,8 @@ impl Organism {
             void,
             layers: layers_data,
         };
-        if let Ok(bytes) = env.encode() {
-            let _ = self.hyphae.broadcast_lattice(bytes);
-        }
+        // Unicast direcionado: só o acceptor processa o IonMigrate.
+        self.send_direct(acceptor, env);
         Ok(n_layers)
     }
 
@@ -1924,6 +2053,37 @@ impl Organism {
                 );
             }
         }
+
+        // 5. Heartbeat de réplica: anuncia para o mesh que este nó ainda
+        //    serve cada ion local (réplicas caídas são detectadas mais rápido
+        //    que pelo TTL genérico do peer_ions).
+        for (name, _) in &self.chambers {
+            let env = Envelope::IonHeartbeat {
+                node_id: self.gland.node_id(),
+                ion: name.clone(),
+            };
+            if let Ok(bytes) = env.encode() {
+                let _ = self.hyphae.broadcast_lattice(bytes);
+            }
+        }
+
+        // 6. Prune réplicas cuja heartbeat sumiu — detecção de falha rápida.
+        const REPLICA_HEARTBEAT_TTL: u64 = 120; // 2 janelas de scaling
+        let expired: Vec<(String, NodeId)> = self.ion_replica_peers.iter()
+            .flat_map(|(ion, peers)| peers.iter().filter_map(|peer| {
+                let ts = self.ion_replica_heartbeat.get(&(ion.clone(), *peer))?;
+                (now.saturating_sub(*ts) >= REPLICA_HEARTBEAT_TTL)
+                    .then(|| (ion.clone(), *peer))
+            }))
+            .collect();
+        for (ion, peer) in expired {
+            if let Some(peers) = self.ion_replica_peers.get_mut(&ion) {
+                peers.retain(|p| *p != peer);
+            }
+            self.ion_replica_heartbeat.remove(&(ion.clone(), peer));
+            self.horizon.write().unwrap().collapse_ion_node(&ion, &peer);
+            tracing::warn!(%ion, %peer, "réplica expirada: removida do Event Horizon");
+        }
     }
 
     fn handle_control(&mut self, req: Request) -> Response {
@@ -1948,6 +2108,28 @@ impl Organism {
                     message: e.to_string(),
                 },
             },
+            Request::ImportSpore {
+                spore_print_base64,
+                expected_plot,
+            } => {
+                use base64::Engine;
+                let expected = expected_plot.parse::<ContentId>();
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(spore_print_base64);
+                match (expected, bytes) {
+                    (Ok(expected), Ok(bytes)) => match self.bank.absorb(&bytes) {
+                        Ok(actual) if actual == expected => Response::Ok {
+                            message: format!("plot importado: {actual}"),
+                        },
+                        Ok(actual) => Response::Err {
+                            message: format!("CID importado {actual} difere do esperado {expected}"),
+                        },
+                        Err(e) => Response::Err { message: e.to_string() },
+                    },
+                    (Err(e), _) => Response::Err { message: e },
+                    (_, Err(e)) => Response::Err { message: e.to_string() },
+                }
+            }
             Request::Signal {
                 plot,
                 quorum,
@@ -2162,10 +2344,16 @@ impl Organism {
                 Response::Ok { message: msg.trim().to_string() }
             }
             Request::IonMigrate { ion, target } => {
-                match self.send_ion_migrate(&ion) {
-                    Ok(n_layers) => {
+                let acceptor = match target.parse::<NodeId>() {
+                    Ok(n) => n,
+                    Err(e) => return Response::Err {
+                        message: format!("target NodeId inválido: {e}"),
+                    },
+                };
+                match self.initiate_ion_migration(&ion, acceptor) {
+                    Ok(()) => {
                         self.ion_hosts.insert(ion.clone(), target);
-                        Response::Ok { message: format!("ion `{ion}` Void + {n_layers} layers enviado para migração") }
+                        Response::Ok { message: format!("oferta de migração do ion `{ion}` iniciada (IonOffer unicast) para {}", acceptor.short()) }
                     }
                     Err(message) => Response::Err { message },
                 }
@@ -2502,12 +2690,11 @@ impl Organism {
                 };
                 match self.bank.deposit(plot) {
                     Ok(plot_id) => {
-                        let _ = self.fruit_ion(&ion, &plot_id.to_string(), "", true);
-                        // Conteúdo viaja na rede SÓ para visibilidades não-privadas:
-                        // public/community/reserved/archived → SporePrint (gossip) + DHT.
-                        // private → permanece local (só o autor baixa).
-                        if vis != "private" {
-                            if let Ok(bytes) = self.bank.spore_print(&plot_id) {
+                        // Sem criptografia/capabilities, somente público é
+                        // distribuído. Outras visibilidades ficam locais.
+                        if vis == "public" {
+                            let _ = self.fruit_ion(&ion, &plot_id.to_string(), "", true);
+                            if let Some(bytes) = self.bank.public_spore_print(&plot_id) {
                                 let _ = self.hyphae.dht_store_local(dht_key(&plot_id), bytes.clone());
                                 let _ = self.hyphae.dht_put(dht_key(&plot_id), bytes);
                             }
@@ -2517,16 +2704,16 @@ impl Organism {
                                     let _ = self.hyphae.broadcast_lattice(bytes);
                                 }
                             }
-                        }
-                        let env = Envelope::RepoAnnounce {
-                            node_id: self.gland.node_id(),
-                            name: name.clone(),
-                            url: format!("mycelium://plot/{plot_id}"),
-                            commit: plot_id.to_string()[2..18].to_string(),
-                            description: format!("[{vis}] {description}"),
-                        };
-                        if let Ok(bytes) = env.encode() {
-                            let _ = self.hyphae.broadcast_lattice(bytes);
+                            let env = Envelope::RepoAnnounce {
+                                node_id: self.gland.node_id(),
+                                name: name.clone(),
+                                url: format!("mycelium://plot/{plot_id}"),
+                                commit: plot_id.to_string()[2..18].to_string(),
+                                description: format!("[{vis}] {description}"),
+                            };
+                            if let Ok(bytes) = env.encode() {
+                                let _ = self.hyphae.broadcast_lattice(bytes);
+                            }
                         }
                         self.known_repos.insert(
                             name.clone(),
@@ -2540,9 +2727,14 @@ impl Organism {
                             "community" => "👥",
                             _ => "📄",
                         };
-                        tracing::info!(repo = %name, %plot_id, files = file_count, bytes = total_bytes, visibility = %vis, "código semeado na rede");
-                        let msg = format!("{} '{}' [{}] semead: plot={}, {} arquivos, {} bytes\n\nBaixar em outro nó:\n  mycelium recall-code --plot {}",
-                            vis_icon, name, vis, plot_id, file_count, total_bytes, plot_id);
+                        tracing::info!(repo = %name, %plot_id, files = file_count, bytes = total_bytes, visibility = %vis, "código depositado no Spore Bank");
+                        let access_hint = if vis == "public" {
+                            format!("Baixar em outro nó:\n  mycelium recall-code --plot {plot_id}")
+                        } else {
+                            "Restrito: armazenado apenas neste nó; publicação em claro desabilitada".to_string()
+                        };
+                        let msg = format!("{} '{}' [{}] semeado: plot={}, {} arquivos, {} bytes\n\n{}",
+                            vis_icon, name, vis, plot_id, file_count, total_bytes, access_hint);
                         Response::Ok { message: msg }
                     }
                     Err(e) => Response::Err { message: format!("falha ao semear: {e}") },
@@ -2560,9 +2752,9 @@ impl Organism {
                                 } else {
                                     "public".to_string()
                                 };
-                                // private: só o autor pode baixar
+                                // Visibilidades restritas: apenas restauração local do autor.
                                 if !recall_allowed(&vis, &plot.author, &self.gland.node_id()) {
-                                    return Response::Err { message: "🔒 acesso negado — plot é privado (só o autor pode baixar)".into() };
+                                    return Response::Err { message: "🔒 acesso negado — plot restrito (apenas autor local)".into() };
                                 }
                                 let out_dir = match &output_dir {
                                     Some(p) => std::path::PathBuf::from(p),
@@ -2571,6 +2763,10 @@ impl Organism {
                                     ),
                                 };
                                 std::fs::create_dir_all(&out_dir).ok();
+                                let canon_out = match out_dir.canonicalize() {
+                                    Ok(c) => c,
+                                    Err(_) => out_dir.clone(),
+                                };
                                 let mut written = 0usize;
                                 let vis_icon = match vis.as_str() {
                                     "public" => "🌐",
@@ -2581,9 +2777,21 @@ impl Organism {
                                     _ => "📄",
                                 };
                                 for leaf in &plot.leaves {
-                                    let file_path = out_dir.join(&leaf.path);
+                                    let safe_rel = match inertia::safe_relative_path(&leaf.path) {
+                                        Ok(p) => p,
+                                        Err(_) => continue,
+                                    };
+                                    let file_path = canon_out.join(&safe_rel);
                                     if let Some(parent) = file_path.parent() {
                                         std::fs::create_dir_all(parent).ok();
+                                        if let Ok(canon_parent) = parent.canonicalize() {
+                                            if !canon_parent.starts_with(&canon_out) {
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    if file_path.is_symlink() {
+                                        let _ = std::fs::remove_file(&file_path);
                                     }
                                     if let Ok(mut f) = std::fs::File::create(&file_path) {
                                         let _ = f.write_all(&leaf.content);
@@ -2708,18 +2916,24 @@ impl Organism {
     pub async fn run(mut self, mut control_rx: mpsc::Receiver<ControlMsg>) -> Result<(), OrganismError> {
         self.store.write_pid()?;
 
-        let bind: std::net::SocketAddr =
-            format!("127.0.0.1:{}", self.state.horizon_port)
-                .parse()
-                .map_err(|e| OrganismError::Msg(format!("{e}")))?;
+        let bind_str = std::env::var("MYCELIUM_HORIZON_BIND")
+            .unwrap_or_else(|_| format!("127.0.0.1:{}", self.state.horizon_port));
+        let bind: std::net::SocketAddr = bind_str
+            .parse()
+            .map_err(|e| OrganismError::Msg(format!("MYCELIUM_HORIZON_BIND inválido: {e}")))?;
         let handle = match serve_horizon(bind, self.horizon.clone()).await {
             Ok(h) => h,
             Err(e) if e.contains("Address already in use") || e.contains("os error 98") => {
                 tracing::warn!(
                     port = self.state.horizon_port,
-                    "Event Horizon ocupado — a usar porta efémera (127.0.0.1:0)"
+                    "Event Horizon ocupado — a usar porta efémera"
                 );
-                let fallback: std::net::SocketAddr = "127.0.0.1:0"
+                let fallback_str = if bind.ip().is_loopback() {
+                    "127.0.0.1:0"
+                } else {
+                    "0.0.0.0:0"
+                };
+                let fallback: std::net::SocketAddr = fallback_str
                     .parse()
                     .map_err(|e| OrganismError::Msg(format!("{e}")))?;
                 serve_horizon(fallback, self.horizon.clone())
@@ -2731,8 +2945,9 @@ impl Organism {
         self.state.horizon_port = handle.bind.port();
         tracing::info!(
             url = %format!("http://{}/", handle.bind),
-            "event horizon escutando — curl http://127.0.0.1:{}/<ion>/",
-            self.state.horizon_port
+            public = !handle.bind.ip().is_loopback(),
+            "event horizon escutando — curl http://{}/<ion>/",
+            handle.bind
         );
         self.horizon_handle = Some(handle);
 
@@ -3241,7 +3456,7 @@ impl Organism {
                                     secreted = true;
                                 }
                                 for id in self.bank.ids().to_vec() {
-                                    if let Ok(bytes) = self.bank.spore_print(&id) {
+                                    if let Some(bytes) = self.bank.public_spore_print(&id) {
                                         if let Ok(plot) = serde_json::from_slice::<Plot>(&bytes) {
                                             let env = Envelope::SporePrint { plot };
                                             if let Ok(encoded) = env.encode() {
@@ -3318,12 +3533,27 @@ impl Organism {
                             } else if let Some(id) =
                                 mycelium_sporebank::content_id_from_dht_key(&key)
                             {
-                                match self.bank.absorb(&value) {
-                                    Ok(_) => tracing::info!(plot = %id.short(), "esporo recuperado do DHT"),
-                                    Err(e) => tracing::warn!("absorb DHT: {e}"),
+                                // Validar a associação entre chave DHT e
+                                // conteúdo ANTES da persistência.
+                                let valid = serde_json::from_slice::<Plot>(&value)
+                                    .ok()
+                                    .and_then(|plot| plot.id().ok().map(|actual| (plot, actual)))
+                                    .map(|(plot, actual)| plot.is_public() && actual == id)
+                                    .unwrap_or(false);
+                                if valid {
+                                    match self.bank.absorb_public(&value) {
+                                        Ok(_) => tracing::info!(plot = %id.short(), "esporo público recuperado do DHT"),
+                                        Err(e) => tracing::warn!("absorb DHT: {e}"),
+                                    }
+                                    let _ = self.persist();
+                                } else {
+                                    tracing::warn!(plot = %id.short(), "DHT: conteúdo restrito ou hash incompatível descartado");
                                 }
-                                let _ = self.persist();
                             } else if let Some(layer_id) = content_id_from_layer_dht_key(&key) {
+                                if ContentId::of(&value) != layer_id {
+                                    tracing::warn!(layer = %layer_id.short(), "DHT: layer com hash incompatível descartada");
+                                    continue;
+                                }
                                 match LayerStore::open(self.store.layers_dir()) {
                                     Ok(store) => match store.put(&value) {
                                         Ok(stored) => {
@@ -3395,11 +3625,12 @@ fn ghost_for_node(gland_seed: [u8; 32]) -> mycelium_ghostid::GhostId {
         .unwrap_or(gland_seed);
     mycelium_ghostid::GhostId::from_secret_bytes(seed, 60 * 60 * 24 * 365 * 100)
         .unwrap_or_else(|_| mycelium_ghostid::GhostId::spawn_quick(60 * 60 * 24 * 365).unwrap())
-/// Regra de visibilidade do `recall-code`: plots `private` só o autor baixa.
-/// Qualquer outra visibilidade (public/reserved/archived/community) pode ser
-/// baixada por qualquer nó que tenha o plot no Spore Bank.
+}
+
+/// Enquanto não houver ACL/capability verificável, apenas Plots públicos
+/// podem ser acessados por outro nó. Restritos só pelo autor local.
 pub fn recall_allowed(visibility: &str, author: &mycelium_core::NodeId, caller: &mycelium_core::NodeId) -> bool {
-    !(visibility == "private" && author != caller)
+    visibility == "public" || author == caller
 }
 
 /// TTL de custódia de zona (600s sem re-anúncio ⇒ custodiante expirado).
@@ -3548,10 +3779,11 @@ mod visibility_tests {
     }
 
     #[test]
-    fn other_visibilities_are_open() {
+    fn other_visibilities_are_not_open_to_non_authors() {
         let a = id(b"autor-a"); let o = id(b"qualquer");
         for vis in ["reserved", "archived", "community"] {
-            assert!(recall_allowed(vis, &a, &o), "{vis}");
+            assert!(!recall_allowed(vis, &a, &o), "{vis}");
+            assert!(recall_allowed(vis, &a, &a), "autor local pode restaurar {vis}");
         }
     }
 }

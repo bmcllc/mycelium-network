@@ -19,7 +19,8 @@ pub use candidate_relay::{
 pub use nip94::{announce_plot, seal_event, NostrEvent};
 pub use relay_pool::{RelayPool, PUBLIC_RELAYS};
 pub use shard_event::{
-    create_shard_event, decrypt_nip44_to_string, decrypt_shard_content, encrypt_nip44,
+    create_shard_event, decode_shard_content, decrypt_nip44_to_string, decrypt_shard_content,
+    encode_shard_content, encrypt_nip44,
     fetch_shards, publish_shards, KIND_QEL_SHARD,
 };
 
@@ -30,6 +31,8 @@ use thiserror::Error;
 pub enum NostrError {
     #[error("todos os relays falharam")]
     AllRelaysFailed,
+    #[error("evento Nostr {event_id} com {bytes} bytes excede limite de {limit} bytes")]
+    EventTooLarge { event_id: String, bytes: usize, limit: usize },
     #[error("hex inválido: {0}")]
     InvalidHex(String),
     #[error("websocket: {0}")]
@@ -46,4 +49,11 @@ pub enum NostrError {
     Ghost(#[from] mycelium_ghostid::GhostError),
     #[error("{0}")]
     Msg(String),
+}
+
+impl NostrError {
+    /// Falhas locais determinísticas não melhoram com retry de relay.
+    pub fn is_deterministic(&self) -> bool {
+        matches!(self, Self::EventTooLarge { .. } | Self::InvalidHex(_) | Self::Json(_) | Self::Qel(_) | Self::Ghost(_))
+    }
 }

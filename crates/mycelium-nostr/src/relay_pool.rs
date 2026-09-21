@@ -19,6 +19,10 @@ pub const PUBLIC_RELAYS: &[&str] = &[
     "wss://relay.primal.net",
 ];
 
+/// Limite conservador por EVENT. Relays públicos variam; acima disto o
+/// transporte Nostr/QEL não promete suporte a VOBs grandes.
+pub const MAX_NOSTR_EVENT_BYTES: usize = 60 * 1024;
+
 /// Pool de relays.
 pub struct RelayPool {
     relays: Vec<String>,
@@ -62,8 +66,8 @@ impl RelayPool {
 
     /// Publica em paralelo em todos os relays; exige `min_relays` sucessos.
     pub async fn publish(&self, event: &NostrEvent) -> Result<usize, NostrError> {
-        let msg = json!(["EVENT", event]);
-        let payload = Arc::new(msg.to_string());
+        let payload = Arc::new(Self::serialized_event(event)?);
+        let event_id = Arc::new(event.id.clone());
         let timeout_dur = self.timeout;
         let min = self.min_relays;
 
@@ -71,60 +75,81 @@ impl RelayPool {
         for url in &self.relays {
             let url = url.clone();
             let payload = Arc::clone(&payload);
+            let event_id = Arc::clone(&event_id);
             handles.push(tokio::spawn(async move {
-                match Self::send_event_static(&url, &payload, timeout_dur).await {
-                    Ok(()) => {
-                        tracing::info!(relay = %url, "EVENT publicado");
-                        true
-                    }
-                    Err(e) => {
-                        tracing::warn!(relay = %url, error = %e, "relay falhou");
-                        false
-                    }
+                let result = Self::send_event_static(&url, &payload, &event_id, timeout_dur).await;
+                if let Err(error) = &result {
+                    tracing::warn!(relay = %url, %error, "relay falhou");
+                } else {
+                    tracing::info!(relay = %url, "EVENT publicado");
                 }
+                (url, result)
             }));
         }
 
         let mut ok = 0usize;
+        let mut failures = Vec::new();
         for h in handles {
-            if let Ok(true) = h.await {
-                ok += 1;
+            match h.await {
+                Ok((_url, Ok(()))) => ok += 1,
+                Ok((url, Err(error))) => failures.push(format!("{url}: {error}")),
+                Err(error) => failures.push(format!("task relay: {error}")),
             }
         }
 
         if ok < min {
-            Err(NostrError::AllRelaysFailed)
+            Err(NostrError::Msg(format!(
+                "ACKs positivos insuficientes ({ok}/{min}): {}",
+                failures.join("; ")
+            )))
         } else {
             Ok(ok)
         }
     }
 
+    /// Serializa exatamente o frame WebSocket e valida o limite antes de I/O.
+    pub fn serialized_event(event: &NostrEvent) -> Result<String, NostrError> {
+        let payload = json!(["EVENT", event]).to_string();
+        if payload.len() > MAX_NOSTR_EVENT_BYTES {
+            return Err(NostrError::EventTooLarge {
+                event_id: event.id.clone(),
+                bytes: payload.len(),
+                limit: MAX_NOSTR_EVENT_BYTES,
+            });
+        }
+        Ok(payload)
+    }
+
     async fn send_event_static(
         url: &str,
         payload: &str,
+        event_id: &str,
         overall: Duration,
     ) -> Result<(), NostrError> {
         let fut = async {
             let (mut ws, _) = connect_async(url)
                 .await
                 .map_err(|e| NostrError::WebSocket(e.to_string()))?;
-            ws.send(Message::Text(payload.to_string().into()))
+            ws.send(Message::Text(payload.to_string()))
                 .await
                 .map_err(|e| NostrError::WebSocket(e.to_string()))?;
 
-            // Espera OK breve (não bloqueia 3s)
-            let _ = timeout(Duration::from_millis(800), async {
+            // Um relay só conta após `OK <event-id> true`; NOTICE não é ACK.
+            timeout(Duration::from_millis(800), async {
                 while let Some(msg) = ws.next().await {
                     let msg = msg.map_err(|e| NostrError::WebSocket(e.to_string()))?;
                     if let Message::Text(t) = msg {
-                        if t.contains("\"OK\"") || t.contains("\"NOTICE\"") {
-                            break;
+                        match parse_relay_ack(&t, event_id)? {
+                            Some(true) => return Ok(()),
+                            Some(false) => return Err(NostrError::Msg(format!("relay rejeitou EVENT: {t}"))),
+                            None => {}
                         }
                     }
                 }
-                Ok::<(), NostrError>(())
+                Err(NostrError::Msg("relay fechou sem ACK".into()))
             })
-            .await;
+            .await
+            .map_err(|_| NostrError::Timeout)??;
 
             let _ = ws.close(None).await;
             Ok(())
@@ -165,7 +190,7 @@ impl RelayPool {
             let (mut ws, _) = connect_async(url)
                 .await
                 .map_err(|e| NostrError::WebSocket(e.to_string()))?;
-            ws.send(Message::Text(req.to_string().into()))
+            ws.send(Message::Text(req.to_string()))
                 .await
                 .map_err(|e| NostrError::WebSocket(e.to_string()))?;
 
@@ -195,13 +220,83 @@ impl RelayPool {
             .await;
 
             let close = json!(["CLOSE", sub_id]);
-            let _ = ws.send(Message::Text(close.to_string().into())).await;
+            let _ = ws.send(Message::Text(close.to_string())).await;
             let _ = ws.close(None).await;
             Ok(events)
         };
         timeout(overall, fut)
             .await
             .map_err(|_| NostrError::Timeout)?
+    }
+}
+
+fn parse_relay_ack(text: &str, expected_event_id: &str) -> Result<Option<bool>, NostrError> {
+    let value: Value = match serde_json::from_str(text) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let Some(parts) = value.as_array() else { return Ok(None) };
+    if parts.first().and_then(Value::as_str) != Some("OK") {
+        return Ok(None);
+    }
+    if parts.get(1).and_then(Value::as_str) != Some(expected_event_id) {
+        return Ok(None);
+    }
+    Ok(parts.get(2).and_then(Value::as_bool))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    fn event_with_content(content: String) -> NostrEvent {
+        NostrEvent { id: "a".repeat(64), pubkey: "b".repeat(64), created_at: 1,
+            kind: 1, tags: vec![], content, sig: "c".repeat(128) }
+    }
+
+    async fn relay(reply_ok: bool) -> (String, tokio::task::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("ws://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let received = ws.next().await.unwrap().unwrap();
+            let payload = received.into_text().unwrap();
+            let event_id = serde_json::from_str::<Value>(&payload).unwrap()[1]["id"].as_str().unwrap().to_owned();
+            ws.send(Message::Text(json!(["OK", event_id, reply_ok, if reply_ok { "saved" } else { "blocked" }]).to_string())).await.unwrap();
+            1
+        });
+        (address, handle)
+    }
+
+    #[test]
+    fn only_positive_ok_is_a_relay_ack() {
+        assert_eq!(parse_relay_ack(r#"["OK","id",true,""]"#, "id").unwrap(), Some(true));
+        assert_eq!(parse_relay_ack(r#"["OK","id",false,"blocked"]"#, "id").unwrap(), Some(false));
+        assert_eq!(parse_relay_ack(r#"["OK","other",true,""]"#, "id").unwrap(), None);
+        assert_eq!(parse_relay_ack(r#"["NOTICE","slow down"]"#, "id").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn relay_only_counts_positive_ack() {
+        let (url, server) = relay(true).await;
+        assert_eq!(RelayPool::new(vec![url]).publish(&event_with_content("ok".into())).await.unwrap(), 1);
+        assert_eq!(server.await.unwrap(), 1);
+
+        let (url, server) = relay(false).await;
+        let error = RelayPool::new(vec![url]).publish(&event_with_content("no".into())).await.unwrap_err().to_string();
+        assert!(error.contains("blocked"), "{error}");
+        assert_eq!(server.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_event_opens_no_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("ws://{}", listener.local_addr().unwrap());
+        let error = RelayPool::new(vec![address]).publish(&event_with_content("x".repeat(MAX_NOSTR_EVENT_BYTES))).await.unwrap_err();
+        assert!(matches!(error, NostrError::EventTooLarge { .. }));
+        assert!(tokio::time::timeout(Duration::from_millis(100), listener.accept()).await.is_err());
     }
 }
 

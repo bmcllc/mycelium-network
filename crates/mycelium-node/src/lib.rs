@@ -49,6 +49,10 @@ pub struct DaemonOptions {
     /// `None` = auto (folha/floresta); `Some` = forçar on/off.
     pub nostr_transport: Option<bool>,
     pub nostr_relay: Option<String>,
+    /// Allowlist de peers licenciados (VOID-00); ativa o gate de admissão
+    /// licenciada. Req. feature `license`.
+    #[cfg(feature = "license")]
+    pub licensed_peers: Option<std::collections::HashSet<String>>,
 }
 
 impl Default for DaemonOptions {
@@ -72,6 +76,8 @@ impl Default for DaemonOptions {
             webrtc_port: 4002,
             nostr_transport: None,
             nostr_relay: None,
+            #[cfg(feature = "license")]
+            licensed_peers: None,
         }
     }
 }
@@ -101,6 +107,8 @@ pub async fn run_daemon(home: PathBuf, opts: DaemonOptions) -> Result<(), Organi
         webrtc_port: opts.webrtc_port,
         nostr_transport: opts.nostr_transport,
         nostr_relay: opts.nostr_relay,
+        #[cfg(feature = "license")]
+        licensed_peers: opts.licensed_peers,
     })?;
     let sock = organism.home().join("mycelium.sock");
     let mut token = std::env::var("MYCELIUM_CONTROL_TOKEN")

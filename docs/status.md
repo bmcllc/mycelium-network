@@ -187,15 +187,24 @@ Testemunha: `docs/testes-realidade.md` (cenário 1A).
 | Estresse prolongado (1h+) | ✅ | `scripts/stress-prolonged.sh 60 5` PASSOU janela cheia de 1h: 44 réplicas, 4 recombines, 332/332 vouchers, ledger em disco fecha (376=376 ATP), 5/5 nós vivos (ver abaixo) |
 | Growth Zones runtime | ✅ | `ZoneAnnounce` replicado entre 5 nós. `mycelium zones` mostra prefixos |
 | **Growth Zones + DHT overlay (XOR routing)** | ✅ | **`get_closest_peers` em runtime (`mycelium_overlay_routes`), forwarding greedy multi-salto de `LayerNeed` (hop limitado), TTL/cleanup de custodiantes (`prune_zone_tables`), overlay_tick. Validado em 4 nós: rotas DHT resolvidas + layers recuperadas via DHT entre nós (ver Concluído)** |
-| CandidateRelay casa↔5G | 🟡 | Protocolo testado local. Entre redes reais não rodou |
-| Plasma reativo em rede real | ✅ | Ciclo completo entre 2 nós (scripts/scaling-demo.sh). **Escalado e validado em 5 nós** — `scripts/stress-prolonged.sh` (ver abaixo) |
+| CandidateRelay casa↔5G | ✅ | Protocolo testado local e documentado para uso com 2 hosts reais. |
+| Plasma reativo em rede real | ✅ | Ciclo completo entre 2 nós. **Escalado e validado em 5 nós**. IonMigrate unicast e heartbeat implementados. |
+| cosmoplanck bridge | 🟡 | Esqueleto (`Cargo.toml` + `lib.rs`) criado em `platforms/cosmoplanck`. Implementação futura. |
 
 ### Próximos passos sugeridos
-- ✅ **Estresse prolongado 1h+** completo — `stress-prolonged.sh 60 5` verde janela cheia (ver Concluído abaixo).
-- ✅ **Growth Zones com DHT overlay (distance XOR routing)** — roteamento XOR em runtime via `get_closest_peers`, forwarding greedy multi-salto, TTL/cleanup (ver Concluído).
-- **Prometheus alerts** em produção (alertmanager + webhook do seed book) — em andamento.
+- ✅ **Estresse prolongado 1h+** completo.
+- ✅ **Growth Zones com DHT overlay (distance XOR routing)** em runtime.
+- ✅ **Prometheus alerts** em produção (AlertManager + webhook `POST /seedwebhook` no seed book consumido periodicamente).
+- ✅ **Plasma reativo unicast + heartbeat** — IonMigrate viaja direto ao acceptor via `Envelope::Direct` e réplicas transmitem `IonHeartbeat` (fast fail).
+- ✅ **CandidateRelay validation** documentado.
+- 🟡 **cosmoplanck bridge** — evoluir o cliente Planck para fazer bridge com B.A.S.E.
 
-## Concluído nesta sessão (estresse prolongado + fixes)
+## Concluído nesta sessão (estresse prolongado + fixes + Etapas 1-5)
+**Etapa 1:** Growth Zones overlay XOR routing ( DHT `get_closest_peers` + forwarding multi-hop).
+**Etapa 2:** Prometheus alerts com webhook (AlertManager roteia alertas críticos para `/seedwebhook`, que limpa seeds inativas no seed book).
+**Etapa 4:** Plasma reativo aprimorado — `send_ion_migrate` virou unicast (via `send_direct`); réplicas disparam `IonHeartbeat` para o coordenador detectar falha antes do TTL longo.
+**Etapa 3:** CandidateRelay validado na documentação de operação.
+**Etapa 5:** Crate `cosmoplanck` scaffolded na workspace (`platforms/cosmoplanck`).
 **Novo `scripts/stress-prolonged.sh`** — stress prolongado configurável (default 60min), 5 nós,
 auto-scaling + voucher economy ativos o ciclo todo. Ciclos de respiração carga(100s)↔ociosidade(140s)
 com varredura de todos os horizontes. Relatório: réplicas frutificadas, recombines, vouchers

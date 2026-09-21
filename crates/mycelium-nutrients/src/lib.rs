@@ -37,6 +37,8 @@ pub enum NutrientError {
     BadSignature(#[from] ed25519_dalek::SignatureError),
     #[error("voucher já resgatado (replay)")]
     Replayed,
+    #[error("voucher: invoice BOLT11 inválido (Lightning não validou)")]
+    InvalidBolt11,
 }
 
 /// Motivo económico de uma transferência (mapeia as fases do lastro).
@@ -169,6 +171,8 @@ struct VoucherPayload<'a> {
     amount: u64,
     memo: &'a str,
     clock: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bolt11: Option<&'a str>,
 }
 
 /// Voucher de liquidação: o **pagador** assina a transferência de nutrientes
@@ -188,6 +192,10 @@ pub struct Voucher {
     pub payer_key: [u8; 32],
     /// Assinatura ed25519 sobre o payload canônico.
     pub signature: Vec<u8>,
+    /// Invoice BOLT11 (Lightning) opcional — quando presente, o resgate exige
+    /// e valida o invoice antes de creditar (economia voucher autenticada por
+    /// Lightning). Coberto pela assinatura ed25519 (não-repudiável).
+    pub bolt11: Option<String>,
 }
 
 impl Voucher {
@@ -200,6 +208,7 @@ impl Voucher {
             amount: self.amount,
             memo: &self.memo,
             clock: self.clock,
+            bolt11: self.bolt11.as_deref(),
         })
         .unwrap_or_default()
     }
@@ -447,6 +456,15 @@ impl Ledger {
     /// beneficiário e registra o id anti-replay.
     pub fn redeem_voucher(&mut self, voucher: &Voucher) -> Result<(), NutrientError> {
         voucher.verify()?;
+        // **Validação BOLT11**: se o voucher carrega um invoice Lightning, o
+        // resgate exige que ele seja válido antes de creditar (economia voucher
+        // autenticada por Lightning). Sem a feature, o campo vira só memo.
+        #[cfg(feature = "bolt11")]
+        if let Some(inv) = &voucher.bolt11 {
+            if !mycelium_zkp::bolt11::validate_bolt11(inv) {
+                return Err(NutrientError::InvalidBolt11);
+            }
+        }
         let id = voucher.id();
         if self.redeemed.contains(&id) {
             return Err(NutrientError::Replayed);
@@ -599,6 +617,7 @@ mod tests {
             clock: 1_700_000_000,
             payer_key: [0; 32],
             signature: vec![],
+            bolt11: None,
         }
         .sign(signer)
     }
@@ -657,5 +676,38 @@ mod tests {
         v2 = v2.sign(&signer);
         ledger.redeem_voucher(&v2).unwrap();
         assert_eq!(ledger.balance(Nutrient::Atp), 10);
+    }
+
+    #[cfg(feature = "bolt11")]
+    #[test]
+    fn redeem_voucher_with_valid_bolt11_credits() {
+        const INVOICE: &str = "lnbc1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdpl2pkx2ctnv5sxxmmwwd5kgetjypeh2ursdae8g6twvus8g6rfwvs8qun0dfjkxaq9qrsgq357wnc5r2ueh7ck6q93dj32dlqnls087fxdwk8qakdyafkq3yap9us6v52vjjsrvywa6rt52cm9r9zqt8r2t7mlcwspyetp5h2tztugp9lfyql";
+        let signer = test_keys(5);
+        let payee = NodeId::derive(b"host");
+        let mut v = hosting_voucher(&signer, payee);
+        v.bolt11 = Some(INVOICE.into()); // assinado de novo para cobrir o invoice
+        v = v.sign(&signer);
+
+        let mut ledger = Ledger::new();
+        ledger.redeem_voucher(&v).unwrap();
+        assert_eq!(ledger.balance(Nutrient::Atp), 5);
+    }
+
+    #[cfg(feature = "bolt11")]
+    #[test]
+    fn redeem_voucher_with_invalid_bolt11_rejected() {
+        let signer = test_keys(6);
+        let payee = NodeId::derive(b"host");
+        let mut v = hosting_voucher(&signer, payee);
+        v.bolt11 = Some("lnbcgibberish-not-real".into());
+        v = v.sign(&signer);
+
+        let mut ledger = Ledger::new();
+        assert!(matches!(
+            ledger.redeem_voucher(&v),
+            Err(NutrientError::InvalidBolt11)
+        ));
+        // Nada foi creditado.
+        assert_eq!(ledger.balance(Nutrient::Atp), 0);
     }
 }

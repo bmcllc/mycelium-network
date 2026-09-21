@@ -37,6 +37,10 @@ lattice — The Lattice Foundry CLI
   lattice plant [opções]        Fase 1: instala nó (folha por default;
                                 --sporocarp com gate de prova + systemd)
 
+  lattice build                  Integração fio-a-fio: seed-code (rede P2P)
+                                → recall-code → B.A.S.E. analyze/synth/prove
+                                (firmware viaja pela rede, sem git)
+
   lattice base <args…>          executa o base-cli direto (analyze, virt, recomp…)
   lattice <cmd mycelium…>       executa o mycelium-cli direto (daemon, sow, status…)
 
@@ -137,6 +141,7 @@ cmd_resurrect() {
 
 case "${1:-}" in
     resurrect) shift; cmd_resurrect "$@" ;;
+    build) shift; exec "$ROOT/scripts/lattice-build.sh" "$@" ;;
     plant) shift; exec "$ROOT/scripts/install-lattice.sh" "$@" ;;
     base) shift; [[ -n "$BASE_BIN" ]] || { echo "erro: base não compilado" >&2; exit 1; }; exec "$BASE_BIN" "$@" ;;
     help|-h|--help|"") usage ;;

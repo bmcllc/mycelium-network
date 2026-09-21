@@ -21,6 +21,9 @@ sha2 = "0.10"
 tracing = { workspace = true }
 url = "2"
 rand = { workspace = true }
+base64 = "0.22"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+mycelium-core = { workspace = true }
+mycelium-sporebank = { workspace = true }

@@ -12,3 +12,9 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 hex = { workspace = true }
 ed25519-dalek = { workspace = true }
+mycelium-zkp = { workspace = true, features = ["bolt11"], optional = true }
+
+[features]
+default = []
+# Validação BOLT11 (Lightning) no resgate de voucher: exige invoice válido.
+bolt11 = ["dep:mycelium-zkp"]

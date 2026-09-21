@@ -14,7 +14,7 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
     command: >
-      daemon -home /home/mycelium/home
+      daemon --home /home/mycelium/home
       --listen /ip4/0.0.0.0/tcp/4000
       --listen /ip6/::/tcp/4000
       --horizon-port 7700
@@ -31,7 +31,7 @@ services:
   mycelium-1:
     image: mycelium-node:latest
     command: >
-      daemon -home /home/mycelium/home
+      daemon --home /home/mycelium/home
       --listen /ip4/0.0.0.0/tcp/4001
       --listen /ip6/::/tcp/4001
       --horizon-port 7701
@@ -45,7 +45,7 @@ services:
   mycelium-2:
     image: mycelium-node:latest
     command: >
-      daemon -home /home/mycelium/home
+      daemon --home /home/mycelium/home
       --listen /ip4/0.0.0.0/tcp/4002
       --listen /ip6/::/tcp/4002
       --horizon-port 7702
@@ -59,7 +59,7 @@ services:
   mycelium-3:
     image: mycelium-node:latest
     command: >
-      daemon -home /home/mycelium/home
+      daemon --home /home/mycelium/home
       --listen /ip4/0.0.0.0/tcp/4003
       --listen /ip6/::/tcp/4003
       --horizon-port 7703
@@ -73,7 +73,7 @@ services:
   mycelium-4:
     image: mycelium-node:latest
     command: >
-      daemon -home /home/mycelium/home
+      daemon --home /home/mycelium/home
       --listen /ip4/0.0.0.0/tcp/4004
       --listen /ip6/::/tcp/4004
       --horizon-port 7704

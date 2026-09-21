@@ -9,7 +9,11 @@
 use giggs::{GiggsError, Mesh, Plot};
 use mycelium_core::ContentId;
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, thiserror::Error)]
 pub enum SporeBankError {
@@ -21,6 +25,8 @@ pub enum SporeBankError {
     Giggs(#[from] GiggsError),
     #[error("esporo {0} não encontrado no banco local")]
     Missing(ContentId),
+    #[error("plot não público: replicação em claro proibida")]
+    NonPublic,
 }
 
 /// Prefixo das chaves DHT do Spore Bank.
@@ -105,15 +111,35 @@ impl SporeBank {
 
     fn save_index(&self) -> Result<(), SporeBankError> {
         let bytes = serde_json::to_vec_pretty(&self.index)?;
-        std::fs::write(self.root.join("index.json"), bytes)?;
+        atomic_write(&self.root.join("index.json"), &bytes)?;
+        Ok(())
+    }
+
+    /// Recarrega entradas gravadas desde que esta instância foi aberta. O daemon
+    /// continua sendo o escritor preferencial, mas isto evita apagar entradas
+    /// antigas ao interoperar com CLIs de versões anteriores.
+    fn refresh_from_disk(&mut self) -> Result<(), SporeBankError> {
+        let path = self.root.join("index.json");
+        if !path.exists() {
+            return Ok(());
+        }
+        let disk: Index = serde_json::from_slice(&std::fs::read(path)?)?;
+        for id in disk.ids {
+            if !self.index.ids.contains(&id) {
+                let bytes = std::fs::read(plot_path(&self.root, &id))?;
+                self.mesh.absorb(&bytes)?;
+                self.index.ids.push(id);
+            }
+        }
         Ok(())
     }
 
     /// Deposita um Plot: grava em disco, atualiza o mesh e devolve o id.
     pub fn deposit(&mut self, plot: Plot) -> Result<ContentId, SporeBankError> {
+        self.refresh_from_disk()?;
         let id = self.mesh.sow(plot)?;
         let bytes = self.mesh.spore_print(&id)?;
-        std::fs::write(plot_path(&self.root, &id), &bytes)?;
+        atomic_write(&plot_path(&self.root, &id), &bytes)?;
         if !self.index.ids.contains(&id) {
             self.index.ids.push(id);
             self.save_index()?;
@@ -123,13 +149,25 @@ impl SporeBank {
 
     /// Absorve bytes de um spore print (vindo de gossip/DHT).
     pub fn absorb(&mut self, bytes: &[u8]) -> Result<ContentId, SporeBankError> {
+        self.refresh_from_disk()?;
         let id = self.mesh.absorb(bytes)?;
-        std::fs::write(plot_path(&self.root, &id), bytes)?;
+        atomic_write(&plot_path(&self.root, &id), bytes)?;
         if !self.index.ids.contains(&id) {
             self.index.ids.push(id);
             self.save_index()?;
         }
         Ok(id)
+    }
+
+    /// Fronteira de entrada da malha: nunca persistir conteúdo marcado como
+    /// restrito recebido por gossip ou pela DHT. Absorb normal continua
+    /// disponível para restauração local feita pelo proprietário.
+    pub fn absorb_public(&mut self, bytes: &[u8]) -> Result<ContentId, SporeBankError> {
+        let plot: Plot = serde_json::from_slice(bytes)?;
+        if !plot.is_public() {
+            return Err(SporeBankError::NonPublic);
+        }
+        self.absorb(bytes)
     }
 
     pub fn recall(&self, id: &ContentId) -> Option<&Plot> {
@@ -138,6 +176,12 @@ impl SporeBank {
 
     pub fn spore_print(&self, id: &ContentId) -> Result<Vec<u8>, SporeBankError> {
         Ok(self.mesh.spore_print(id)?)
+    }
+
+    /// Somente este método deve alimentar a DHT/gossip de Plots.
+    pub fn public_spore_print(&self, id: &ContentId) -> Option<Vec<u8>> {
+        self.recall(id).filter(|plot| plot.is_public())?;
+        self.spore_print(id).ok()
     }
 
     pub fn mesh(&self) -> &Mesh {
@@ -163,6 +207,28 @@ impl SporeBank {
 
 fn plot_path(root: &Path, id: &ContentId) -> PathBuf {
     root.join("plots").join(format!("{}.json", hex::encode(id.0)))
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
+    let seq = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp = path.with_extension(format!("tmp-{}-{seq}", std::process::id()));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)?;
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -224,6 +290,34 @@ mod tests {
         let bytes = a.spore_print(&id).unwrap();
         assert_eq!(b.absorb(&bytes).unwrap(), id);
         assert_eq!(b.recall(&id).unwrap().message, "replicated");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn stale_writer_merges_disk_index_and_same_cid_is_idempotent() {
+        let home = tmp();
+        let mut first = SporeBank::open(&home).unwrap();
+        let mut stale = SporeBank::open(&home).unwrap();
+        let id_a = first.deposit(sample_plot("a")).unwrap();
+        assert_eq!(first.deposit(sample_plot("a")).unwrap(), id_a);
+        let id_b = stale.deposit(sample_plot("b")).unwrap();
+        let reopened = SporeBank::open(&home).unwrap();
+        assert_eq!(reopened.len(), 2);
+        assert!(reopened.recall(&id_a).is_some());
+        assert!(reopened.recall(&id_b).is_some());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn private_plot_remains_local_and_is_rejected_from_gossip() {
+        let home = tmp();
+        let mut a = SporeBank::open(home.join("a")).unwrap();
+        let mut b = SporeBank::open(home.join("b")).unwrap();
+        let id = a.deposit(sample_plot("[private] segredo")).unwrap();
+        assert!(a.public_spore_print(&id).is_none());
+        let raw_local = a.spore_print(&id).unwrap();
+        assert!(matches!(b.absorb_public(&raw_local), Err(SporeBankError::NonPublic)));
+        assert!(b.recall(&id).is_none());
         std::fs::remove_dir_all(&home).ok();
     }
 }

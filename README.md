@@ -66,7 +66,21 @@ Demos: `./scripts/e2e-demo.sh` · `./scripts/horizon-demo.sh` · `./scripts/seed
 # Passthrough: lattice base … (base-cli) e lattice daemon|sow|status… (mycelium-cli)
 ```
 
-Requer binários compilados (`target/release/mycelium` e `Behavioral ASIC Synthesis Engine/target/{release,debug}/base`) ou `LATTICE_MYCELIUM_BIN` / `LATTICE_BASE_BIN`. Home default: `LATTICE_HOME` ou `~/.local/share/mycelium`.
+Requer binários compilados (`target/release/mycelium` e `Behavioral ASIC Synthesis Engine/target/release/base`) ou `LATTICE_MYCELIUM_BIN` / `LATTICE_BASE_BIN`. Home default: `LATTICE_HOME` ou `~/.local/share/mycelium`.
+
+## Código-fonte pela rede (sem git, sem GitHub)
+
+```bash
+# Semeia um diretório inteiro (recursivo) com visibilidade
+mycelium --home ~/n1 seed-code --path ./meu-app --name meu-app \
+  --description "app beta" --ion webapp --visibility public   # public|private|reserved|archived|community
+
+# Em outro nó, baixa o código (replica via gossip/SporePrint em segundos)
+mycelium --home ~/n2 recall-code --plot Qm…            # extrai em ./meu-app (CWD do CLI)
+mycelium --home ~/n2 recall-code --plot Qm… --output /tmp/x   # destino explícito
+
+# privado: só o autor baixa; o conteúdo nunca trafega na rede
+```
 
 ## Fluxo ponta a ponta
 
@@ -139,6 +153,31 @@ mycelium --home /tmp/folha-b recall --plot Qm… --hybrid
 ```
 
 Docs: [docs/nostr-qel.md](docs/nostr-qel.md) · voluntário mesh: [docs/candidatos.md](docs/candidatos.md) · ET-COSMIC bridge: [docs/et-cosmic-bridge.md](docs/et-cosmic-bridge.md) · feature CLI `nostr` (default).
+
+## COSMIC — storage + compute + identidade pós-quânticos
+
+Remodela o tríplice *VPS = compute + storage + uptime* em **contratos
+criptográficos**: a confiança sai do hardware e vai pra criptografia.
+Design completo em [docs/cosmic-design.md](docs/cosmic-design.md). Binário
+`cosmic` (crate `cosmic-cli`):
+
+```bash
+# Storage QEL: fragmenta em shards pós-quânticos (3/7), multicanal.
+# --home <nó> distribui os shards na malha Mycelium via Isotope (qualquer peer recupera).
+cosmic put arquivo.bin --k 3 --n 7 --home ~/node-a
+cosmic get Qm0d70b7c78873aafe911f4b5f9313502f5d9a3eb47aac0cdf0817fd2a6fb72140 --out recuperado.bin --home ~/node-b
+
+# Compute verificável: receita determinística → proof re-provável (re-provm).
+# --home <nó> publica proof + input na rede; cosmic verify <proof_id> recupera e re-executa.
+cosmic run --recipe blake3 input.bin --proof proof.json --home ~/node-a
+cosmic verify Qm0d70b7c78873… --home ~/node-b --id Qm0d70b7c78873…   # ✓ re-provm confere
+
+# Identidade portátil: o mesmo --seed deriva a mesma identidade em QUALQUER OS/arch
+cosmic auth spawn --seed 00010203… (e depois cosmic auth sign/verify)
+```
+
+Shards e identidade em `~/.cosmic` (ou `$COSMIC_HOME`).
+
 
 ## Fase tropical / PQC (port ET-COSMIC)
 

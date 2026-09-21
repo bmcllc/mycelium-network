@@ -948,7 +948,6 @@ impl HyphaeNode {
         let discovered = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 use mycelium_nostr::announce_and_discover_session;
-                let mut already: std::collections::HashMap<String, std::time::Instant> = std::collections::HashMap::new();
                 let Ok((_pk, peers)) =
                     announce_and_discover_session(&home_clone, &relay_clone).await
                 else {

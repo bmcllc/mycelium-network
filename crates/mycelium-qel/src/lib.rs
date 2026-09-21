@@ -9,7 +9,6 @@ pub use topological::{
     annihilate, topological_charge, verify_topological_invariant, TopologicalCharge,
 };
 
-use blake3;
 use mycelium_ghostid::GhostId;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -34,8 +33,14 @@ pub enum QelError {
     PayloadTooLarge,
 }
 
-/// Limite alinhado à mailbox DHT / eventos Nostr (~64 KiB).
+/// Guarda superior do payload original. O transporte Nostr aplica depois seu
+/// limite definitivo sobre o frame WebSocket `EVENT` completamente serializado.
 pub const MAX_SHARD_PAYLOAD: usize = 64 * 1024;
+
+/// Cabeçalho do ShareWire compacto: magic, versão, índice, k, n e flags.
+pub const COMPACT_SHARE_WIRE_HEADER_LEN: usize = 8;
+const COMPACT_SHARE_WIRE_MAGIC: &[u8; 3] = b"QSW";
+const COMPACT_SHARE_WIRE_VERSION: u8 = 1;
 
 /// Transporte sugerido para o shard (backends físicos ficam para fases futuras).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,15 +143,14 @@ pub fn fragment(
     for (i, share) in shares.into_iter().enumerate() {
         let ghost = GhostId::spawn_quick(config.ttl_secs)?;
         let index = share.index;
-        let payload = serde_json::to_vec(&ShareWire {
+        let payload = encode_share_wire(&ShareWire {
             index: share.index,
             data: share.data.clone(),
             threshold: share.threshold,
             total_shares: share.total_shares,
             integrity_check: share.integrity_check,
             compression: share.compression,
-        })
-        .map_err(|e| QelError::Shamir(e.to_string()))?;
+        });
         drop(share);
 
         if payload.len() > MAX_SHARD_PAYLOAD {
@@ -197,17 +201,28 @@ pub fn reconstruct(shards: &[QelShard]) -> Result<Vec<u8>, QelError> {
     }
 
     let threshold = shards[0].threshold as usize;
+    let total = shards[0].total;
     let nonce = shards[0].nonce;
     let content_id = &shards[0].content_id;
     let content_hash = shards[0].content_hash;
 
     if !shards
         .iter()
-        .all(|s| s.nonce == nonce && s.content_id == *content_id && s.content_hash == content_hash)
+        .all(|s| s.nonce == nonce
+            && s.content_id == *content_id
+            && s.content_hash == content_hash
+            && s.threshold as usize == threshold
+            && s.total == total
+            && s.index > 0
+            && s.index <= total)
     {
         return Err(QelError::MismatchedShards);
     }
 
+    let distinct = shards.iter().map(|s| s.index).collect::<std::collections::HashSet<_>>();
+    if distinct.len() != shards.len() {
+        return Err(QelError::MismatchedShards);
+    }
     if shards.len() < threshold {
         return Err(QelError::InsufficientShards {
             have: shards.len(),
@@ -217,8 +232,10 @@ pub fn reconstruct(shards: &[QelShard]) -> Result<Vec<u8>, QelError> {
 
     let mut shares = Vec::with_capacity(threshold);
     for s in shards.iter().take(threshold) {
-        let wire: ShareWire = serde_json::from_slice(&s.payload)
-            .map_err(|e| QelError::Shamir(e.to_string()))?;
+        let wire = decode_share_wire(&s.payload)?;
+        if wire.index != s.index || wire.threshold != s.threshold || wire.total_shares != s.total {
+            return Err(QelError::MismatchedShards);
+        }
         shares.push(shamir_share::Share {
             index: wire.index,
             data: wire.data,
@@ -245,6 +262,40 @@ struct ShareWire {
     total_shares: u8,
     integrity_check: bool,
     compression: bool,
+}
+
+fn encode_share_wire(wire: &ShareWire) -> Vec<u8> {
+    let mut out = Vec::with_capacity(COMPACT_SHARE_WIRE_HEADER_LEN + wire.data.len());
+    out.extend_from_slice(COMPACT_SHARE_WIRE_MAGIC);
+    out.push(COMPACT_SHARE_WIRE_VERSION);
+    out.push(wire.index);
+    out.push(wire.threshold);
+    out.push(wire.total_shares);
+    out.push(u8::from(wire.integrity_check) | (u8::from(wire.compression) << 1));
+    out.extend_from_slice(&wire.data);
+    out
+}
+
+fn decode_share_wire(payload: &[u8]) -> Result<ShareWire, QelError> {
+    if payload.starts_with(COMPACT_SHARE_WIRE_MAGIC) {
+        if payload.len() < COMPACT_SHARE_WIRE_HEADER_LEN
+            || payload[3] != COMPACT_SHARE_WIRE_VERSION
+        {
+            return Err(QelError::Shamir("ShareWire compacto inválido ou não suportado".into()));
+        }
+        let flags = payload[7];
+        return Ok(ShareWire {
+            index: payload[4],
+            threshold: payload[5],
+            total_shares: payload[6],
+            integrity_check: flags & 1 != 0,
+            compression: flags & 2 != 0,
+            data: payload[COMPACT_SHARE_WIRE_HEADER_LEN..].to_vec(),
+        });
+    }
+    // Compatibilidade com eventos QEL v0, cujo ShareWire era JSON e `data`
+    // era serializado como um array de números.
+    serde_json::from_slice(payload).map_err(|e| QelError::Shamir(e.to_string()))
 }
 
 fn assign_diverse_transports(total: u8) -> Vec<TransportHint> {
@@ -332,6 +383,15 @@ mod tests {
     }
 
     #[test]
+    fn mixed_or_duplicate_shards_are_rejected() {
+        let cfg = QelConfig { threshold: 3, total: 5, ttl_secs: 3600 };
+        let a = fragment(b"plot-a", "Qma", &cfg).unwrap();
+        let b = fragment(b"plot-b", "Qmb", &cfg).unwrap();
+        assert!(matches!(reconstruct(&[a[0].clone(), a[1].clone(), b[2].clone()]), Err(QelError::MismatchedShards)));
+        assert!(matches!(reconstruct(&[a[0].clone(), a[0].clone(), a[1].clone()]), Err(QelError::MismatchedShards)));
+    }
+
+    #[test]
     fn hybrid_hints_split_nostr_ipfs() {
         let cfg = QelConfig {
             threshold: 3,
@@ -345,5 +405,19 @@ mod tests {
         assert!(shards[3..]
             .iter()
             .all(|s| s.transport == TransportHint::Ipfs));
+    }
+
+    #[test]
+    fn compact_share_wire_has_fixed_overhead_and_legacy_still_reconstructs() {
+        let cfg = QelConfig { threshold: 3, total: 5, ttl_secs: 3600 };
+        let mut shards = fragment(b"legacy-compatible", "Qmlegacy", &cfg).unwrap();
+        assert!(shards.iter().all(|s| s.payload.starts_with(COMPACT_SHARE_WIRE_MAGIC)));
+        assert!(shards.iter().all(|s| s.payload.len() > COMPACT_SHARE_WIRE_HEADER_LEN));
+
+        for shard in &mut shards[..3] {
+            let wire = decode_share_wire(&shard.payload).unwrap();
+            shard.payload = serde_json::to_vec(&wire).unwrap();
+        }
+        assert_eq!(reconstruct(&shards[..3]).unwrap(), b"legacy-compatible");
     }
 }

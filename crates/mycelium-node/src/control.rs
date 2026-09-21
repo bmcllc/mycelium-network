@@ -33,6 +33,11 @@ pub enum Request {
         #[serde(default)]
         recipient: Option<String>,
     },
+    /// Importa um spore print pelo escritor único do daemon.
+    ImportSpore {
+        spore_print_base64: String,
+        expected_plot: String,
+    },
     Signal {
         plot: String,
         quorum: usize,
@@ -169,15 +174,51 @@ pub enum Request {
         name: String,
         description: String,
         ion: String,
+        visibility: String,
         /// Arquivos: (caminho, conteúdo em base64).
         files: Vec<(String, String)>,
     },
     /// Baixa código-fonte da rede via ContentId.
     RecallCode {
         plot: String,
+        /// Diretório absoluto de destino (default: nome derivado da mensagem do plot).
+        #[serde(default)]
+        output_dir: Option<String>,
     },
     /// Lista repositórios anunciados via gossipsub por peers da rede.
     Repos,
+    /// Verifica uma licença VOID-00 (ML-DSA-87 + device binding).
+    #[cfg(feature = "license")]
+    VerifyLicense {
+        /// Chave pública do vendor (2592 bytes, hex).
+        vendor_public_key: String,
+        /// Entropia do dispositivo (hex).
+        device_entropy: String,
+        /// SKU do produto (ex: "SKU-A-ENTIDADE-PRO").
+        sku: String,
+        /// Payload canónico da licença (hex, 121 bytes).
+        license_payload: String,
+        /// Assinatura ML-DSA-87 (hex, 4627 bytes).
+        signature: String,
+        /// Timestamp Unix em segundos.
+        unix_now_secs: u64,
+        /// **Auto-release**: se presente, e a verificação passar, este PeerId é
+        /// inscrito na allowlist de admissão licenciada (gate passa a aceitá-lo).
+        peer_id: Option<String>,
+    },
+    /// Inscreve um PeerId na allowlist de admissão licenciada (runtime).
+    /// Requer feature `license`.
+    #[cfg(feature = "license")]
+    RegisterLicensedPeer {
+        /// PeerId do nó a autorizar.
+        peer_id: String,
+    },
+    /// Valida um invoice BOLT11 (Lightning) e devolve resumo. Requer feature `bolt11`.
+    #[cfg(feature = "bolt11")]
+    Bolt11Validate {
+        /// Invoice BOLT11 (string completa `lnbc...`).
+        bolt11: String,
+    },
     Shutdown,
 }
 

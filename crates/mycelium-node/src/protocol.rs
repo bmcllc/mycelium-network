@@ -107,6 +107,13 @@ pub enum Envelope {
         ion: String,
         membrane: String,
     },
+    /// Heartbeat de réplica viva: anuncia "ainda estou servindo este ion".
+    /// Permite aos pares do ion detectarem réplicas caídas em vez de só pelo
+    /// TTL do `peer_ions` (mais rápido para o Plasma reagir).
+    IonHeartbeat {
+        node_id: NodeId,
+        ion: String,
+    },
     /// Anúncio de repositório — informação pública de onde baixar código-fonte
     /// via Mycelium Network (sem dados sensíveis como IPs ou chaves SSH).
     RepoAnnounce {
@@ -238,6 +245,22 @@ mod tests {
                 assert_eq!(node_id, NodeId::derive(b"node"));
                 assert_eq!(ion, "webapp");
                 assert_eq!(membrane, "floresta");
+            }
+            _ => panic!("tipo errado"),
+        }
+    }
+
+    #[test]
+    fn ion_heartbeat_roundtrip() {
+        let env = Envelope::IonHeartbeat {
+            node_id: NodeId::derive(b"node"),
+            ion: "webapp".into(),
+        };
+        let back = Envelope::decode(&env.encode().unwrap()).unwrap();
+        match back {
+            Envelope::IonHeartbeat { node_id, ion } => {
+                assert_eq!(node_id, NodeId::derive(b"node"));
+                assert_eq!(ion, "webapp");
             }
             _ => panic!("tipo errado"),
         }

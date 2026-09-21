@@ -33,6 +33,8 @@ base64 = "0.22"
 [features]
 default = ["nostr", "nostr-transport"]
 webrtc = ["mycelium-node/webrtc", "mycelium-hyphae/webrtc"]
+license = ["mycelium-node/license"]
+bolt11 = ["mycelium-node/bolt11"]
 nostr = [
     "dep:mycelium-ghostid",
     "dep:mycelium-qel",

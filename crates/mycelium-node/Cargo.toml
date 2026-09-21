@@ -32,14 +32,20 @@ hex = { workspace = true }
 libp2p = { workspace = true }
 axum = { workspace = true }
 base64 = "0.22"
+mycelium-zkp = { workspace = true, features = ["license", "bolt11"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = "3"
+reqwest = { workspace = true }
+axum = { workspace = true }
 
 [features]
 default = []
 webrtc = ["mycelium-hyphae/webrtc"]
+license = ["dep:mycelium-zkp", "mycelium-hyphae/license"]
+# Lightning BOLT11 no runtime (parse/validação de invoice para a economia voucher).
+bolt11 = ["dep:mycelium-zkp", "mycelium-zkp/bolt11", "mycelium-nutrients/bolt11"]
 # Mantido para a CLI activar a mesma feature flag; publish Nostr corre no CLI.
 nostr = []
 nostr-transport = ["mycelium-hyphae/nostr-transport"]
