@@ -8,7 +8,9 @@ use crate::control::{ControlMsg, Request, Response, StatusReport};
 use crate::protocol::Envelope;
 use crate::store::{IonRecord, NodeStore, OrganismState, StoreError};
 use giggs::{Leaf, Plot, RefStore, RefUpdate, SignedRefUpdate};
-use inertia::{Flywheel, Momentum, Thrust, Vector};
+use inertia::{
+    AttestationPayload, AttestationStore, Flywheel, Momentum, SignedAttestation, Thrust, Vector,
+};
 use isotope::{Atom, Nucleus, DEFAULT_RING_SIZE};
 use mycelium_core::{ContentId, FruitingBody, Membrane, NodeId, Nutrient, Resources};
 use mycelium_hyphae::{
@@ -24,7 +26,7 @@ use mycelium_sporebank::{
 use mycelium_tropical::{MyceliumPhase, PhysarumNetwork};
 use plasma::{Charge, Cloud, Ion};
 use singularity::{serve_horizon, EventHorizon, HorizonHandle, HorizonTable, Orbit};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -886,7 +888,7 @@ impl Organism {
                     if let Thrust::Deploy { ref target_ion } = vector.thrust {
                         self.birth_ion(target_ion, &vector.plot.to_string(), name)?;
                     }
-                    self.broadcast_momentum(&vector, &momentum, self.gland.node_id())?;
+                    self.broadcast_momentum(&vector, &momentum, self.gland.node_id(), &work)?;
                     // Oferece Build/Test à rede (Deploy fica no emissor).
                     if !matches!(vector.thrust, Thrust::Deploy { .. }) {
                         let env = Envelope::VectorOffer {
@@ -937,16 +939,89 @@ impl Organism {
         vector: &Vector,
         momentum: &Momentum,
         executor: NodeId,
+        work_dir: &Path,
     ) -> Result<(), OrganismError> {
+        let artifacts = self
+            .build_artifacts
+            .get(&vector.plot)
+            .and_then(|archive| archive.encode().ok())
+            .map(|bytes| vec![ContentId::of(&bytes)])
+            .unwrap_or_default();
+        let payload = AttestationPayload {
+            input: vector.plot,
+            thrust: vector.thrust.clone(),
+            commands: inertia::command_manifest(&vector.thrust, work_dir),
+            environment: BTreeMap::from([
+                ("arch".into(), std::env::consts::ARCH.into()),
+                (
+                    "isolation".into(),
+                    if inertia::is_sandbox_available() {
+                        "bubblewrap"
+                    } else {
+                        "local-policy"
+                    }
+                    .into(),
+                ),
+                ("os".into(), std::env::consts::OS.into()),
+            ]),
+            executor,
+            success: momentum.success,
+            atp_earned: momentum.atp_earned,
+            log_digest: ContentId::of(momentum.log.as_bytes()),
+            artifacts,
+        };
+        let attestation = SignedAttestation::sign(payload, &self.ghost)
+            .map_err(|e| OrganismError::Msg(e.to_string()))?;
+        AttestationStore::open(self.home.join("attestations"))
+            .and_then(|store| store.persist(&attestation))
+            .map_err(|e| OrganismError::Msg(e.to_string()))?;
         let env = Envelope::MomentumReport {
             vector: vector.clone(),
             momentum: momentum.clone(),
             executor,
+            attestation: Some(attestation),
         };
         let _ = self
             .hyphae
             .broadcast_lattice(env.encode().map_err(|e| OrganismError::Msg(e.to_string()))?);
         Ok(())
+    }
+
+    fn validate_momentum_attestation(
+        &self,
+        vector: &Vector,
+        momentum: &Momentum,
+        executor: NodeId,
+        attestation: Option<&SignedAttestation>,
+    ) -> Result<ContentId, OrganismError> {
+        let attestation = attestation
+            .ok_or_else(|| OrganismError::Msg("atestado de Inertia ausente".into()))?;
+        attestation
+            .verify()
+            .map_err(|e| OrganismError::Msg(e.to_string()))?;
+        let payload = &attestation.payload;
+        if payload.input != vector.plot
+            || payload.thrust != vector.thrust
+            || payload.executor != executor
+            || payload.success != momentum.success
+            || payload.atp_earned != momentum.atp_earned
+            || payload.log_digest != ContentId::of(momentum.log.as_bytes())
+        {
+            return Err(OrganismError::Msg(
+                "atestado nao corresponde ao Vector/Momentum recebido".into(),
+            ));
+        }
+        if payload.commands.is_empty()
+            || !payload.environment.contains_key("os")
+            || !payload.environment.contains_key("arch")
+        {
+            return Err(OrganismError::Msg(
+                "atestado nao descreve comandos e ambiente minimos".into(),
+            ));
+        }
+        AttestationStore::open(self.home.join("attestations"))
+            .and_then(|store| store.persist(attestation))
+            .map_err(|e| OrganismError::Msg(e.to_string()))
     }
 
     /// Anuncia layer no DHT + gossip.
@@ -1161,7 +1236,7 @@ impl Organism {
                 "vector remoto executado: {}",
                 momentum.log
             );
-            self.broadcast_momentum(&v, &momentum, self.gland.node_id())?;
+            self.broadcast_momentum(&v, &momentum, self.gland.node_id(), &work)?;
         }
         Ok(())
     }
@@ -1449,6 +1524,7 @@ impl Organism {
                 vector,
                 momentum,
                 executor,
+                attestation,
             } => {
                 tracing::info!(
                     plot = %vector.plot.short(),
@@ -1457,8 +1533,25 @@ impl Organism {
                     "momentum report: {}",
                     momentum.log
                 );
-                // Crédito simbólico no emissor quando o trabalho veio de outro nó.
-                if vector.emitter == self.gland.node_id() && executor != self.gland.node_id() {
+                let attestation_result = self.validate_momentum_attestation(
+                    &vector,
+                    &momentum,
+                    executor,
+                    attestation.as_ref(),
+                );
+                if let Err(error) = &attestation_result {
+                    tracing::warn!(
+                        plot = %vector.plot.short(),
+                        executor = %executor.short(),
+                        %error,
+                        "momentum report rejeitado: atestacao ausente ou invalida"
+                    );
+                }
+                // Crédito simbólico somente após validar e persistir a atestação.
+                if attestation_result.is_ok()
+                    && vector.emitter == self.gland.node_id()
+                    && executor != self.gland.node_id()
+                {
                     self.ledger.feed(
                         Nutrient::Spores,
                         1,

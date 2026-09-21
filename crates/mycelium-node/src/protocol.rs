@@ -4,7 +4,7 @@
 
 use entropy::Shade;
 use giggs::Plot;
-use inertia::{Momentum, Vector};
+use inertia::{Momentum, SignedAttestation, Vector};
 use isotope::Atom;
 use mycelium_core::{ContentId, NodeId, Nutrient};
 use mycelium_nutrients::Voucher;
@@ -35,6 +35,8 @@ pub enum Envelope {
         vector: Vector,
         momentum: Momentum,
         executor: NodeId,
+        #[serde(default)]
+        attestation: Option<SignedAttestation>,
     },
     /// Átomo do Isotope (estado LWW propagado por hifas).
     AtomSync { key: String, atom: Atom },

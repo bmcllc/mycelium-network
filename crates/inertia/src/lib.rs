@@ -8,15 +8,22 @@
 //! materializado a partir das leaves do Plot.
 
 use mycelium_core::{ContentId, NodeId};
+use mycelium_ghostid::GhostId;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
-use std::path::Path;
+use std::collections::{BTreeMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, thiserror::Error)]
 pub enum InertiaError {
     #[error("nenhum vector na fila de momentum")]
     QueueEmpty,
+    #[error("erro de armazenamento da atestacao: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("atestado invalido: {0}")]
+    InvalidAttestation(String),
+    #[error("erro de serializacao: {0}")]
+    Codec(#[from] serde_json::Error),
 }
 
 /// Fase do pipeline que o Vector carrega.
@@ -28,13 +35,118 @@ pub enum Thrust {
 }
 
 /// Unidade de trabalho que viaja pela rede.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Vector {
     /// Plot do Giggs que este Vector processa.
     pub plot: ContentId,
     pub thrust: Thrust,
     /// Nó que emitiu o Vector (para devolver o momentum).
     pub emitter: NodeId,
+}
+
+/// Evidencia reproduzivel que vincula uma execucao ao seu input e resultado.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AttestationPayload {
+    pub input: ContentId,
+    pub thrust: Thrust,
+    pub commands: Vec<String>,
+    pub environment: BTreeMap<String, String>,
+    pub executor: NodeId,
+    pub success: bool,
+    pub atp_earned: u64,
+    pub log_digest: ContentId,
+    pub artifacts: Vec<ContentId>,
+}
+
+/// Assinatura prova autoria do relatorio; nao prova honestidade do executor.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SignedAttestation {
+    pub payload: AttestationPayload,
+    pub signer: String,
+    pub signature: String,
+}
+
+impl SignedAttestation {
+    pub fn sign(payload: AttestationPayload, identity: &GhostId) -> Result<Self, InertiaError> {
+        let bytes = serde_json::to_vec(&payload)?;
+        Ok(Self {
+            payload,
+            signer: identity.nostr_pubkey_hex(),
+            signature: hex::encode(identity.sign(&bytes)),
+        })
+    }
+
+    pub fn verify(&self) -> Result<(), InertiaError> {
+        let pubkey = decode_fixed::<32>(&self.signer, "chave publica")?;
+        let signature = decode_fixed::<64>(&self.signature, "assinatura")?;
+        let bytes = serde_json::to_vec(&self.payload)?;
+        GhostId::verify(&pubkey, &bytes, &signature)
+            .map_err(|_| InertiaError::InvalidAttestation("assinatura rejeitada".into()))
+    }
+}
+
+fn decode_fixed<const N: usize>(value: &str, label: &str) -> Result<[u8; N], InertiaError> {
+    let bytes = hex::decode(value)
+        .map_err(|_| InertiaError::InvalidAttestation(format!("{label} nao e hexadecimal")))?;
+    bytes.try_into().map_err(|v: Vec<u8>| {
+        InertiaError::InvalidAttestation(format!(
+            "{label} deve ter {N} bytes, recebeu {}",
+            v.len()
+        ))
+    })
+}
+
+/// Armazena atestacoes por CID e sempre revalida conteudo e assinatura na leitura.
+pub struct AttestationStore {
+    root: PathBuf,
+}
+
+impl AttestationStore {
+    pub fn open(root: impl Into<PathBuf>) -> Result<Self, InertiaError> {
+        let root = root.into();
+        std::fs::create_dir_all(&root)?;
+        Ok(Self { root })
+    }
+
+    pub fn persist(&self, attestation: &SignedAttestation) -> Result<ContentId, InertiaError> {
+        attestation.verify()?;
+        let bytes = serde_json::to_vec_pretty(attestation)?;
+        let id = ContentId::of(&bytes);
+        let destination = self.root.join(format!("{id}.json"));
+        if !destination.exists() {
+            let temporary = self.root.join(format!(".{id}.tmp"));
+            std::fs::write(&temporary, &bytes)?;
+            std::fs::rename(temporary, destination)?;
+        }
+        Ok(id)
+    }
+
+    pub fn get(&self, id: &ContentId) -> Result<SignedAttestation, InertiaError> {
+        let bytes = std::fs::read(self.root.join(format!("{id}.json")))?;
+        if ContentId::of(&bytes) != *id {
+            return Err(InertiaError::InvalidAttestation(
+                "CID nao corresponde ao conteudo persistido".into(),
+            ));
+        }
+        let attestation: SignedAttestation = serde_json::from_slice(&bytes)?;
+        attestation.verify()?;
+        Ok(attestation)
+    }
+}
+
+/// Comandos efetivamente selecionados para a receita do Vector.
+pub fn command_manifest(thrust: &Thrust, work_dir: &Path) -> Vec<String> {
+    match thrust {
+        Thrust::Build if work_dir.join("build.sh").is_file() => vec!["sh build.sh".into()],
+        Thrust::Build if work_dir.join("Cargo.toml").is_file() => {
+            vec!["cargo build --release".into()]
+        }
+        Thrust::Build => vec!["inertia synthetic-build".into()],
+        Thrust::Test if work_dir.join("test.sh").is_file() => vec!["sh test.sh".into()],
+        Thrust::Test if work_dir.join("Cargo.toml").is_file() => vec!["cargo test".into()],
+        Thrust::Test => vec!["inertia test-skip".into()],
+        Thrust::Deploy { target_ion } => vec![format!("inertia deploy {target_ion}")],
+    }
 }
 
 /// Resultado da execução de um Vector.
@@ -427,6 +539,85 @@ pub fn collect_artifact(work_dir: &Path) -> Option<Vec<(String, Vec<u8>)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_attestation(success: bool) -> (GhostId, SignedAttestation) {
+        let identity = GhostId::spawn_quick(3_600).unwrap();
+        let payload = AttestationPayload {
+            input: ContentId::of(b"source-plot"),
+            thrust: Thrust::Test,
+            commands: vec!["cargo test".into()],
+            environment: BTreeMap::from([
+                ("arch".into(), "x86_64".into()),
+                ("os".into(), "linux".into()),
+            ]),
+            executor: NodeId::derive(identity.nostr_pubkey_hex().as_bytes()),
+            success,
+            atp_earned: if success { 5 } else { 0 },
+            log_digest: ContentId::of(if success { b"ok" } else { b"failed" }),
+            artifacts: vec![ContentId::of(b"artifact")],
+        };
+        let attestation = SignedAttestation::sign(payload, &identity).unwrap();
+        (identity, attestation)
+    }
+
+    #[test]
+    fn signed_attestation_survives_restart_and_detects_tampering() {
+        let dir = std::env::temp_dir().join(format!(
+            "inertia-attestations-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (_, attestation) = test_attestation(true);
+        let id = AttestationStore::open(&dir)
+            .unwrap()
+            .persist(&attestation)
+            .unwrap();
+
+        let reopened = AttestationStore::open(&dir).unwrap();
+        assert_eq!(reopened.get(&id).unwrap(), attestation);
+
+        let path = dir.join(format!("{id}.json"));
+        let mut bytes = std::fs::read(&path).unwrap();
+        let index = bytes.iter().position(|byte| *byte == b'{').unwrap();
+        bytes[index] = b'[';
+        std::fs::write(path, bytes).unwrap();
+        assert!(matches!(
+            reopened.get(&id),
+            Err(InertiaError::InvalidAttestation(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn signature_rejects_a_mutated_payload() {
+        let (_, mut attestation) = test_attestation(true);
+        attestation.payload.success = false;
+        assert!(matches!(
+            attestation.verify(),
+            Err(InertiaError::InvalidAttestation(_))
+        ));
+    }
+
+    #[test]
+    fn command_manifest_matches_the_selected_recipe() {
+        let dir = std::env::temp_dir().join(format!(
+            "inertia-manifest-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("build.sh"), b"#!/bin/sh\n").unwrap();
+        assert_eq!(command_manifest(&Thrust::Build, &dir), ["sh build.sh"]);
+        assert_eq!(
+            command_manifest(&Thrust::Deploy { target_ion: "edge".into() }, &dir),
+            ["inertia deploy edge"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn vectors_spin_in_fifo_order() {
