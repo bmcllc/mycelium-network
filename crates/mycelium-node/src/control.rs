@@ -113,11 +113,23 @@ pub enum Request {
         repository: Option<String>,
         #[serde(default)]
         branch: Option<String>,
+        /// Ponta que o cliente espera substituir. Quando informada, a
+        /// publicação falha se a referência já tiver avançado.
+        #[serde(default)]
+        expected_previous_cid: Option<String>,
         message: String,
         leaves: Vec<giggs::Leaf>,
     },
     /// Reconstrói uma árvore de código a partir de um ContentId.
     RepoClone {
+        cid: String,
+    },
+    /// Executa Build e Test sobre um snapshot exato, sem promover ou fazer deploy.
+    InertiaRun {
+        cid: String,
+    },
+    /// Recupera uma atestação persistida pelo seu ContentId.
+    InertiaAttestation {
         cid: String,
     },
     /// Transfere nutrientes assinados (Micelial Value Layer).
@@ -248,6 +260,17 @@ pub enum Response {
     RepoCloneResult {
         message: String,
         leaves: Vec<giggs::Leaf>,
+    },
+    InertiaRunResult {
+        input_cid: String,
+        build_attestation_cid: String,
+        test_attestation_cid: Option<String>,
+        artifact_cid: Option<String>,
+        success: bool,
+    },
+    InertiaAttestationResult {
+        cid: String,
+        attestation: inertia::SignedAttestation,
     },
     TransferResult {
         tx_id: String,
@@ -577,5 +600,51 @@ mod tests {
     fn auth_ok_strips_field() {
         let req = parse_request_line(r#"{"auth":"secret","cmd":"status"}"#, Some("secret")).unwrap();
         assert!(matches!(req, Request::Status));
+    }
+
+    #[test]
+    fn repo_publish_accepts_optional_expected_previous_cid() {
+        let without_expected = parse_request_line(
+            r#"{"cmd":"repo_publish","message":"initial","leaves":[]}"#,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            without_expected,
+            Request::RepoPublish {
+                expected_previous_cid: None,
+                ..
+            }
+        ));
+
+        let with_expected = parse_request_line(
+            r#"{"cmd":"repo_publish","message":"next","leaves":[],"expected_previous_cid":"Qm0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            with_expected,
+            Request::RepoPublish {
+                expected_previous_cid: Some(cid),
+                ..
+            } if cid.starts_with("Qm0123")
+        ));
+    }
+
+    #[test]
+    fn inertia_requests_are_deserializable() {
+        let run = parse_request_line(
+            r#"{"cmd":"inertia_run","cid":"Qm0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(run, Request::InertiaRun { .. }));
+
+        let query = parse_request_line(
+            r#"{"cmd":"inertia_attestation","cid":"Qmabcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"}"#,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(query, Request::InertiaAttestation { .. }));
     }
 }

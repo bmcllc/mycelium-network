@@ -611,11 +611,31 @@ impl Organism {
         message: String,
         leaves: Vec<giggs::Leaf>,
     ) -> Result<ContentId, OrganismError> {
+        self.publish_repo_ref_expected(repository, branch, None, message, leaves)
+    }
+
+    /// Variante com precondição explícita, usada por integrações que precisam
+    /// provar que publicaram exatamente sobre a revisão homologada.
+    pub fn publish_repo_ref_expected(
+        &mut self,
+        repository: &str,
+        branch: &str,
+        expected_previous: Option<ContentId>,
+        message: String,
+        leaves: Vec<giggs::Leaf>,
+    ) -> Result<ContentId, OrganismError> {
         let refs = RefStore::open(self.home.join("giggs/refs"))
             .map_err(|e| OrganismError::Msg(e.to_string()))?;
         let current = refs.read(repository, branch)
             .map_err(|e| OrganismError::Msg(e.to_string()))?;
         let parent = current.as_ref().map(|value| value.update.target);
+        if expected_previous.is_some() && expected_previous != parent {
+            return Err(OrganismError::Msg(format!(
+                "referência {repository}/{branch} avançou: esperado {:?}, atual {:?}",
+                expected_previous.map(|id| id.to_string()),
+                parent.map(|id| id.to_string()),
+            )));
+        }
         let plot = Plot {
             author: self.gland.node_id(),
             message,
@@ -925,6 +945,73 @@ impl Organism {
         Ok(work)
     }
 
+    fn run_inertia_validation(
+        &mut self,
+        plot: ContentId,
+    ) -> Result<(ContentId, Option<ContentId>, Option<ContentId>, bool), OrganismError> {
+        let work = self.prepare_workbench(&plot)?;
+        let executor = self.gland.node_id();
+        let mut flywheel = Flywheel::new();
+        flywheel.inject(Vector {
+            plot,
+            thrust: Thrust::Build,
+            emitter: executor,
+        });
+
+        let (build_vector, build_momentum) = flywheel
+            .spin(executor, &work)
+            .map_err(|e| OrganismError::Msg(e.to_string()))?;
+        let artifact = if build_momentum.success {
+            let archive = match inertia::collect_artifact(&work) {
+                Some(files) => {
+                    let mut archive = LayerArchive::new();
+                    for (path, bytes) in files {
+                        archive.insert(path, bytes);
+                    }
+                    archive
+                }
+                None => {
+                    let fallback = self
+                        .bank
+                        .spore_print(&plot)
+                        .unwrap_or_else(|_| b"{}".to_vec());
+                    LayerArchive::single("app.payload", fallback)
+                }
+            };
+            let store = LayerStore::open(self.store.layers_dir())
+                .map_err(|e| OrganismError::Msg(e.to_string()))?;
+            let artifact = store
+                .put_archive(&archive)
+                .map_err(|e| OrganismError::Msg(e.to_string()))?;
+            self.build_artifacts.insert(plot, archive);
+            Some(artifact)
+        } else {
+            None
+        };
+        let build_attestation =
+            self.broadcast_momentum(&build_vector, &build_momentum, executor, &work)?;
+        if !build_momentum.success {
+            return Ok((build_attestation, None, None, false));
+        }
+
+        flywheel.inject(Vector {
+            plot,
+            thrust: Thrust::Test,
+            emitter: executor,
+        });
+        let (test_vector, test_momentum) = flywheel
+            .spin(executor, &work)
+            .map_err(|e| OrganismError::Msg(e.to_string()))?;
+        let test_attestation =
+            self.broadcast_momentum(&test_vector, &test_momentum, executor, &work)?;
+        Ok((
+            build_attestation,
+            Some(test_attestation),
+            artifact,
+            test_momentum.success,
+        ))
+    }
+
     fn vector_fingerprint(vector: &Vector) -> String {
         format!(
             "{}:{:?}:{}",
@@ -940,7 +1027,7 @@ impl Organism {
         momentum: &Momentum,
         executor: NodeId,
         work_dir: &Path,
-    ) -> Result<(), OrganismError> {
+    ) -> Result<ContentId, OrganismError> {
         let artifacts = self
             .build_artifacts
             .get(&vector.plot)
@@ -972,7 +1059,7 @@ impl Organism {
         };
         let attestation = SignedAttestation::sign(payload, &self.ghost)
             .map_err(|e| OrganismError::Msg(e.to_string()))?;
-        AttestationStore::open(self.home.join("attestations"))
+        let attestation_id = AttestationStore::open(self.home.join("attestations"))
             .and_then(|store| store.persist(&attestation))
             .map_err(|e| OrganismError::Msg(e.to_string()))?;
         let env = Envelope::MomentumReport {
@@ -984,7 +1071,7 @@ impl Organism {
         let _ = self
             .hyphae
             .broadcast_lattice(env.encode().map_err(|e| OrganismError::Msg(e.to_string()))?);
-        Ok(())
+        Ok(attestation_id)
     }
 
     fn validate_momentum_attestation(
@@ -2593,12 +2680,20 @@ impl Organism {
                     message: format!("erro ao salvar catálogo: {}", e),
                 })
             }
-            Request::RepoPublish { repository, branch, message, leaves } => {
+            Request::RepoPublish { repository, branch, expected_previous_cid, message, leaves } => {
                 let n = leaves.len();
                 let bytes: usize = leaves.iter().map(|l| l.content.len()).sum();
-                match self.publish_repo_ref(
+                let expected_previous = match expected_previous_cid {
+                    Some(value) => match value.parse::<ContentId>() {
+                        Ok(id) => Some(id),
+                        Err(e) => return Response::Err { message: e },
+                    },
+                    None => None,
+                };
+                match self.publish_repo_ref_expected(
                     repository.as_deref().unwrap_or("default"),
                     branch.as_deref().unwrap_or("main"),
+                    expected_previous,
                     message,
                     leaves,
                 ) {
@@ -2632,6 +2727,35 @@ impl Organism {
                             ),
                         }
                     }
+                },
+                Err(e) => Response::Err { message: e },
+            },
+            Request::InertiaRun { cid } => match cid.parse::<ContentId>() {
+                Ok(input) => match self.run_inertia_validation(input) {
+                    Ok((build, test, artifact, success)) => Response::InertiaRunResult {
+                        input_cid: input.to_string(),
+                        build_attestation_cid: build.to_string(),
+                        test_attestation_cid: test.map(|id| id.to_string()),
+                        artifact_cid: artifact.map(|id| id.to_string()),
+                        success,
+                    },
+                    Err(e) => Response::Err {
+                        message: e.to_string(),
+                    },
+                },
+                Err(e) => Response::Err { message: e },
+            },
+            Request::InertiaAttestation { cid } => match cid.parse::<ContentId>() {
+                Ok(id) => match AttestationStore::open(self.home.join("attestations"))
+                    .and_then(|store| store.get(&id))
+                {
+                    Ok(attestation) => Response::InertiaAttestationResult {
+                        cid: id.to_string(),
+                        attestation,
+                    },
+                    Err(e) => Response::Err {
+                        message: e.to_string(),
+                    },
                 },
                 Err(e) => Response::Err { message: e },
             },

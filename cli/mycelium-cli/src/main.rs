@@ -389,6 +389,9 @@ enum RepoCmd {
         /// Branch atualizada por compare-and-swap.
         #[arg(long, default_value = "main")]
         branch: String,
+        /// Publica somente se a branch ainda apontar para este ContentId.
+        #[arg(long)]
+        expected_previous_cid: Option<String>,
         /// Mensagem/descrição do commit (ex.: "v0.1.0 — store P2P").
         #[arg(short, long, default_value = "mycelium-launcher-store")]
         message: String,
@@ -401,6 +404,16 @@ enum RepoCmd {
         /// Diretório de destino da árvore reconstruída.
         #[arg(short, long)]
         dest: PathBuf,
+    },
+    /// Executa Build e Test sobre um ContentId, sem deploy.
+    Validate {
+        #[arg(long)]
+        cid: String,
+    },
+    /// Recupera e verifica uma atestação persistida.
+    Attestation {
+        #[arg(long)]
+        cid: String,
     },
     /// Lista os repos disponíveis no SporeBank local
     List,
@@ -2442,7 +2455,7 @@ async fn store_cmd_async(home: &PathBuf, action: StoreCmd) -> Result<(), String>
 
 async fn repo_cmd(home: &PathBuf, action: RepoCmd) -> Result<(), String> {
     match action {
-        RepoCmd::Publish { dir, repository, branch, message } => {
+        RepoCmd::Publish { dir, repository, branch, expected_previous_cid, message } => {
             if !dir.is_dir() {
                 return Err(format!("diretório não encontrado: {:?}", dir));
             }
@@ -2457,6 +2470,7 @@ async fn repo_cmd(home: &PathBuf, action: RepoCmd) -> Result<(), String> {
             let resp = call(&home.join("mycelium.sock"), Request::RepoPublish {
                 repository,
                 branch: Some(branch),
+                expected_previous_cid,
                 message,
                 leaves,
             }).await?;
@@ -2504,6 +2518,61 @@ async fn repo_cmd(home: &PathBuf, action: RepoCmd) -> Result<(), String> {
                         )),
                     }
                 }
+            }
+        }
+        RepoCmd::Validate { cid } => {
+            let resp = call(
+                &home.join("mycelium.sock"),
+                Request::InertiaRun { cid: cid.clone() },
+            )
+            .await?;
+            match resp {
+                Response::InertiaRunResult {
+                    input_cid,
+                    build_attestation_cid,
+                    test_attestation_cid,
+                    artifact_cid,
+                    success,
+                } => {
+                    println!("[🍄 Inertia] CID de entrada       : {input_cid}");
+                    println!("[🍄 Inertia] Atestação de build  : {build_attestation_cid}");
+                    if let Some(cid) = test_attestation_cid {
+                        println!("[🍄 Inertia] Atestação de teste  : {cid}");
+                    }
+                    if let Some(cid) = artifact_cid {
+                        println!("[🍄 Inertia] Artefato             : {cid}");
+                    }
+                    if success {
+                        println!("[🍄 Inertia] ✅ Build e testes aprovados");
+                        Ok(())
+                    } else {
+                        Err("validação Inertia reprovada; as atestações foram preservadas".into())
+                    }
+                }
+                Response::Err { message } => Err(message),
+                other => Err(format!("resposta inesperada: {:?}", other)),
+            }
+        }
+        RepoCmd::Attestation { cid } => {
+            let resp = call(
+                &home.join("mycelium.sock"),
+                Request::InertiaAttestation { cid: cid.clone() },
+            )
+            .await?;
+            match resp {
+                Response::InertiaAttestationResult { cid, attestation } => {
+                    attestation
+                        .verify()
+                        .map_err(|e| format!("atestação {cid} inválida: {e}"))?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&attestation)
+                            .map_err(|e| format!("serializar atestação: {e}"))?
+                    );
+                    Ok(())
+                }
+                Response::Err { message } => Err(message),
+                other => Err(format!("resposta inesperada: {:?}", other)),
             }
         }
         RepoCmd::List => {
