@@ -44,9 +44,40 @@ impl ExitPolicyValidator {
                 || (octets[0] == 100 && (64..=127).contains(&octets[1]))
                 // 0.0.0.0/8 (Current network)
                 || octets[0] == 0
+                // 192.0.0.0/24 (IETF Protocol Assignments)
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+                // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 (Documentation)
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+                || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+                // 198.18.0.0/15 (Benchmarking)
+                || (octets[0] == 198 && (18..=19).contains(&octets[1]))
+                // 224.0.0.0/4 (Multicast e Reservado)
+                || octets[0] >= 224
             }
             IpAddr::V6(v6) => {
+                let segments = v6.segments();
+                let octets = v6.octets();
+
+                // IPv4-mapped IPv6 (::ffff:0:0/96)
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    return Self::is_private_or_restricted(&IpAddr::V4(v4));
+                }
+
+                // ::1 (Loopback) ou :: (Unspecified)
                 v6.is_loopback() || v6.is_unspecified()
+                // fc00::/7 (Unique Local Addresses - ULA / Private)
+                || (octets[0] & 0xfe) == 0xfc
+                // fe80::/10 (Link-Local Unicast)
+                || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
+                // fec0::/10 (Site-Local deprecated)
+                || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0xc0)
+                // ff00::/8 (Multicast)
+                || octets[0] == 0xff
+                // 2001:db8::/32 (Documentation)
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                // 100::/64 (Discard-only)
+                || (segments[0] == 0x0100 && segments[1] == 0)
             }
         }
     }
@@ -76,10 +107,9 @@ impl ExitPolicyValidator {
         if self.policy.block_private_networks {
             if let Socks5Target::Ip(addr) = target {
                 if Self::is_private_or_restricted(&addr.ip()) {
-                    return Err(VeilError::Exit(format!(
-                        "Acesso a redes privadas/internas ({}) proibido (proteção anti-SSRF)",
-                        addr.ip()
-                    )));
+                    return Err(VeilError::Exit(
+                        "Acesso a redes privadas/internas proibido (proteção anti-SSRF)".into()
+                    ));
                 }
             }
         }
@@ -109,21 +139,45 @@ impl ExitForwarder {
     pub async fn connect_to_target(&self, target: &Socks5Target) -> Result<TcpStream, VeilError> {
         self.validator.validate_target(target)?;
 
-        let target_str = target.to_target_string();
-        tracing::info!(target = %target_str, "Nó Exit estabelecendo conexão de saída");
+        let connect_addr = match target {
+            Socks5Target::Ip(addr) => {
+                if self.validator.policy.block_private_networks && ExitPolicyValidator::is_private_or_restricted(&addr.ip()) {
+                    return Err(VeilError::Exit("Acesso a endereço IP privado/restrito proibido (anti-SSRF)".into()));
+                }
+                *addr
+            }
+            Socks5Target::Domain(domain, port) => {
+                // Valida antes de conectar: resolução DNS remota no Exit
+                let resolved_addrs = tokio::net::lookup_host((domain.as_str(), *port))
+                    .await
+                    .map_err(|e| VeilError::Exit(format!("Falha na resolução remota de DNS: {e}")))?;
 
-        let stream = TcpStream::connect(&target_str)
+                let mut chosen = None;
+                for addr in resolved_addrs {
+                    if self.validator.policy.block_private_networks && ExitPolicyValidator::is_private_or_restricted(&addr.ip()) {
+                        return Err(VeilError::Exit("Domínio resolve para rede privada/restrita; abortado por proteção anti-SSRF".into()));
+                    }
+                    if chosen.is_none() {
+                        chosen = Some(addr);
+                    }
+                }
+
+                chosen.ok_or_else(|| VeilError::Exit("Nenhum endereço resolvido para o domínio".into()))?
+            }
+        };
+
+        // Log sem dados identificáveis de tráfego de navegação (Zero Logging)
+        tracing::debug!("Nó Exit abrindo conexão de saída autorizada");
+
+        let stream = TcpStream::connect(connect_addr)
             .await
-            .map_err(|e| VeilError::Exit(format!("Falha ao conectar no destino `{target_str}`: {e}")))?;
+            .map_err(|e| VeilError::Exit(format!("Falha ao conectar no destino remoto: {e}")))?;
 
-        // Se conectou por domínio, valida se o IP resolvido é público
+        // Dupla validação pós-conexão para prevenir race conditions de DNS rebinding
         if self.validator.policy.block_private_networks {
-            if let Ok(peer_addr) = stream.peer_addr() {
-                if ExitPolicyValidator::is_private_or_restricted(&peer_addr.ip()) {
-                    return Err(VeilError::Exit(format!(
-                        "Destino `{target_str}` resolveu para IP privado ({}); conexão abortada",
-                        peer_addr.ip()
-                    )));
+            if let Ok(peer) = stream.peer_addr() {
+                if ExitPolicyValidator::is_private_or_restricted(&peer.ip()) {
+                    return Err(VeilError::Exit("Conexão estabelecida com IP privado; abortada por anti-SSRF".into()));
                 }
             }
         }

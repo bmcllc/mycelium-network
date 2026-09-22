@@ -12,6 +12,15 @@ pub const CELL_HEADER_LEN: usize = 9;
 /// Tamanho máximo do payload de dados em uma única célula (512 - 9 = 503 bytes).
 pub const MAX_PAYLOAD_LEN: usize = CELL_SIZE - CELL_HEADER_LEN;
 
+/// Overhead criptográfico AEAD (ChaCha20Poly1305) por salto (12 bytes nonce + 16 bytes Poly1305 tag).
+pub const ONION_OVERHEAD_PER_HOP: usize = 28;
+
+/// Número máximo de saltos em circuitos padrão do Veil.
+pub const MAX_CIRCUIT_HOPS: usize = 3;
+
+/// Limite máximo seguro de dados úteis de aplicação por célula para acomodar até 3 saltos de cifra em camadas.
+pub const MAX_STREAM_DATA_CHUNK: usize = 400;
+
 /// Comandos suportados pelo protocolo de células Veil.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -28,6 +37,20 @@ pub enum CellCommand {
     Padding = 0x05,
     /// Reconhecimento (Ack) de fluxo ou batimento de coração.
     Heartbeat = 0x06,
+    /// Estende o circuito para o próximo salto (telescoping).
+    Extend = 0x07,
+    /// Confirmação de extensão de circuito.
+    Extended = 0x08,
+    /// Abertura de fluxo para um destino remoto no nó Exit.
+    StreamBegin = 0x10,
+    /// Confirmação de conexão com o destino remoto estabelecida pelo nó Exit.
+    StreamConnected = 0x11,
+    /// Recusa de conexão pelo nó Exit (anti-SSRF, DNS falhou ou host inalcançável).
+    StreamRefused = 0x12,
+    /// Dados bidirecionais de um fluxo ativo.
+    StreamData = 0x13,
+    /// Encerramento de um fluxo ativo.
+    StreamEnd = 0x14,
 }
 
 impl TryFrom<u8> for CellCommand {
@@ -41,6 +64,13 @@ impl TryFrom<u8> for CellCommand {
             0x04 => Ok(CellCommand::Destroy),
             0x05 => Ok(CellCommand::Padding),
             0x06 => Ok(CellCommand::Heartbeat),
+            0x07 => Ok(CellCommand::Extend),
+            0x08 => Ok(CellCommand::Extended),
+            0x10 => Ok(CellCommand::StreamBegin),
+            0x11 => Ok(CellCommand::StreamConnected),
+            0x12 => Ok(CellCommand::StreamRefused),
+            0x13 => Ok(CellCommand::StreamData),
+            0x14 => Ok(CellCommand::StreamEnd),
             other => Err(format!("Comando de célula desconhecido: 0x{other:02x}")),
         }
     }

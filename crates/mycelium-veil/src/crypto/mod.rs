@@ -1,7 +1,7 @@
 //! Criptografia em camadas pós-quântica e rotinas Sphinx para o Mycelium VEIL Ω.
 
 pub mod cell;
-pub use cell::{CellCommand, VeilCell, CELL_SIZE, MAX_PAYLOAD_LEN};
+pub use cell::{CellCommand, VeilCell, CELL_SIZE, MAX_PAYLOAD_LEN, MAX_STREAM_DATA_CHUNK};
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -156,12 +156,21 @@ pub fn onion_encrypt_layers(
     Ok(current)
 }
 
-/// Decifra uma camada de cebola em um nó intermediário.
+/// Decifra uma camada de cebola em um nó intermediário (sentido forward).
 pub fn onion_peel_layer(
     layer_data: &[u8],
     keys: &HopKeys,
 ) -> Result<Vec<u8>, CryptoError> {
     let mut cipher = HopCipher::new(&keys.forward_key);
+    cipher.decrypt(layer_data)
+}
+
+/// Decifra uma camada de cebola no cliente (sentido backward).
+pub fn onion_peel_layer_backward(
+    layer_data: &[u8],
+    keys: &HopKeys,
+) -> Result<Vec<u8>, CryptoError> {
+    let mut cipher = HopCipher::new(&keys.backward_key);
     cipher.decrypt(layer_data)
 }
 

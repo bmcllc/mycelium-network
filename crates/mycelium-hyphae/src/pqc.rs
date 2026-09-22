@@ -161,8 +161,24 @@ impl Transport for PqcTransport {
                             Ok(s) => s,
                             Err(_) => continue,
                         };
-                        // Vincula o segredo pós-quântico compartilhado à transcrição da sessão
-                        let _session_key = derive_pqc_session_key(&ss, b"mycelium-pqc-accept-transcript-v1");
+                        // Vincula o segredo pós-quântico compartilhado à transcrição simétrica da sessão
+                        let session_key = derive_pqc_session_key(&ss, b"mycelium-pqc-v1-hybrid-transcript");
+                        let mut client_auth = [0u8; 32];
+                        if stream.read_exact(&mut client_auth).await.is_err() {
+                            continue;
+                        }
+                        let expected_client_auth = blake3::keyed_hash(&session_key, b"mycelium-pqc-client-auth");
+                        if client_auth != *expected_client_auth.as_bytes() {
+                            tracing::warn!("handshake PQC: falha na autenticação do cliente");
+                            continue;
+                        }
+                        let server_auth = blake3::keyed_hash(&session_key, b"mycelium-pqc-server-auth");
+                        if stream.write_all(server_auth.as_bytes()).await.is_err() {
+                            continue;
+                        }
+                        if stream.flush().await.is_err() {
+                            continue;
+                        }
                         let peer_maddr = Multiaddr::empty()
                             .with(Protocol::Tcp(peer_addr.port()));
                         let _ = tx.unbounded_send((stream, peer_maddr));
@@ -207,10 +223,21 @@ impl Transport for PqcTransport {
                 .map_err(|e| PqcTransportError::Msg(e.to_string()))?;
             let enc = mlkem_encapsulate(&peer_pk)
                 .map_err(|e| PqcTransportError::Msg(e.to_string()))?;
-            // Vincula o segredo pós-quântico compartilhado à transcrição da discagem
-            let _session_key = derive_pqc_session_key(&enc.shared_secret, b"mycelium-pqc-dial-transcript-v1");
+            // Vincula o segredo pós-quântico compartilhado à transcrição simétrica da discagem
+            let session_key = derive_pqc_session_key(&enc.shared_secret, b"mycelium-pqc-v1-hybrid-transcript");
+            let client_auth = blake3::keyed_hash(&session_key, b"mycelium-pqc-client-auth");
+
             stream.write_all(&enc.ciphertext).await?;
+            stream.write_all(client_auth.as_bytes()).await?;
             stream.flush().await?;
+
+            let mut server_auth = [0u8; 32];
+            stream.read_exact(&mut server_auth).await?;
+            let expected_server_auth = blake3::keyed_hash(&session_key, b"mycelium-pqc-server-auth");
+            if server_auth != *expected_server_auth.as_bytes() {
+                return Err(PqcTransportError::Msg("Autenticação mútua do servidor PQC falhou".into()));
+            }
+
             Ok(stream.compat())
         }))
     }
@@ -353,6 +380,42 @@ mod tests {
         let k2 = derive_pqc_session_key(&shared, b"context-b");
         assert_ne!(k1, k2);
         assert_eq!(k1, derive_pqc_session_key(&shared, b"context-a"));
+    }
+
+    #[tokio::test]
+    async fn pqc_mutual_auth_handshake_flow() {
+        let server_kp = generate_pqc_keypair();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let srv_priv = server_kp.private_bytes().to_vec();
+        let srv_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut ct = vec![0u8; 1568];
+            stream.read_exact(&mut ct).await.unwrap();
+            let ss = mlkem_decapsulate(&srv_priv, &ct).unwrap();
+            let session_key = derive_pqc_session_key(&ss, b"mycelium-pqc-v1-hybrid-transcript");
+            let mut client_auth = [0u8; 32];
+            stream.read_exact(&mut client_auth).await.unwrap();
+            assert_eq!(client_auth, *blake3::keyed_hash(&session_key, b"mycelium-pqc-client-auth").as_bytes());
+            let server_auth = blake3::keyed_hash(&session_key, b"mycelium-pqc-server-auth");
+            stream.write_all(server_auth.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let mut client_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let enc = mlkem_encapsulate(&server_kp.public_key).unwrap();
+        let session_key = derive_pqc_session_key(&enc.shared_secret, b"mycelium-pqc-v1-hybrid-transcript");
+        let client_auth = blake3::keyed_hash(&session_key, b"mycelium-pqc-client-auth");
+        client_stream.write_all(&enc.ciphertext).await.unwrap();
+        client_stream.write_all(client_auth.as_bytes()).await.unwrap();
+        client_stream.flush().await.unwrap();
+
+        let mut server_auth = [0u8; 32];
+        client_stream.read_exact(&mut server_auth).await.unwrap();
+        assert_eq!(server_auth, *blake3::keyed_hash(&session_key, b"mycelium-pqc-server-auth").as_bytes());
+
+        srv_task.await.unwrap();
     }
 }
 

@@ -151,6 +151,8 @@ pub struct Organism {
     veil_mode: Option<String>,
     #[cfg(feature = "veil")]
     veil_enabled: bool,
+    #[cfg(feature = "veil")]
+    veil_router_handles: Vec<tokio::task::JoinHandle<()>>,
     ion_hosts: HashMap<String, String>,
     catalog: std::sync::Arc<std::sync::Mutex<mycelium_store::StoreCatalog>>,
     home: PathBuf,
@@ -428,6 +430,8 @@ impl Organism {
             veil_mode: config.veil_mode,
             #[cfg(feature = "veil")]
             veil_enabled: config.veil_enabled,
+            #[cfg(feature = "veil")]
+            veil_router_handles: Vec::new(),
             ion_hosts: HashMap::new(),
             catalog: std::sync::Arc::new(std::sync::Mutex::new(catalog)),
             home: config.home.clone(),
@@ -2339,8 +2343,8 @@ impl Organism {
     #[cfg(feature = "veil")]
     pub async fn start_veil_service(&mut self) -> Result<std::net::SocketAddr, OrganismError> {
         use mycelium_veil::{
-            proxy_socks5_connection, ExitForwarder, LiveCircuitManager,
-            Socks5Server, VeilConfig, VeilEngine, VeilMode,
+            proxy_socks5_connection, CircuitHopNode, LiveCircuitClient, Socks5Server,
+            VeilConfig, VeilEngine, VeilHopRouter, VeilMode,
         };
         use std::sync::Arc;
 
@@ -2362,6 +2366,76 @@ impl Organism {
             .start_session(config.mode)
             .map_err(|e| OrganismError::Msg(e.to_string()))?;
 
+        // 1. Inicia nós do circuito (Exit, e opcionalmente Middle e Guard)
+        let mut router_handles = Vec::new();
+
+        let exit_kp = mycelium_pqc::mlkem_keygen();
+        let exit_pk = exit_kp.public_key.clone();
+        let exit_router = VeilHopRouter::new(exit_kp, Some(config.exit_policy.clone()));
+        let exit_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| OrganismError::Msg(format!("Erro no bind do nó Exit: {e}")))?;
+        let exit_addr = exit_listener.local_addr().map_err(|e| OrganismError::Msg(e.to_string()))?;
+        router_handles.push(tokio::spawn(async move {
+            let _ = exit_router.run(exit_listener).await;
+        }));
+
+        let hops = if config.mode == VeilMode::Geo {
+            vec![CircuitHopNode {
+                node_id: "exit-geo-node".into(),
+                public_kem_key: exit_pk,
+                endpoint: exit_addr.to_string(),
+            }]
+        } else {
+            let middle_kp = mycelium_pqc::mlkem_keygen();
+            let middle_pk = middle_kp.public_key.clone();
+            let middle_router = VeilHopRouter::new(middle_kp, None);
+            let middle_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .map_err(|e| OrganismError::Msg(format!("Erro no bind do nó Middle: {e}")))?;
+            let middle_addr = middle_listener.local_addr().map_err(|e| OrganismError::Msg(e.to_string()))?;
+            router_handles.push(tokio::spawn(async move {
+                let _ = middle_router.run(middle_listener).await;
+            }));
+
+            let guard_kp = mycelium_pqc::mlkem_keygen();
+            let guard_pk = guard_kp.public_key.clone();
+            let guard_router = VeilHopRouter::new(guard_kp, None);
+            let guard_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .map_err(|e| OrganismError::Msg(format!("Erro no bind do nó Guard: {e}")))?;
+            let guard_addr = guard_listener.local_addr().map_err(|e| OrganismError::Msg(e.to_string()))?;
+            router_handles.push(tokio::spawn(async move {
+                let _ = guard_router.run(guard_listener).await;
+            }));
+
+            vec![
+                CircuitHopNode {
+                    node_id: "guard-node".into(),
+                    public_kem_key: guard_pk,
+                    endpoint: guard_addr.to_string(),
+                },
+                CircuitHopNode {
+                    node_id: "middle-node".into(),
+                    public_kem_key: middle_pk,
+                    endpoint: middle_addr.to_string(),
+                },
+                CircuitHopNode {
+                    node_id: "exit-node".into(),
+                    public_kem_key: exit_pk,
+                    endpoint: exit_addr.to_string(),
+                },
+            ]
+        };
+
+        // 2. Conecta o cliente do circuito através do handshake telescópico ML-KEM-1024
+        let circuit_client = Arc::new(
+            LiveCircuitClient::connect(101, hops)
+                .await
+                .map_err(|e| OrganismError::Msg(format!("Falha no handshake telescópico Veil: {e}")))?,
+        );
+
+        // 3. Inicia servidor SOCKS5 local (sem ExitForwarder local!)
         let server = Socks5Server::new(socks_addr);
         let listener = server
             .bind()
@@ -2369,55 +2443,19 @@ impl Organism {
             .map_err(|e| OrganismError::Msg(e.to_string()))?;
         let actual_bind = listener.local_addr().map_err(|e| OrganismError::Msg(e.to_string()))?;
 
-        let forwarder = Arc::new(ExitForwarder::new(config.exit_policy.clone()));
         let kill_switch = engine.kill_switch().clone();
-
-        let live_mgr = LiveCircuitManager::new();
-        let kp1 = mycelium_pqc::mlkem_keygen();
-        let kp2 = mycelium_pqc::mlkem_keygen();
-        let kp3 = mycelium_pqc::mlkem_keygen();
-
-        let hops = if config.mode == VeilMode::Geo {
-            vec![mycelium_veil::CircuitHopNode {
-                node_id: "exit-geo-node".into(),
-                public_kem_key: kp3.public_key.clone(),
-                endpoint: "127.0.0.1:0".into(),
-            }]
-        } else {
-            vec![
-                mycelium_veil::CircuitHopNode {
-                    node_id: "guard-node".into(),
-                    public_kem_key: kp1.public_key.clone(),
-                    endpoint: "127.0.0.1:0".into(),
-                },
-                mycelium_veil::CircuitHopNode {
-                    node_id: "middle-node".into(),
-                    public_kem_key: kp2.public_key.clone(),
-                    endpoint: "127.0.0.1:0".into(),
-                },
-                mycelium_veil::CircuitHopNode {
-                    node_id: "exit-node".into(),
-                    public_kem_key: kp3.public_key.clone(),
-                    endpoint: "127.0.0.1:0".into(),
-                },
-            ]
-        };
-
-        let circuit = live_mgr
-            .create_circuit(hops)
-            .map_err(|e| OrganismError::Msg(e.to_string()))?;
-
         let ks_clone = kill_switch.clone();
+        let c_client = Arc::clone(&circuit_client);
+
         let task_handle = tokio::spawn(async move {
             tracing::info!(bind = %actual_bind, "VEIL SOCKS5 proxy escutando");
             loop {
                 match listener.accept().await {
                     Ok((stream, _peer_addr)) => {
-                        let c = Arc::clone(&circuit);
-                        let f = Arc::clone(&forwarder);
+                        let c = Arc::clone(&c_client);
                         let ks = ks_clone.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = proxy_socks5_connection(stream, c, f, ks).await {
+                            if let Err(e) = proxy_socks5_connection(stream, c, ks).await {
                                 tracing::debug!(error = %e, "conexao socks5 finalizada");
                             }
                         });
@@ -2433,11 +2471,12 @@ impl Organism {
         self.veil_engine = Some(engine);
         self.veil_socks5_handle = Some(task_handle);
         self.veil_socks5_addr = Some(actual_bind);
+        self.veil_router_handles = router_handles;
         self.veil_enabled = true;
 
         tracing::info!(
             bind = %actual_bind,
-            "VEIL Ω ativo no organismo — SOCKS5 pronto para conexões"
+            "VEIL Ω ativo no organismo — SOCKS5 pronto com circuito telescópico ML-KEM-1024"
         );
 
         Ok(actual_bind)
@@ -2446,6 +2485,9 @@ impl Organism {
     #[cfg(feature = "veil")]
     pub fn stop_veil_service(&mut self) {
         if let Some(handle) = self.veil_socks5_handle.take() {
+            handle.abort();
+        }
+        for handle in self.veil_router_handles.drain(..) {
             handle.abort();
         }
         if let Some(engine) = self.veil_engine.take() {

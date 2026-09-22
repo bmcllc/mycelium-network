@@ -22,6 +22,70 @@ impl Socks5Target {
             Socks5Target::Domain(domain, port) => format!("{domain}:{port}"),
         }
     }
+
+    /// Serializa o destino para o formato padronizado SOCKS5 [ATYP + Addr + Port].
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        match self {
+            Socks5Target::Ip(SocketAddr::V4(v4)) => {
+                buf.push(0x01);
+                buf.extend_from_slice(&v4.ip().octets());
+                buf.extend_from_slice(&v4.port().to_be_bytes());
+            }
+            Socks5Target::Ip(SocketAddr::V6(v6)) => {
+                buf.push(0x04);
+                buf.extend_from_slice(&v6.ip().octets());
+                buf.extend_from_slice(&v6.port().to_be_bytes());
+            }
+            Socks5Target::Domain(domain, port) => {
+                buf.push(0x03);
+                buf.push(domain.len() as u8);
+                buf.extend_from_slice(domain.as_bytes());
+                buf.extend_from_slice(&port.to_be_bytes());
+            }
+        }
+        buf
+    }
+
+    /// Desserializa bytes no formato padronizado SOCKS5.
+    pub fn decode(bytes: &[u8]) -> Result<Self, VeilError> {
+        if bytes.is_empty() {
+            return Err(VeilError::Socks5("Dados de destino vazios".into()));
+        }
+        match bytes[0] {
+            0x01 => {
+                if bytes.len() < 7 {
+                    return Err(VeilError::Socks5("Tamanho de IPv4 inválido".into()));
+                }
+                let ip = Ipv4Addr::new(bytes[1], bytes[2], bytes[3], bytes[4]);
+                let port = u16::from_be_bytes([bytes[5], bytes[6]]);
+                Ok(Socks5Target::Ip(SocketAddr::new(IpAddr::V4(ip), port)))
+            }
+            0x03 => {
+                if bytes.len() < 2 {
+                    return Err(VeilError::Socks5("Tamanho de domínio inválido".into()));
+                }
+                let len = bytes[1] as usize;
+                if bytes.len() < 2 + len + 2 {
+                    return Err(VeilError::Socks5("Dados de domínio incompletos".into()));
+                }
+                let domain = String::from_utf8_lossy(&bytes[2..2 + len]).to_string();
+                let port = u16::from_be_bytes([bytes[2 + len], bytes[3 + len]]);
+                Ok(Socks5Target::Domain(domain, port))
+            }
+            0x04 => {
+                if bytes.len() < 19 {
+                    return Err(VeilError::Socks5("Tamanho de IPv6 inválido".into()));
+                }
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&bytes[1..17]);
+                let ip = Ipv6Addr::from(octets);
+                let port = u16::from_be_bytes([bytes[17], bytes[18]]);
+                Ok(Socks5Target::Ip(SocketAddr::new(IpAddr::V6(ip), port)))
+            }
+            other => Err(VeilError::Socks5(format!("Tipo ATYP desconhecido: 0x{other:02x}"))),
+        }
+    }
 }
 
 /// Servidor SOCKS5 local.
@@ -162,17 +226,15 @@ impl Socks5Server {
     }
 }
 
-use crate::exit::ExitForwarder;
-use crate::planes::live::LiveCircuit;
+use crate::planes::live::LiveCircuitClient;
 use crate::tunnel::KillSwitch;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-/// Executa a ponte bidirecional completa entre o stream TCP do cliente SOCKS5,
-/// o circuito onion Veil e o nó Exit conectado ao destino remoto.
+/// Executa a ponte bidirecional completa entre o stream TCP do cliente SOCKS5
+/// e o circuito onion Veil (sem nenhuma conexão direta local ao destino).
 pub async fn proxy_socks5_connection(
     mut client_stream: TcpStream,
-    circuit: Arc<Mutex<LiveCircuit>>,
-    forwarder: Arc<ExitForwarder>,
+    circuit: Arc<LiveCircuitClient>,
     kill_switch: KillSwitch,
 ) -> Result<(), VeilError> {
     kill_switch.allow_traffic()?;
@@ -180,8 +242,8 @@ pub async fn proxy_socks5_connection(
     // 1. Handshake SOCKS5 (obtém o target sem resolução de DNS local!)
     let target = Socks5Server::handle_handshake(&mut client_stream).await?;
 
-    // 2. Conecta ao destino remoto via nó Exit (com validação anti-SSRF e resolução remota)
-    let mut remote_stream = match forwarder.connect_to_target(&target).await {
+    // 2. Abre fluxo através do circuito onion (apenas o nó Exit remoto conecta ao destino)
+    let stream = match circuit.open_stream(&target).await {
         Ok(s) => {
             // [VER=0x05] [REP=0x00 SUCESSO] [RSV=0x00] [ATYP=0x01 IPv4] [127.0.0.1] [PORT=1080]
             client_stream
@@ -195,9 +257,10 @@ pub async fn proxy_socks5_connection(
                 VeilError::Exit(msg)
                     if msg.contains("proibido")
                         || msg.contains("privado")
+                        || msg.contains("restrita")
                         || msg.contains("bloqueada") =>
                 {
-                    0x02 // Connection not allowed by ruleset
+                    0x02 // Connection not allowed by ruleset (anti-SSRF / política)
                 }
                 _ => 0x04, // Host unreachable / General failure
             };
@@ -208,14 +271,13 @@ pub async fn proxy_socks5_connection(
         }
     };
 
-    let (mut client_reader, mut client_writer) = client_stream.split();
-    let (mut remote_reader, mut remote_writer) = remote_stream.split();
+    let (mut client_reader, mut client_writer) = client_stream.into_split();
+    let (mut stream_reader, stream_writer) = stream.split();
 
     let ks_c2r = kill_switch.clone();
-    let circuit_c2r = Arc::clone(&circuit);
 
-    // Tarefa: Cliente -> Circuito Onion -> Destino Remoto
-    let client_to_remote = async move {
+    // Tarefa: Cliente Local -> Circuito Onion (células de 512 bytes)
+    let client_to_circuit = async move {
         let mut buf = [0u8; 8192];
         loop {
             ks_c2r.allow_traffic()?;
@@ -224,55 +286,38 @@ pub async fn proxy_socks5_connection(
                 .await
                 .map_err(|e| VeilError::Socks5(format!("Erro ao ler do cliente: {e}")))?;
             if n == 0 {
+                let _ = stream_writer.close().await;
                 break;
             }
             ks_c2r.allow_traffic()?;
-            // Encapsula nas células onion do circuito
-            let _cells = {
-                let mut lock = circuit_c2r.lock().unwrap();
-                lock.forward_encrypt(1, &buf[..n])?
-            };
-            // Entrega os dados ao destino remoto
-            remote_writer
-                .write_all(&buf[..n])
-                .await
-                .map_err(|e| VeilError::Socks5(format!("Erro ao escrever no destino: {e}")))?;
+            stream_writer.send_data(&buf[..n]).await?;
         }
         Ok::<(), VeilError>(())
     };
 
     let ks_r2c = kill_switch.clone();
-    let circuit_r2c = Arc::clone(&circuit);
 
-    // Tarefa: Destino Remoto -> Circuito Onion -> Cliente
-    let remote_to_client = async move {
-        let mut buf = [0u8; 8192];
+    // Tarefa: Circuito Onion (células de 512 bytes) -> Cliente Local
+    let circuit_to_client = async move {
         loop {
             ks_r2c.allow_traffic()?;
-            let n = remote_reader
-                .read(&mut buf)
-                .await
-                .map_err(|e| VeilError::Socks5(format!("Erro ao ler do destino: {e}")))?;
-            if n == 0 {
-                break;
+            match stream_reader.receive_data().await? {
+                Some(data) => {
+                    ks_r2c.allow_traffic()?;
+                    client_writer
+                        .write_all(&data)
+                        .await
+                        .map_err(|e| VeilError::Socks5(format!("Erro ao escrever no cliente: {e}")))?;
+                }
+                None => break, // Fim do fluxo / EOF
             }
-            ks_r2c.allow_traffic()?;
-            // Atualiza contadores do circuito
-            {
-                let mut lock = circuit_r2c.lock().unwrap();
-                lock.bytes_received += n as u64;
-            }
-            client_writer
-                .write_all(&buf[..n])
-                .await
-                .map_err(|e| VeilError::Socks5(format!("Erro ao escrever no cliente: {e}")))?;
         }
         Ok::<(), VeilError>(())
     };
 
     tokio::select! {
-        res = client_to_remote => res,
-        res = remote_to_client => res,
+        res = client_to_circuit => res,
+        res = circuit_to_client => res,
     }
 }
 

@@ -30,7 +30,10 @@ pub use crypto::cell::{CellCommand, VeilCell, CELL_SIZE};
 pub use crypto::{HopKeys, CryptoError};
 pub use exit::{ExitForwarder, ExitPolicyValidator};
 pub use layers::{LayerPipeline, VeilLayer};
-pub use planes::live::{CircuitHopNode, LiveCircuit, LiveCircuitManager};
+pub use planes::live::{
+    CircuitHopNode, CircuitStreamReader, CircuitStreamWriter, FrameType, InnerMessage,
+    LiveCircuit, LiveCircuitClient, LiveCircuitManager, LiveCircuitStream, VeilHopRouter,
+};
 pub use planes::mix::{MixMessage, MixPlane};
 pub use socks5::{proxy_socks5_connection, Socks5Server, Socks5Target};
 pub use tunnel::{KillSwitch, KillSwitchState, PlatformTunnelType, SystemTunnel};
