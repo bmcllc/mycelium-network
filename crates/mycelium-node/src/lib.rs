@@ -71,6 +71,17 @@ pub struct DaemonOptions {
     pub veil_exits: Vec<String>,
     /// Pinning de identidade para modo produção: `"<papel>:<hex_identity_pubkey>"`.
     pub veil_trust: Vec<String>,
+    /// Endereço público anunciado no descritor assinado (alcançável pelos demais nós).
+    /// Nunca 0.0.0.0 — separado do endereço de escuta (`--veil-listen`).
+    pub veil_advertise: Option<String>,
+    /// Caminho da identidade persistente do nó (GhostId + par ML-KEM-1024).
+    /// Padrão: `{home}/veil-identity.json` (permissões 0600).
+    pub veil_identity: Option<PathBuf>,
+    /// Rota a identidade Veil explicitamente (nunca implícita em reinício).
+    pub veil_rotate_identity: bool,
+    /// IP de origem explícito para o egresso do Exit (hosts multi-homing).
+    /// Sob NAT, o destino observa o IP da tradução, não este bind.
+    pub veil_egress_bind: Option<std::net::IpAddr>,
 }
 
 impl Default for DaemonOptions {
@@ -105,6 +116,10 @@ impl Default for DaemonOptions {
             veil_middles: Vec::new(),
             veil_exits: Vec::new(),
             veil_trust: Vec::new(),
+            veil_advertise: None,
+            veil_identity: None,
+            veil_rotate_identity: false,
+            veil_egress_bind: None,
         }
     }
 }
@@ -145,6 +160,10 @@ pub async fn run_daemon(home: PathBuf, opts: DaemonOptions) -> Result<(), Organi
         veil_middles: opts.veil_middles,
         veil_exits: opts.veil_exits,
         veil_trust: opts.veil_trust,
+        veil_advertise: opts.veil_advertise,
+        veil_identity_path: opts.veil_identity,
+        veil_rotate_identity: opts.veil_rotate_identity,
+        veil_egress_bind: opts.veil_egress_bind,
     })?;
     let sock = organism.home().join("mycelium.sock");
     let mut token = std::env::var("MYCELIUM_CONTROL_TOKEN")

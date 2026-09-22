@@ -172,6 +172,10 @@ mod veil_tests {
                 role: None,
                 listen: None,
                 trust: vec![],
+                advertise: None,
+                identity: None,
+                rotate_identity: false,
+                egress_bind: None,
             },
         )
         .await

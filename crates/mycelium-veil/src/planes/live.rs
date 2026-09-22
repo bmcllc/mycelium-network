@@ -1918,4 +1918,102 @@ mod tests {
             "somente o salto alvo (Middle) recupera o endpoint do Exit"
         );
     }
+
+    /// Ajuste de implantação: identidade persistente — reiniciar um relay NÃO pode fazer os
+    /// pins distribuídos deixarem de corresponder. O descritor reemitido após o reinício
+    /// mantém a MESMA identidade pública e chave KEM; os pins do descritor pré-reinício
+    /// continuam validando a conexão em modo produção.
+    #[tokio::test]
+    async fn test_relay_restart_preserves_pinned_identity_and_kem() {
+        use crate::VeilNodeIdentity;
+        use std::io::ErrorKind;
+
+        let dir = std::env::temp_dir().join(format!("veil-restart-{}", rand::random::<u64>()));
+        let identity_path = dir.join("veil-identity.json");
+
+        // ----- 1ª vida do relay: identidade persistida + descritor assinado -----
+        let (identity, created) = VeilNodeIdentity::load_or_create(&identity_path, Some([11u8; 32]))
+            .expect("identidade persistente");
+        assert!(created, "primeiro uso cria a identidade");
+        let router = identity.into_router(None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.2:0").await.expect("bind relay");
+        let addr = listener.local_addr().expect("local addr");
+        let desc_before = router.descriptor("relay-persistente".into(), addr.to_string());
+
+        // Pins distribuídos fora de banda ao cliente (nunca mudam entre reinícios):
+        let identity_pin = desc_before.identity_pubkey;
+        let kem_pin = desc_before.public_kem_key.clone();
+        let endpoint_pin = desc_before.endpoint.clone();
+
+        let relay_task = tokio::spawn(async move {
+            let _ = router.run(listener).await;
+        });
+
+        let hops_before = vec![CircuitHopNode::from_descriptor(desc_before.clone())];
+        let trusted_before = vec![TrustedIdentity::new("relay-prod".into(), identity_pin, kem_pin.clone())
+            .with_endpoint(endpoint_pin.clone())];
+        let client1 = LiveCircuitClient::connect_production(8101, hops_before, &trusted_before)
+            .await
+            .expect("circuito com o relay antes do reinício");
+        assert_eq!(client1.hop_keys.len(), 1);
+        relay_task.abort();
+
+        // ----- 2ª vida do relay: identidade RECARREGADA do disco (reinício real) -----
+        let (identity2, created2) = VeilNodeIdentity::load_or_create(&identity_path, Some([11u8; 32]))
+            .expect("identidade recarregada");
+        assert!(!created2, "reinício não pode regenerar a identidade");
+        let router2 = identity2.into_router(None);
+
+        // Rebinda o MESMO endereço (porta liberada pelo abort do listener anterior).
+        let listener2 = loop {
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => break l,
+                Err(e) if e.kind() == ErrorKind::AddrInUse => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("rebind do relay: {e}"),
+            }
+        };
+        let desc_after = router2.descriptor("relay-persistente".into(), addr.to_string());
+        assert_eq!(
+            desc_after.identity_pubkey, identity_pin,
+            "identidade pública do relay deve sobreviver ao reinício"
+        );
+        assert_eq!(
+            desc_after.public_kem_key, kem_pin,
+            "chave KEM do relay deve sobreviver ao reinício"
+        );
+        assert_eq!(desc_after.endpoint, endpoint_pin);
+
+        let relay_task2 = tokio::spawn(async move {
+            let _ = router2.run(listener2).await;
+        });
+
+        // Cliente reconecta em modo produção usando os MESMOS pins (sem redistribuir nada).
+        let hops_after = vec![CircuitHopNode::from_descriptor(desc_after.clone())];
+        let trusted_after = vec![TrustedIdentity::new("relay-prod".into(), identity_pin, kem_pin)
+            .with_endpoint(endpoint_pin)];
+        let client2 = LiveCircuitClient::connect_production(8102, hops_after, &trusted_after)
+            .await
+            .expect("pins continuam válidos após o reinício do relay");
+        assert_eq!(client2.hop_keys.len(), 1);
+
+        // Contra-prova: uma identidade REGENERADA (comportamento pré-correção) seria rejeitada.
+        let fresh = VeilNodeIdentity::generate();
+        let desc_fresh = fresh.descriptor("relay-persistente".into(), addr.to_string());
+        let res = LiveCircuitClient::connect_production(
+            8103,
+            vec![CircuitHopNode::from_descriptor(desc_fresh)],
+            &trusted_before,
+        )
+        .await;
+        match res {
+            Ok(_) => panic!("relay com identidade regenerada não pode aceitar pins antigos!"),
+            Err(VeilError::Crypto(msg)) => assert!(msg.contains("Substitui"), "mensagem inesperada: {msg}"),
+            Err(e) => panic!("Esperado erro de substituição, obtido: {e}"),
+        }
+
+        relay_task2.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -248,6 +248,19 @@ pub enum Request {
         /// Pinning de identidade `"<nome>:<hex_identity>"` por salto (modo produção).
         #[serde(default)]
         trust: Vec<String>,
+        /// Endereço público anunciado no descritor (ex.: `203.0.113.9:9050`). Separado do listen.
+        #[serde(default)]
+        advertise: Option<String>,
+        /// Caminho da identidade persistente do nó (GhostId + ML-KEM). Default: `{home}/veil-identity.json`.
+        #[serde(default)]
+        identity: Option<String>,
+        /// Rota a identidade Veil explicitamente (nunca implícita em reinício).
+        #[serde(default)]
+        rotate_identity: bool,
+        /// IP de origem explícito do egresso do Exit (multi-homing). Sob NAT o destino
+        /// observa o IP da tradução, não este bind.
+        #[serde(default)]
+        egress_bind: Option<String>,
     },
     /// Encerra o serviço VEIL Ω.
     VeilStop,

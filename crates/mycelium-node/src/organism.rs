@@ -105,6 +105,17 @@ pub struct OrganismConfig {
     /// Pinning de identidade para modo produção: `"<papel>:<hex_identity_pubkey>"` (ex.: "guard:<hex>").
     /// Quando presente, o cliente exige que cada salto apresente a identidade fixada (anti-substituição).
     pub veil_trust: Vec<String>,
+    /// Endereço público anunciado no descritor assinado (alcançável pelos demais nós).
+    /// Nunca 0.0.0.0 — separado do endereço de escuta (`--veil-listen`).
+    pub veil_advertise: Option<String>,
+    /// Caminho da identidade persistente do nó (GhostId + par ML-KEM-1024).
+    /// Padrão: `{home}/veil-identity.json` (permissões 0600).
+    pub veil_identity_path: Option<PathBuf>,
+    /// Rota a identidade Veil explicitamente (nunca implícita em reinício).
+    pub veil_rotate_identity: bool,
+    /// IP de origem explícito para o egresso do Exit (hosts multi-homing).
+    /// Sob NAT, o destino observa o IP da tradução, não este bind.
+    pub veil_egress_bind: Option<std::net::IpAddr>,
 }
 
 pub struct Organism {
@@ -169,6 +180,14 @@ pub struct Organism {
     veil_exits: Vec<String>,
     #[cfg(feature = "veil")]
     veil_trust: Vec<String>,
+    #[cfg(feature = "veil")]
+    veil_advertise: Option<String>,
+    #[cfg(feature = "veil")]
+    veil_identity_path: Option<PathBuf>,
+    #[cfg(feature = "veil")]
+    veil_rotate_identity: bool,
+    #[cfg(feature = "veil")]
+    veil_egress_bind: Option<std::net::IpAddr>,
     #[cfg(feature = "veil")]
     veil_local_descriptor: Option<String>,
     #[cfg(feature = "veil")]
@@ -473,6 +492,14 @@ impl Organism {
             veil_exits: config.veil_exits,
             #[cfg(feature = "veil")]
             veil_trust: config.veil_trust,
+            #[cfg(feature = "veil")]
+            veil_advertise: config.veil_advertise,
+            #[cfg(feature = "veil")]
+            veil_identity_path: config.veil_identity_path,
+            #[cfg(feature = "veil")]
+            veil_rotate_identity: config.veil_rotate_identity,
+            #[cfg(feature = "veil")]
+            veil_egress_bind: config.veil_egress_bind,
             #[cfg(feature = "veil")]
             veil_local_descriptor: None,
             #[cfg(feature = "veil")]
@@ -2388,6 +2415,79 @@ impl Organism {
     }
 
     #[cfg(feature = "veil")]
+    /// Caminho do arquivo de identidade persistente do nó Veil (GhostId + ML-KEM-1024).
+    fn veil_identity_file(&self) -> PathBuf {
+        self.veil_identity_path
+            .clone()
+            .unwrap_or_else(|| self.home().join("veil-identity.json"))
+    }
+
+    #[cfg(feature = "veil")]
+    /// Carrega (ou cria) a identidade persistente do nó Veil. Rotação é sempre explícita
+    /// (`veil_rotate_identity`) — um reinício nunca regenera a identidade silenciosamente.
+    /// Retorna `(identidade, mensagem_de_log_opcional)`.
+    fn load_veil_node_identity(
+        &self,
+    ) -> Result<(mycelium_veil::VeilNodeIdentity, Option<String>), OrganismError> {
+        let path = self.veil_identity_file();
+        if self.veil_rotate_identity {
+            let (identity, old_hex, new_hex) = mycelium_veil::VeilNodeIdentity::rotate(&path)
+                .map_err(|e| OrganismError::Msg(format!("falha ao rotacionar identidade Veil: {e}")))?;
+            tracing::warn!(
+                old_identity = %old_hex,
+                new_identity = %new_hex,
+                path = %path.display(),
+                "identidade Veil rotacionada explicitamente — redistribua descritores e pins"
+            );
+            Ok((identity, Some(format!("identidade rotacionada: {old_hex} -> {new_hex}"))))
+        } else {
+            let (identity, created) = mycelium_veil::VeilNodeIdentity::load_or_create(
+                &path,
+                Some(self.gland.seed()),
+            )
+            .map_err(|e| OrganismError::Msg(format!("falha ao carregar identidade Veil: {e}")))?;
+            let log = if created {
+                tracing::warn!(
+                    path = %path.display(),
+                    identity = %hex::encode(identity.ghost.nostr_pubkey()),
+                    "primeira execução: nova identidade Veil persistida — distribua este pin aos clientes"
+                );
+                Some(format!("nova identidade Veil persistida em {}", path.display()))
+            } else {
+                tracing::info!(
+                    identity = %hex::encode(identity.ghost.nostr_pubkey()),
+                    "identidade Veil carregada do disco (pins continuam válidos)"
+                );
+                None
+            };
+            Ok((identity, log))
+        }
+    }
+
+    #[cfg(feature = "veil")]
+    /// Resolve o endpoint anunciado no descritor assinado: `veil_advertise` se fornecido
+    /// (separado da escuta), senão o próprio listen quando ele NÃO for 0.0.0.0/[::].
+    fn resolve_veil_advertise(&self, listen: std::net::SocketAddr) -> Result<String, OrganismError> {
+        if let Some(advertise) = &self.veil_advertise {
+            if !advertise.contains(':') {
+                return Err(OrganismError::Msg(format!(
+                    "--veil-advertise '{advertise}' deve incluir porta (ex.: 203.0.113.9:9050 ou relay.example.org:9050)"
+                )));
+            }
+            return Ok(advertise.clone());
+        }
+        let ip = listen.ip();
+        if ip.is_unspecified() {
+            return Err(OrganismError::Msg(
+                "o endereço de escuta 0.0.0.0/[::] não pode ser anunciado no descritor assinado: \
+                 informe --veil-advertise <ip|hostname>:<porta> alcançável pelos demais nós \
+                 (endereço anunciado é separado do endereço de escuta)".into(),
+            ));
+        }
+        Ok(listen.to_string())
+    }
+
+    #[cfg(feature = "veil")]
     pub async fn start_veil_service(&mut self) -> Result<std::net::SocketAddr, OrganismError> {
         use mycelium_veil::{
             proxy_socks5_connection, CircuitHopNode, LiveCircuitClient, Socks5Server,
@@ -2421,14 +2521,24 @@ impl Organism {
                 let listen_addr = self.veil_listen.unwrap_or_else(|| {
                     "0.0.0.0:9050".parse().expect("valid relay listen addr")
                 });
+                let advertise = self.resolve_veil_advertise(listen_addr)?;
                 let listener = tokio::net::TcpListener::bind(listen_addr)
                     .await
                     .map_err(|e| OrganismError::Msg(format!("Erro no bind do nó Relay: {e}")))?;
                 let actual_addr = listener.local_addr().map_err(|e| OrganismError::Msg(e.to_string()))?;
 
-                let kp = mycelium_pqc::mlkem_keygen();
-                let router = VeilHopRouter::new(kp, None);
-                let desc = router.descriptor(self.gland.node_id().to_string(), actual_addr.to_string());
+                // Identidade persistente: o reinício do relay NÃO pode invalidar os pins
+                // distribuídos aos clientes (--veil-trust) nem a chave KEM do descritor.
+                let (identity, identity_log) = self.load_veil_node_identity()?;
+                let identity_hex = hex::encode(identity.ghost.nostr_pubkey());
+                tracing::info!(
+                    bind = %actual_addr,
+                    advertise = %advertise,
+                    identity = %identity_hex,
+                    "VEIL Ω nó Relay ativo"
+                );
+                let router = identity.into_router(None);
+                let desc = router.descriptor(self.gland.node_id().to_string(), advertise);
                 self.veil_local_descriptor = Some(desc.to_json().map_err(|e| OrganismError::Msg(e.to_string()))?);
 
                 router_handles.push(tokio::spawn(async move {
@@ -2439,22 +2549,46 @@ impl Organism {
                 self.veil_router_handles = router_handles;
                 self.veil_enabled = true;
 
-                tracing::info!(bind = %actual_addr, "VEIL Ω nó Relay ativo");
+                if let Some(msg) = identity_log {
+                    tracing::info!("{msg}");
+                }
                 Ok(actual_addr)
             }
             "exit" => {
                 let listen_addr = self.veil_listen.unwrap_or_else(|| {
                     "0.0.0.0:9051".parse().expect("valid exit listen addr")
                 });
+                let advertise = self.resolve_veil_advertise(listen_addr)?;
                 let listener = tokio::net::TcpListener::bind(listen_addr)
                     .await
                     .map_err(|e| OrganismError::Msg(format!("Erro no bind do nó Exit: {e}")))?;
                 let actual_addr = listener.local_addr().map_err(|e| OrganismError::Msg(e.to_string()))?;
 
-                let kp = mycelium_pqc::mlkem_keygen();
-                let router = VeilHopRouter::new(kp, Some(config.exit_policy.clone()))
-                    .with_bind_source(actual_addr.ip());
-                let desc = router.descriptor(self.gland.node_id().to_string(), actual_addr.to_string());
+                let (identity, identity_log) = self.load_veil_node_identity()?;
+                let identity_hex = hex::encode(identity.ghost.nostr_pubkey());
+                tracing::info!(
+                    bind = %actual_addr,
+                    advertise = %advertise,
+                    identity = %identity_hex,
+                    "VEIL Ω nó Exit ativo"
+                );
+                let mut router = identity.into_router(Some(config.exit_policy.clone()));
+                // Egresso do Exit: vincula-se a um IP de origem apenas quando o operador o
+                // indica explicitamente (hosts multi-homing). O default (None) deixa a rota
+                // do sistema escolher a origem — sob NAT, o IP observado pelo destino é o da
+                // tradução da rede, não o do bind local nem o anunciado no descritor.
+                if let Some(src) = self.veil_egress_bind {
+                    tracing::warn!(
+                        source = %src,
+                        "egress bind explícito configurado; sob NAT o destino observa o IP traduzido, não este bind"
+                    );
+                    router = router.with_bind_source(src);
+                } else {
+                    tracing::debug!(
+                        "egress sem bind explícito — IP de origem escolhido pela rota do sistema (NAT reescreve)"
+                    );
+                }
+                let desc = router.descriptor(self.gland.node_id().to_string(), advertise);
                 self.veil_local_descriptor = Some(desc.to_json().map_err(|e| OrganismError::Msg(e.to_string()))?);
 
                 router_handles.push(tokio::spawn(async move {
@@ -2465,7 +2599,9 @@ impl Organism {
                 self.veil_router_handles = router_handles;
                 self.veil_enabled = true;
 
-                tracing::info!(bind = %actual_addr, "VEIL Ω nó Exit ativo");
+                if let Some(msg) = identity_log {
+                    tracing::info!("{msg}");
+                }
                 Ok(actual_addr)
             }
             "client" => {
@@ -3569,7 +3705,7 @@ impl Organism {
                     Err(e) => Response::Err { message: format!("invoice BOLT11 parse: {e}") },
                 }
             }
-            Request::VeilStart { mode, socks5_port, role, listen, trust } => {
+            Request::VeilStart { mode, socks5_port, role, listen, trust, advertise, identity, rotate_identity, egress_bind } => {
                 #[cfg(feature = "veil")]
                 {
                     if let Some(port) = socks5_port {
@@ -3589,6 +3725,23 @@ impl Organism {
                     if !trust.is_empty() {
                         self.veil_trust = trust;
                     }
+                    if let Some(a) = advertise {
+                        self.veil_advertise = Some(a);
+                    }
+                    if let Some(i) = identity {
+                        self.veil_identity_path = Some(std::path::PathBuf::from(i));
+                    }
+                    if rotate_identity {
+                        self.veil_rotate_identity = true;
+                    }
+                    if let Some(eb) = egress_bind {
+                        match eb.parse::<std::net::IpAddr>() {
+                            Ok(ip) => self.veil_egress_bind = Some(ip),
+                            Err(_) => {
+                                return Response::Err { message: format!("--egress-bind inválido: {eb}") }
+                            }
+                        }
+                    }
                     match self.start_veil_service().await {
                         Ok(bound) => Response::Ok {
                             message: format!("VEIL Ω iniciado: escutando em {bound}"),
@@ -3600,7 +3753,7 @@ impl Organism {
                 }
                 #[cfg(not(feature = "veil"))]
                 {
-                    let _ = (mode, socks5_port, role, listen, trust);
+                    let _ = (mode, socks5_port, role, listen, trust, advertise, identity, rotate_identity, egress_bind);
                     Response::Err {
                         message: "recompile mycelium-node com --features veil".into(),
                     }

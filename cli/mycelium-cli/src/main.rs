@@ -125,6 +125,21 @@ enum Commands {
         /// Ativa autenticação estrita anti-substituição no modo client.
         #[arg(long = "veil-trust")]
         veil_trust: Vec<String>,
+        /// Endereço público anunciado no descritor assinado (ex.: 203.0.113.9:9050).
+        /// Separado do --veil-listen; nunca use 0.0.0.0.
+        #[arg(long = "veil-advertise")]
+        veil_advertise: Option<String>,
+        /// Caminho da identidade persistente do nó (GhostId + ML-KEM-1024).
+        /// Padrão: {home}/veil-identity.json (permissões 0600).
+        #[arg(long = "veil-identity")]
+        veil_identity: Option<PathBuf>,
+        /// Rota a identidade Veil explicitamente (nunca implícita em reinício).
+        #[arg(long = "veil-rotate-identity")]
+        veil_rotate_identity: bool,
+        /// IP de origem explícito do egresso do Exit (multi-homing). Sob NAT o destino
+        /// observa o IP da tradução, não este bind.
+        #[arg(long = "veil-egress-bind")]
+        veil_egress_bind: Option<std::net::IpAddr>,
     },
     Status,
     Sow {
@@ -396,6 +411,18 @@ enum VeilCmd {
         /// Pinning de identidade de produção: "<nome>:<hex_identity_pubkey>" por salto.
         #[arg(long, value_name = "NOME:HEX")]
         trust: Vec<String>,
+        /// Endereço público anunciado no descritor (ex.: 203.0.113.9:9050). Separado do listen.
+        #[arg(long, value_name = "HOST:PORTA")]
+        advertise: Option<String>,
+        /// Caminho da identidade persistente do nó (GhostId + ML-KEM-1024).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+        /// Rota a identidade Veil explicitamente (nunca implícita em reinício).
+        #[arg(long)]
+        rotate_identity: bool,
+        /// IP de origem explícito do egresso do Exit (multi-homing).
+        #[arg(long)]
+        egress_bind: Option<std::net::IpAddr>,
     },
     /// Encerra o serviço VEIL Ω e desliga o SOCKS5 proxy.
     Stop,
@@ -638,6 +665,10 @@ fn main() {
             veil_middles,
             veil_exits,
             veil_trust,
+            veil_advertise,
+            veil_identity,
+            veil_rotate_identity,
+            veil_egress_bind,
         } => {
             #[cfg(not(feature = "license"))]
             let _ = licensed_peers;
@@ -684,6 +715,10 @@ fn main() {
                 veil_middles,
                 veil_exits,
                 veil_trust,
+                veil_advertise,
+                veil_identity,
+                veil_rotate_identity,
+                veil_egress_bind,
             },
             upnp,
             ))
@@ -2722,13 +2757,17 @@ async fn veil_cmd(home: &PathBuf, action: VeilCmd) -> Result<(), String> {
         VeilCmd::Status => {
             print_response(call(&sock, Request::VeilStatus).await?)
         }
-        VeilCmd::Start { mode, port, role, listen, trust } => {
+        VeilCmd::Start { mode, port, role, listen, trust, advertise, identity, rotate_identity, egress_bind } => {
             print_response(call(&sock, Request::VeilStart {
                 mode: Some(mode),
                 socks5_port: Some(port),
                 role,
                 listen,
                 trust,
+                advertise,
+                identity: identity.map(|p| p.display().to_string()),
+                rotate_identity,
+                egress_bind: egress_bind.map(|ip| ip.to_string()),
             }).await?)
         }
         VeilCmd::Stop => {

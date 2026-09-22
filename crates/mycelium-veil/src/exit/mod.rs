@@ -126,9 +126,14 @@ impl ExitPolicyValidator {
 /// Encaminhador do Nó de Saída (conecta ao destino na internet real).
 pub struct ExitForwarder {
     validator: ExitPolicyValidator,
-    /// IP ao qual as conexões de saída devem ser vinculadas (o IP público do próprio Exit).
-    /// Sem este vínculo, o kernel escolhe o IP de origem pela rota, o que pode mascarar
-    /// o endereço do Exit em hosts multi-homed.
+    /// IP local ao qual as conexões de saída DEVEM ser vinculadas (hosts multi-homed).
+    ///
+    /// Semântica: este vínculo escolhe o IP de origem local do socket de egresso, o que é
+    /// relevante apenas quando o nó possui várias interfaces públicas. **Não** garante o
+    /// endereço observado pelo destino: sob NAT, o IP público é o resultado da tradução de
+    /// endereços da rede (o destino vê o IP do roteador NAT, não este bind). O padrão
+    /// (`None`) deixa a rota do sistema escolher a origem — comportamento correto na maioria
+    /// dos hosts, inclusive atrás de NAT com port-forwarding.
     bind_source: Option<IpAddr>,
 }
 
@@ -140,7 +145,8 @@ impl ExitForwarder {
         }
     }
 
-    /// Construtor com vínculo de IP de origem explícito (endereço público do nó Exit).
+    /// Construtor com vínculo de IP de origem explícito (hosts multi-homed).
+    /// Aviso NAT: o IP observado pelo destino pode ser o da tradução da rede, não este IP.
     pub fn with_bind_source(policy: ExitPolicy, bind_source: IpAddr) -> Self {
         Self {
             validator: ExitPolicyValidator::new(policy),

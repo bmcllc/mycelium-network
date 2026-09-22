@@ -20,6 +20,7 @@
 pub mod config;
 pub mod crypto;
 pub mod exit;
+pub mod identity;
 pub mod layers;
 pub mod planes;
 pub mod socks5;
@@ -29,6 +30,7 @@ pub mod tunnel;
 pub use config::{ExitPolicy, VeilConfig, VeilMode};
 pub use crypto::cell::{CellCommand, VeilCell, CELL_SIZE};
 pub use crypto::{HopKeys, CryptoError};
+pub use identity::{VeilNodeIdentity, VEIL_NODE_IDENTITY_TTL};
 pub use exit::{ExitForwarder, ExitPolicyValidator};
 pub use layers::{LayerPipeline, VeilLayer};
 pub use planes::live::{

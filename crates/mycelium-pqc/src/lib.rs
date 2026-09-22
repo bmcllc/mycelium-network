@@ -62,6 +62,22 @@ pub fn mlkem_encapsulate(public_key: &[u8]) -> Result<KemEncap, PqcError> {
     })
 }
 
+/// Reconstrói um `KemKeyPair` a partir da chave privada (usado para restaurar
+/// a identidade persistente de um nó VEIL Ω entre reinícios).
+pub fn mlkem_keypair_from_private(private_key: &[u8]) -> Result<KemKeyPair, PqcError> {
+    type Dk = <MlKem1024 as KemCore>::DecapsulationKey;
+    type Ek = <MlKem1024 as KemCore>::EncapsulationKey;
+    let dk_arr = private_key
+        .try_into()
+        .map_err(|_| PqcError::BadLength("ML-KEM dk".into()))?;
+    let dk = Dk::from_bytes(dk_arr);
+    let ek: Ek = dk.encapsulation_key().clone();
+    Ok(KemKeyPair {
+        public_key: ek.as_bytes().to_vec(),
+        dk_bytes: dk.as_bytes().to_vec(),
+    })
+}
+
 pub fn mlkem_decapsulate(private_key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, PqcError> {
     type Dk = <MlKem1024 as KemCore>::DecapsulationKey;
     let dk_arr = private_key
@@ -85,6 +101,19 @@ mod tests {
         let kp = mlkem_keygen();
         let enc = mlkem_encapsulate(&kp.public_key).expect("encap");
         let ss = mlkem_decapsulate(kp.private_bytes(), &enc.ciphertext).expect("decap");
+        assert_eq!(ss, enc.shared_secret);
+    }
+
+    #[test]
+    fn mlkem_keypair_restore_from_private() {
+        let kp = mlkem_keygen();
+        let restored = mlkem_keypair_from_private(kp.private_bytes()).expect("restore");
+        assert_eq!(kp.public_key, restored.public_key, "chave pública deve ser idêntica à derivada da privada");
+        assert_eq!(kp.private_bytes(), restored.private_bytes(), "chave privada deve ser preservada byte-a-byte");
+
+        // O par restaurado continua operacional para encapsular/decapsular.
+        let enc = mlkem_encapsulate(&restored.public_key).expect("encap com par restaurado");
+        let ss = mlkem_decapsulate(restored.private_bytes(), &enc.ciphertext).expect("decap com par restaurado");
         assert_eq!(ss, enc.shared_secret);
     }
 }
