@@ -69,13 +69,23 @@ mod chronicle_tests {
 // Fiel a `get_h_generator`/`create_pedersen_commitment` de void_core.
 
 fn pedersen_h_point() -> curve25519_dalek::edwards::EdwardsPoint {
-    let h_scalar = Scalar::from_bytes_mod_order_wide(
-        Sha3_512::digest(b"hydra-pedersen-H-generator-v8")
-            .as_slice()
-            .try_into()
-            .unwrap(),
-    );
-    ED25519_BASEPOINT_POINT * h_scalar
+    // Audit fix: generate independent generator H where discrete log log_G(H) is unknown (nothing-up-my-sleeve).
+    // Uses hash-to-curve with domain separation by finding the first valid curve point from SHA3-256
+    // and multiplying by the curve cofactor to clear small-order components.
+    for counter in 0u32..1000 {
+        let mut h = Sha3_256::new();
+        h.update(b"mycelium-veil-pedersen-H-generator-v1");
+        h.update(counter.to_be_bytes());
+        let digest: [u8; 32] = h.finalize().into();
+        let compressed = curve25519_dalek::edwards::CompressedEdwardsY(digest);
+        if let Some(pt) = compressed.decompress() {
+            let cleared = pt.mul_by_cofactor();
+            if !cleared.is_small_order() {
+                return cleared;
+            }
+        }
+    }
+    panic!("Failed to derive independent Pedersen H generator");
 }
 
 /// Commitment: C = r·G + v·H (blinding fornecido pelo caller).
@@ -183,9 +193,37 @@ pub fn hashcash_check(digest: &[u8], zero_bits: u8) -> bool {
     true
 }
 
+/// Prova verificável anti-Sybil de Hashcash PoW ligando trabalho ao recurso.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HashcashProof {
+    pub resource: Vec<u8>,
+    pub nonce: u64,
+    pub zero_bits: u8,
+    pub digest: [u8; 32],
+}
+
+impl HashcashProof {
+    /// Verifica se a prova é válida para um recurso esperado e dificuldade mínima.
+    pub fn verify(&self, expected_resource: &[u8], min_zero_bits: u8) -> bool {
+        if self.resource != expected_resource || self.zero_bits < min_zero_bits {
+            return false;
+        }
+        let mut h = Sha3_256::new();
+        h.update(&self.resource);
+        h.update(self.nonce.to_be_bytes());
+        let computed: [u8; 32] = h.finalize().into();
+        computed == self.digest && hashcash_check(&self.digest, self.zero_bits)
+    }
+}
+
 /// SHA3-256 hashcash: nonce tal que digest(resource ‖ nonce) tem
-/// `zero_bits` leading bits a zero. (Toy PoW: devolve o digest.)
+/// `zero_bits` leading bits a zero. (Mantido por compatibilidade legada, devolve digest.)
 pub fn hashcash_mint(resource: &[u8], zero_bits: u8) -> Vec<u8> {
+    hashcash_mint_proof(resource, zero_bits).digest.to_vec()
+}
+
+/// Gera uma prova verificável HashcashProof ligando o trabalho ao recurso.
+pub fn hashcash_mint_proof(resource: &[u8], zero_bits: u8) -> HashcashProof {
     assert!(zero_bits <= 24, "zero_bits <= 24 p/ mint rápido");
     let mut nonce = 0u64;
     loop {
@@ -194,7 +232,14 @@ pub fn hashcash_mint(resource: &[u8], zero_bits: u8) -> Vec<u8> {
         h.update(nonce.to_be_bytes());
         let d = h.finalize();
         if hashcash_check(&d, zero_bits) {
-            return d.to_vec();
+            let mut digest = [0u8; 32];
+            digest.copy_from_slice(&d);
+            return HashcashProof {
+                resource: resource.to_vec(),
+                nonce,
+                zero_bits,
+                digest,
+            };
         }
         nonce += 1;
         if nonce == u64::MAX {
@@ -203,9 +248,14 @@ pub fn hashcash_mint(resource: &[u8], zero_bits: u8) -> Vec<u8> {
     }
 }
 
+/// Verifica uma prova Hashcash de forma autônoma.
+pub fn hashcash_verify_proof(proof: &HashcashProof, expected_resource: &[u8], min_zero_bits: u8) -> bool {
+    proof.verify(expected_resource, min_zero_bits)
+}
+
 #[cfg(test)]
 mod hashcash_tests {
-    use super::{hashcash_check, hashcash_mint};
+    use super::{hashcash_check, hashcash_mint, hashcash_mint_proof, hashcash_verify_proof};
     use sha3::{Digest, Sha3_256};
 
     #[test]
@@ -215,6 +265,17 @@ mod hashcash_tests {
         assert!(hashcash_check(&minted, 8));
         let d = Sha3_256::digest(b"algo-totalmente-outro");
         assert!(!hashcash_check(&d, 8));
+    }
+
+    #[test]
+    fn verifiable_proof_binds_resource_and_nonce() {
+        let proof = hashcash_mint_proof(b"auth:session:123", 10);
+        assert!(hashcash_verify_proof(&proof, b"auth:session:123", 10));
+        assert!(hashcash_verify_proof(&proof, b"auth:session:123", 8));
+        // Recurso trocado deve falhar
+        assert!(!hashcash_verify_proof(&proof, b"auth:session:999", 10));
+        // Dificuldade maior que o trabalho computado deve falhar
+        assert!(!hashcash_verify_proof(&proof, b"auth:session:123", 24));
     }
 }
 

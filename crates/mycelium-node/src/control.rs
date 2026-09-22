@@ -235,6 +235,17 @@ pub enum Request {
         /// Invoice BOLT11 (string completa `lnbc...`).
         bolt11: String,
     },
+    /// Inicia o serviço VEIL Ω (SOCKS5 + circuitos de privacidade).
+    VeilStart {
+        #[serde(default)]
+        mode: Option<String>,
+        #[serde(default)]
+        socks5_port: Option<u16>,
+    },
+    /// Encerra o serviço VEIL Ω.
+    VeilStop,
+    /// Consulta o estado do serviço VEIL Ω.
+    VeilStatus,
     Shutdown,
 }
 
@@ -291,6 +302,17 @@ pub enum Response {
     AssetSharesResult {
         asset: String,
         holdings: Vec<crate::assets::ShareHolding>,
+    },
+    /// Relatório de estado do serviço VEIL Ω.
+    VeilStatusResult {
+        active: bool,
+        mode: Option<String>,
+        socks5_addr: Option<String>,
+        session_id: Option<String>,
+        bytes_routed: u64,
+        mac_address: Option<String>,
+        kill_switch: String,
+        active_layers: usize,
     },
 }
 
@@ -352,6 +374,9 @@ pub struct StatusReport {
     /// Fase Physarum (exploratory|transport|dormant).
     #[serde(default)]
     pub physarum_phase: String,
+    /// Endereço SOCKS5 Veil ativo, se habilitado.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub veil_socks5: Option<String>,
 }
 
 /// Mensagem interna: pedido + canal de resposta.

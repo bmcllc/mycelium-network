@@ -32,7 +32,7 @@ echo "seeds: $(cat "$SEEDS")"
 
 echo "== daemon B (só seed-file, CPU ociosa) =="
 RUST_LOG=info "$BIN" --home "$B" daemon \
-  --seed-file "$SEEDS" --no-mdns --horizon-port 17512 \
+  --listen /ip4/127.0.0.1/tcp/14012 --seed-file "$SEEDS" --no-mdns --horizon-port 17512 \
   --contribute 2cpu,4gb,100gb >/tmp/lat-b.log 2>&1 &
 
 ok=0

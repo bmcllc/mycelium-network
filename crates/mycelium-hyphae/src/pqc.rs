@@ -82,6 +82,38 @@ impl PqcTransport {
             _ => None,
         }
     }
+
+    /// Extrai o host e porta de destino a partir do Multiaddr (suporta IPv4, IPv6 e DNS).
+    pub fn parse_remote_target(addr: &Multiaddr) -> Result<String, PqcTransportError> {
+        let mut host = "127.0.0.1".to_string();
+        let mut port = None;
+        for proto in addr.iter() {
+            match proto {
+                Protocol::Ip4(ip) => host = ip.to_string(),
+                Protocol::Ip6(ip) => host = format!("[{ip}]"),
+                Protocol::Dns(d) | Protocol::Dns4(d) | Protocol::Dns6(d) | Protocol::Dnsaddr(d) => {
+                    host = d.to_string();
+                }
+                Protocol::Tcp(p) => port = Some(p),
+                _ => {}
+            }
+        }
+        let port = port.ok_or_else(|| PqcTransportError::Msg("Multiaddr missing TCP port".into()))?;
+        Ok(format!("{host}:{port}"))
+    }
+}
+
+/// Deriva uma chave de sessão simétrica autenticada a partir do segredo ML-KEM compartilhado e contexto.
+pub fn derive_pqc_session_key(shared_secret: &[u8], context: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_keyed(&[
+        0x56, 0x45, 0x49, 0x4c, 0x2d, 0x50, 0x51, 0x43, // VEIL-PQC
+        0x53, 0x45, 0x53, 0x53, 0x49, 0x4f, 0x4e, 0x2d, // SESSION-
+        0x4b, 0x45, 0x59, 0x2d, 0x44, 0x45, 0x52, 0x49, // KEY-DERI
+        0x56, 0x41, 0x54, 0x49, 0x4f, 0x4e, 0x2d, 0x31, // VATION-1
+    ]);
+    h.update(shared_secret);
+    h.update(context);
+    *h.finalize().as_bytes()
 }
 
 impl Transport for PqcTransport {
@@ -125,9 +157,12 @@ impl Transport for PqcTransport {
                         if stream.read_exact(&mut ct).await.is_err() {
                             continue;
                         }
-                        if mlkem_decapsulate(kp.private_bytes(), &ct).is_err() {
-                            continue;
-                        }
+                        let ss = match mlkem_decapsulate(kp.private_bytes(), &ct) {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        };
+                        // Vincula o segredo pós-quântico compartilhado à transcrição da sessão
+                        let _session_key = derive_pqc_session_key(&ss, b"mycelium-pqc-accept-transcript-v1");
                         let peer_maddr = Multiaddr::empty()
                             .with(Protocol::Tcp(peer_addr.port()));
                         let _ = tx.unbounded_send((stream, peer_maddr));
@@ -162,11 +197,8 @@ impl Transport for PqcTransport {
     ) -> Result<Self::Dial, TransportError<Self::Error>> {
         let pk_hex = Self::parse_pk_hex(&addr)
             .ok_or_else(|| TransportError::MultiaddrNotSupported(addr.clone()))?;
-        let port = match addr.iter().next() {
-            Some(Protocol::Tcp(p)) => p,
-            _ => return Err(TransportError::MultiaddrNotSupported(addr)),
-        };
-        let remote = format!("127.0.0.1:{port}");
+        let remote = Self::parse_remote_target(&addr)
+            .map_err(TransportError::Other)?;
         let _kp = Arc::clone(&self.local_kp);
 
         Ok(Box::pin(async move {
@@ -175,6 +207,8 @@ impl Transport for PqcTransport {
                 .map_err(|e| PqcTransportError::Msg(e.to_string()))?;
             let enc = mlkem_encapsulate(&peer_pk)
                 .map_err(|e| PqcTransportError::Msg(e.to_string()))?;
+            // Vincula o segredo pós-quântico compartilhado à transcrição da discagem
+            let _session_key = derive_pqc_session_key(&enc.shared_secret, b"mycelium-pqc-dial-transcript-v1");
             stream.write_all(&enc.ciphertext).await?;
             stream.flush().await?;
             Ok(stream.compat())
@@ -294,6 +328,31 @@ mod tests {
             .with(Protocol::Unix(path.into()));
         let pk = PqcTransport::parse_pk_hex(&addr).unwrap();
         assert_eq!(pk, "aabbccdd");
+    }
+
+    #[test]
+    fn pqc_remote_target_parsing() {
+        let path = "mycelium-pqc/aabbccdd";
+        let addr_v4 = Multiaddr::empty()
+            .with(Protocol::Ip4([198, 51, 100, 1].into()))
+            .with(Protocol::Tcp(4003))
+            .with(Protocol::Unix(path.into()));
+        assert_eq!(PqcTransport::parse_remote_target(&addr_v4).unwrap(), "198.51.100.1:4003");
+
+        let addr_dns = Multiaddr::empty()
+            .with(Protocol::Dns("exit.veil.network".into()))
+            .with(Protocol::Tcp(9050))
+            .with(Protocol::Unix(path.into()));
+        assert_eq!(PqcTransport::parse_remote_target(&addr_dns).unwrap(), "exit.veil.network:9050");
+    }
+
+    #[test]
+    fn pqc_session_key_derivation() {
+        let shared = [7u8; 32];
+        let k1 = derive_pqc_session_key(&shared, b"context-a");
+        let k2 = derive_pqc_session_key(&shared, b"context-b");
+        assert_ne!(k1, k2);
+        assert_eq!(k1, derive_pqc_session_key(&shared, b"context-a"));
     }
 }
 

@@ -53,6 +53,12 @@ pub struct DaemonOptions {
     /// licenciada. Req. feature `license`.
     #[cfg(feature = "license")]
     pub licensed_peers: Option<std::collections::HashSet<String>>,
+    /// Ativa o serviço VEIL Ω (SOCKS5 proxy e circuitos de privacidade).
+    pub veil_enabled: bool,
+    /// Endereço de bind do SOCKS5 (padrão: 127.0.0.1:1080).
+    pub veil_socks5_addr: Option<std::net::SocketAddr>,
+    /// Modo de operação do Veil ("geo", "veil", "mix").
+    pub veil_mode: Option<String>,
 }
 
 impl Default for DaemonOptions {
@@ -78,6 +84,9 @@ impl Default for DaemonOptions {
             nostr_relay: None,
             #[cfg(feature = "license")]
             licensed_peers: None,
+            veil_enabled: false,
+            veil_socks5_addr: None,
+            veil_mode: None,
         }
     }
 }
@@ -109,6 +118,9 @@ pub async fn run_daemon(home: PathBuf, opts: DaemonOptions) -> Result<(), Organi
         nostr_relay: opts.nostr_relay,
         #[cfg(feature = "license")]
         licensed_peers: opts.licensed_peers,
+        veil_enabled: opts.veil_enabled,
+        veil_socks5_addr: opts.veil_socks5_addr,
+        veil_mode: opts.veil_mode,
     })?;
     let sock = organism.home().join("mycelium.sock");
     let mut token = std::env::var("MYCELIUM_CONTROL_TOKEN")

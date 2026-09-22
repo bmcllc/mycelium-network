@@ -3145,9 +3145,11 @@ dependencies = [
  "mycelium-hyphae",
  "mycelium-nutrients",
  "mycelium-pheromones",
+ "mycelium-pqc",
  "mycelium-sporebank",
  "mycelium-store",
  "mycelium-tropical",
+ "mycelium-veil",
  "mycelium-zkp",
  "plasma",
  "reqwest 0.12.28",
@@ -3302,6 +3304,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "mycelium-veil"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "blake3",
+ "bytes",
+ "chacha20poly1305",
+ "hex",
+ "mycelium-core",
+ "mycelium-distancebridge",
+ "mycelium-ghostid",
+ "mycelium-pqc",
+ "mycelium-qel",
+ "mycelium-zkp",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "mycelium-zkp"
 version = "0.1.0"
 dependencies = [
@@ -3314,6 +3340,7 @@ dependencies = [
  "merlin",
  "ml-dsa",
  "rand_core 0.6.4",
+ "serde",
  "sha3 0.10.9",
 ]
 

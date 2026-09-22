@@ -157,8 +157,8 @@ fn hash_hex(bytes: &[u8]) -> String {
 /// Executa a receita sobre os bytes de entrada e devolve o output processado.
 fn run_recipe(recipe: &str, input: &[u8]) -> Result<Vec<u8>, String> {
     match recipe {
-        // Receitas determinísticas embutidas (re-provm idêntico em qualquer vértice).
-        "sha256" | "sha256sum" => Ok(blake3::hash(input).as_bytes().to_vec()),
+        // Receitas determinísticas embutidas (re-provam idêntico em qualquer vértice).
+        "sha256" | "sha256sum" => Ok(mycelium_ghostid::sha256(input).to_vec()),
         "blake3" => Ok(blake3::hash(input).as_bytes().to_vec()),
         "echo" => Ok(input.to_vec()),
         // Receita externa via shell (exige mesmo toolchain/versão para re-provar).

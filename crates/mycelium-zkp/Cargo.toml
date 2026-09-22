@@ -22,6 +22,7 @@ sha3 = { version = "0.10" }
 hex = { workspace = true }
 curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc"] }
 rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
+serde = { workspace = true }
 
 # Phase A — range-proof (void_core lock: bulletproofs =4.0.0, merlin =3.0.0, dalek-ng =4.1.1)
 bulletproofs = { version = "=4.0.0", optional = true }

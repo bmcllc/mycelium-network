@@ -94,6 +94,9 @@ pub struct OrganismConfig {
     /// licenciada é ativado: apenas estes PeerIds se conectam. Req. feature `license`.
     #[cfg(feature = "license")]
     pub licensed_peers: Option<std::collections::HashSet<String>>,
+    pub veil_enabled: bool,
+    pub veil_socks5_addr: Option<std::net::SocketAddr>,
+    pub veil_mode: Option<String>,
 }
 
 pub struct Organism {
@@ -138,6 +141,16 @@ pub struct Organism {
     known_zones_ts: HashMap<NodeId, u64>,
     /// Quantas vezes resolveu rota DHT (`ClosestPeers`) no overlay de zonas.
     routing_hits: u64,
+    #[cfg(feature = "veil")]
+    veil_engine: Option<std::sync::Arc<mycelium_veil::VeilEngine>>,
+    #[cfg(feature = "veil")]
+    veil_socks5_handle: Option<tokio::task::JoinHandle<()>>,
+    #[cfg(feature = "veil")]
+    veil_socks5_addr: Option<std::net::SocketAddr>,
+    #[cfg(feature = "veil")]
+    veil_mode: Option<String>,
+    #[cfg(feature = "veil")]
+    veil_enabled: bool,
     ion_hosts: HashMap<String, String>,
     catalog: std::sync::Arc<std::sync::Mutex<mycelium_store::StoreCatalog>>,
     home: PathBuf,
@@ -405,6 +418,16 @@ impl Organism {
             known_zones: HashMap::new(),
             known_zones_ts: HashMap::new(),
             routing_hits: 0,
+            #[cfg(feature = "veil")]
+            veil_engine: None,
+            #[cfg(feature = "veil")]
+            veil_socks5_handle: None,
+            #[cfg(feature = "veil")]
+            veil_socks5_addr: config.veil_socks5_addr,
+            #[cfg(feature = "veil")]
+            veil_mode: config.veil_mode,
+            #[cfg(feature = "veil")]
+            veil_enabled: config.veil_enabled,
             ion_hosts: HashMap::new(),
             catalog: std::sync::Arc::new(std::sync::Mutex::new(catalog)),
             home: config.home.clone(),
@@ -537,6 +560,14 @@ impl Organism {
                 MyceliumPhase::Transport => "transport".into(),
                 MyceliumPhase::Dormant => "dormant".into(),
             },
+            #[cfg(feature = "veil")]
+            veil_socks5: if self.veil_enabled {
+                self.veil_socks5_addr.map(|a| a.to_string())
+            } else {
+                None
+            },
+            #[cfg(not(feature = "veil"))]
+            veil_socks5: None,
         }
     }
 
@@ -2305,7 +2336,134 @@ impl Organism {
         }
     }
 
-    fn handle_control(&mut self, req: Request) -> Response {
+    #[cfg(feature = "veil")]
+    pub async fn start_veil_service(&mut self) -> Result<std::net::SocketAddr, OrganismError> {
+        use mycelium_veil::{
+            proxy_socks5_connection, ExitForwarder, LiveCircuitManager,
+            Socks5Server, VeilConfig, VeilEngine, VeilMode,
+        };
+        use std::sync::Arc;
+
+        self.stop_veil_service();
+
+        let socks_addr = self.veil_socks5_addr.unwrap_or_else(|| {
+            "127.0.0.1:1080".parse().expect("valid loopback socks5 addr")
+        });
+
+        let mut config = match self.veil_mode.as_deref() {
+            Some("geo") => VeilConfig::new_geo(socks_addr.port()),
+            Some("mix") => VeilConfig::new_mix(),
+            _ => VeilConfig::new_veil(socks_addr.port()),
+        };
+        config.socks5_bind = socks_addr;
+
+        let engine = Arc::new(VeilEngine::new(config.clone()));
+        let _session = engine
+            .start_session(config.mode)
+            .map_err(|e| OrganismError::Msg(e.to_string()))?;
+
+        let server = Socks5Server::new(socks_addr);
+        let listener = server
+            .bind()
+            .await
+            .map_err(|e| OrganismError::Msg(e.to_string()))?;
+        let actual_bind = listener.local_addr().map_err(|e| OrganismError::Msg(e.to_string()))?;
+
+        let forwarder = Arc::new(ExitForwarder::new(config.exit_policy.clone()));
+        let kill_switch = engine.kill_switch().clone();
+
+        let live_mgr = LiveCircuitManager::new();
+        let kp1 = mycelium_pqc::mlkem_keygen();
+        let kp2 = mycelium_pqc::mlkem_keygen();
+        let kp3 = mycelium_pqc::mlkem_keygen();
+
+        let hops = if config.mode == VeilMode::Geo {
+            vec![mycelium_veil::CircuitHopNode {
+                node_id: "exit-geo-node".into(),
+                public_kem_key: kp3.public_key.clone(),
+                endpoint: "127.0.0.1:0".into(),
+            }]
+        } else {
+            vec![
+                mycelium_veil::CircuitHopNode {
+                    node_id: "guard-node".into(),
+                    public_kem_key: kp1.public_key.clone(),
+                    endpoint: "127.0.0.1:0".into(),
+                },
+                mycelium_veil::CircuitHopNode {
+                    node_id: "middle-node".into(),
+                    public_kem_key: kp2.public_key.clone(),
+                    endpoint: "127.0.0.1:0".into(),
+                },
+                mycelium_veil::CircuitHopNode {
+                    node_id: "exit-node".into(),
+                    public_kem_key: kp3.public_key.clone(),
+                    endpoint: "127.0.0.1:0".into(),
+                },
+            ]
+        };
+
+        let circuit = live_mgr
+            .create_circuit(hops)
+            .map_err(|e| OrganismError::Msg(e.to_string()))?;
+
+        let ks_clone = kill_switch.clone();
+        let task_handle = tokio::spawn(async move {
+            tracing::info!(bind = %actual_bind, "VEIL SOCKS5 proxy escutando");
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _peer_addr)) => {
+                        let c = Arc::clone(&circuit);
+                        let f = Arc::clone(&forwarder);
+                        let ks = ks_clone.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = proxy_socks5_connection(stream, c, f, ks).await {
+                                tracing::debug!(error = %e, "conexao socks5 finalizada");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "socks5 listener fechado");
+                        break;
+                    }
+                }
+            }
+        });
+
+        self.veil_engine = Some(engine);
+        self.veil_socks5_handle = Some(task_handle);
+        self.veil_socks5_addr = Some(actual_bind);
+        self.veil_enabled = true;
+
+        tracing::info!(
+            bind = %actual_bind,
+            "VEIL Ω ativo no organismo — SOCKS5 pronto para conexões"
+        );
+
+        Ok(actual_bind)
+    }
+
+    #[cfg(feature = "veil")]
+    pub fn stop_veil_service(&mut self) {
+        if let Some(handle) = self.veil_socks5_handle.take() {
+            handle.abort();
+        }
+        if let Some(engine) = self.veil_engine.take() {
+            engine.stop_session();
+        }
+        self.veil_enabled = false;
+        tracing::info!("VEIL Ω encerrado no organismo");
+    }
+
+    #[cfg(not(feature = "veil"))]
+    pub async fn start_veil_service(&mut self) -> Result<std::net::SocketAddr, OrganismError> {
+        Err(OrganismError::Msg("recompile mycelium-node com --features veil".into()))
+    }
+
+    #[cfg(not(feature = "veil"))]
+    pub fn stop_veil_service(&mut self) {}
+
+    async fn handle_control(&mut self, req: Request) -> Response {
         match req {
             Request::Status => Response::Status(Box::new(self.status_report())),
             Request::Sow {
@@ -3169,6 +3327,111 @@ impl Organism {
                     Err(e) => Response::Err { message: format!("invoice BOLT11 parse: {e}") },
                 }
             }
+            Request::VeilStart { mode, socks5_port } => {
+                #[cfg(feature = "veil")]
+                {
+                    if let Some(port) = socks5_port {
+                        self.veil_socks5_addr = Some(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+                    }
+                    if let Some(m) = mode {
+                        self.veil_mode = Some(m);
+                    }
+                    match self.start_veil_service().await {
+                        Ok(bound) => Response::Ok {
+                            message: format!("VEIL Ω iniciado: SOCKS5 escutando em {bound}"),
+                        },
+                        Err(e) => Response::Err {
+                            message: format!("falha ao iniciar VEIL Ω: {e}"),
+                        },
+                    }
+                }
+                #[cfg(not(feature = "veil"))]
+                {
+                    let _ = (mode, socks5_port);
+                    Response::Err {
+                        message: "recompile mycelium-node com --features veil".into(),
+                    }
+                }
+            }
+            Request::VeilStop => {
+                #[cfg(feature = "veil")]
+                {
+                    self.stop_veil_service();
+                    Response::Ok {
+                        message: "VEIL Ω finalizado".into(),
+                    }
+                }
+                #[cfg(not(feature = "veil"))]
+                {
+                    Response::Err {
+                        message: "recompile mycelium-node com --features veil".into(),
+                    }
+                }
+            }
+            Request::VeilStatus => {
+                #[cfg(feature = "veil")]
+                {
+                    let active = self.veil_enabled;
+                    let (mode, session_id, bytes_routed, mac_address, kill_switch, active_layers) =
+                        if let Some(ref eng) = self.veil_engine {
+                            let ks_state = match eng.kill_switch().state() {
+                                mycelium_veil::KillSwitchState::Triggered => "triggered",
+                                mycelium_veil::KillSwitchState::Armed => "armed",
+                                mycelium_veil::KillSwitchState::Disarmed => "disarmed",
+                            };
+                            let sess = eng.current_session();
+                            let sess_id = sess.as_ref().map(|s| s.session_id.clone());
+                            let mac = sess.as_ref().map(|s| {
+                                format!(
+                                    "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                                    s.mac_address[0], s.mac_address[1], s.mac_address[2],
+                                    s.mac_address[3], s.mac_address[4], s.mac_address[5]
+                                )
+                            });
+                            let bytes = sess.as_ref().map(|s| s.bytes_routed).unwrap_or(0);
+                            let layers = sess.as_ref().map(|s| s.active_layers).unwrap_or(7);
+                            let mode_str = match eng.config().mode {
+                                mycelium_veil::VeilMode::Veil => "veil",
+                                mycelium_veil::VeilMode::Geo => "geo",
+                                mycelium_veil::VeilMode::Mix => "mix",
+                            };
+                            (
+                                Some(mode_str.to_string()),
+                                sess_id,
+                                bytes,
+                                mac,
+                                ks_state.to_string(),
+                                layers,
+                            )
+                        } else {
+                            (
+                                self.veil_mode.clone(),
+                                None,
+                                0,
+                                None,
+                                "uninitialized".to_string(),
+                                0,
+                            )
+                        };
+
+                    Response::VeilStatusResult {
+                        active,
+                        mode,
+                        socks5_addr: self.veil_socks5_addr.map(|a| a.to_string()),
+                        session_id,
+                        bytes_routed,
+                        mac_address,
+                        kill_switch,
+                        active_layers,
+                    }
+                }
+                #[cfg(not(feature = "veil"))]
+                {
+                    Response::Err {
+                        message: "recompile mycelium-node com --features veil".into(),
+                    }
+                }
+            }
             Request::Shutdown => Response::Ok {
                 message: "encerrando".into(),
             },
@@ -3364,6 +3627,18 @@ impl Organism {
             "política de membrana"
         );
 
+        #[cfg(feature = "veil")]
+        if self.veil_enabled {
+            match self.start_veil_service().await {
+                Ok(bound) => {
+                    tracing::info!(bind = %bound, "VEIL Ω SOCKS5 ativado no boot");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "falha ao iniciar VEIL Ω no boot");
+                }
+            }
+        }
+
         tracing::info!(
             node = %self.gland.node_id().short(),
             peer = %self.hyphae.peer_id(),
@@ -3378,7 +3653,7 @@ impl Organism {
                     match msg {
                         Some(ControlMsg { request, reply }) => {
                             let shutdown = matches!(request, Request::Shutdown);
-                            let resp = self.handle_control(request);
+                            let resp = self.handle_control(request).await;
                             let _ = reply.send(resp);
                             if shutdown {
                                 break;
@@ -3867,6 +4142,7 @@ impl Organism {
         if let Some(h) = self.horizon_handle.take() {
             h.shutdown();
         }
+        self.stop_veil_service();
         self.persist()?;
         self.store.clear_runtime_files();
         tracing::info!("organismo hibernou — estado persistido");

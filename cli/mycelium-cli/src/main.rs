@@ -97,6 +97,15 @@ enum Commands {
         /// Depreciado: ignorado (Política de Membrana — sem UPnP).
         #[arg(long = "upnp")]
         upnp: bool,
+        /// Ativa o serviço VEIL Ω (SOCKS5 proxy e privacidade pós-quântica).
+        #[arg(long = "veil")]
+        veil: bool,
+        /// Endereço de escuta do SOCKS5 (default: 127.0.0.1:1080).
+        #[arg(long = "veil-socks5")]
+        veil_socks5: Option<std::net::SocketAddr>,
+        /// Modo de operação VEIL: veil (3 saltos), geo (1 salto), mix (mixnet).
+        #[arg(long = "veil-mode")]
+        veil_mode: Option<String>,
     },
     Status,
     Sow {
@@ -340,6 +349,28 @@ enum Commands {
         #[command(subcommand)]
         action: RepoCmd,
     },
+    /// Infraestrutura pós-quântica de privacidade VEIL Ω (SOCKS5, Onion Routing, Anti-SSRF).
+    Veil {
+        #[command(subcommand)]
+        action: VeilCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum VeilCmd {
+    /// Consulta o estado da sessão e do proxy VEIL Ω.
+    Status,
+    /// Inicia o serviço VEIL Ω e SOCKS5 proxy no nó em execução.
+    Start {
+        /// Modo de operação: veil (3 saltos), geo (1 salto), mix (mixnet).
+        #[arg(long, default_value = "veil")]
+        mode: String,
+        /// Porta local SOCKS5 (default: 1080).
+        #[arg(long, default_value_t = 1080)]
+        port: u16,
+    },
+    /// Encerra o serviço VEIL Ω e desliga o SOCKS5 proxy.
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -568,6 +599,9 @@ fn main() {
             nostr_relay,
             licensed_peers,
             upnp,
+            veil,
+            veil_socks5,
+            veil_mode,
         } => {
             #[cfg(not(feature = "license"))]
             let _ = licensed_peers;
@@ -605,6 +639,9 @@ fn main() {
                 } else {
                     Some(licensed_peers.into_iter().collect())
                 },
+                veil_enabled: veil,
+                veil_socks5_addr: veil_socks5,
+                veil_mode,
             },
             upnp,
             ))
@@ -768,6 +805,7 @@ fn main() {
         }
         Commands::Store { action } => store_cmd(&home, action),
         Commands::Repo { action } => rt.block_on(repo_cmd(&home, action)),
+        Commands::Veil { action } => rt.block_on(veil_cmd(&home, action)),
     };
 
     if let Err(e) = result {
@@ -2228,6 +2266,38 @@ fn print_response(resp: Response) -> Result<(), String> {
             if let Some(dns) = &s.dns_seed {
                 println!("    dns_seed   : {dns}");
             }
+            if let Some(socks) = &s.veil_socks5 {
+                println!("    veil_socks5: {socks}");
+            }
+            Ok(())
+        }
+        Response::VeilStatusResult {
+            active,
+            mode,
+            socks5_addr,
+            session_id,
+            bytes_routed,
+            mac_address,
+            kill_switch,
+            active_layers,
+        } => {
+            println!("[🛡️] Mycelium VEIL Ω");
+            println!("    estado     : {}", if active { "ativo 🟢" } else { "inativo ⚪" });
+            if let Some(m) = mode {
+                println!("    modo       : {m}");
+            }
+            if let Some(s) = socks5_addr {
+                println!("    socks5     : {s}");
+            }
+            if let Some(id) = session_id {
+                println!("    sessão_id  : {id}");
+            }
+            if let Some(mac) = mac_address {
+                println!("    mac_efêmero: {mac}");
+            }
+            println!("    kill_switch: {kill_switch}");
+            println!("    camadas    : {active_layers}/7 ativas");
+            println!("    tráfego    : {bytes_routed} bytes");
             Ok(())
         }
         Response::Err { message } => Err(message),
@@ -2587,6 +2657,24 @@ async fn repo_cmd(home: &PathBuf, action: RepoCmd) -> Result<(), String> {
                 }
                 _ => Err("resposta inesperada no status".into()),
             }
+        }
+    }
+}
+
+async fn veil_cmd(home: &PathBuf, action: VeilCmd) -> Result<(), String> {
+    let sock = home.join("mycelium.sock");
+    match action {
+        VeilCmd::Status => {
+            print_response(call(&sock, Request::VeilStatus).await?)
+        }
+        VeilCmd::Start { mode, port } => {
+            print_response(call(&sock, Request::VeilStart {
+                mode: Some(mode),
+                socks5_port: Some(port),
+            }).await?)
+        }
+        VeilCmd::Stop => {
+            print_response(call(&sock, Request::VeilStop).await?)
         }
     }
 }

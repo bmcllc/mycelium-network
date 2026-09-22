@@ -1,0 +1,28 @@
+[package]
+name = "mycelium-veil"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Mycelium VEIL Ω: infraestrutura P2P pós-quântica de anonimato, circuitos onion (LIVE), mixnet com atrasos (MIX), SOCKS5 e fusão ET-COSMIC-OLD"
+
+[dependencies]
+mycelium-core = { workspace = true }
+mycelium-ghostid = { workspace = true }
+mycelium-qel = { workspace = true }
+mycelium-pqc = { workspace = true }
+mycelium-zkp = { workspace = true }
+mycelium-distancebridge = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+chacha20poly1305 = "0.10"
+aes-gcm = "0.10"
+zeroize = { version = "1.9", features = ["zeroize_derive"] }

@@ -33,6 +33,8 @@ libp2p = { workspace = true }
 axum = { workspace = true }
 base64 = "0.22"
 mycelium-zkp = { workspace = true, features = ["license", "bolt11"], optional = true }
+mycelium-veil = { workspace = true, optional = true }
+mycelium-pqc = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
@@ -42,6 +44,7 @@ axum = { workspace = true }
 
 [features]
 default = []
+veil = ["dep:mycelium-veil", "dep:mycelium-pqc"]
 webrtc = ["mycelium-hyphae/webrtc"]
 license = ["dep:mycelium-zkp", "mycelium-hyphae/license"]
 # Lightning BOLT11 no runtime (parse/validação de invoice para a economia voucher).
