@@ -18,6 +18,7 @@ use crate::crypto::{
     CELL_SIZE, MAX_STREAM_DATA_CHUNK,
 };
 use crate::config::ExitPolicy;
+use crate::bridge::EntryPool;
 use crate::exit::ExitForwarder;
 use crate::socks5::Socks5Target;
 use crate::transport::{link_handshake_client, link_handshake_server, VeilSecureStream};
@@ -957,7 +958,7 @@ impl LiveCircuitClient {
     /// Modo de confiança `Test` (TOFU): verifica assinatura, validade temporal e consistência
     /// interna de cada descritor, sem identidade fixada externamente.
     pub async fn connect(circuit_id: u32, hops: Vec<CircuitHopNode>) -> Result<Self, VeilError> {
-        Self::connect_internal(circuit_id, hops, DeploymentMode::Test, &[]).await
+        Self::connect_internal(circuit_id, hops, DeploymentMode::Test, &[], None).await
     }
 
     /// Modo produção: além da verificação criptográfica e temporal, cada salto deve corresponder
@@ -968,7 +969,23 @@ impl LiveCircuitClient {
         hops: Vec<CircuitHopNode>,
         trusted: &[TrustedIdentity],
     ) -> Result<Self, VeilError> {
-        Self::connect_internal(circuit_id, hops, DeploymentMode::Production, trusted).await
+        Self::connect_internal(circuit_id, hops, DeploymentMode::Production, trusted, None).await
+    }
+
+    /// Modo produção com transporte de entrada intercambiável (P1.3).
+    ///
+    /// Igual a [`LiveCircuitClient::connect_production`], mas o enlace até o Guard é
+    /// estabelecido através do [`EntryPool`] (bridges independentes). O pool comuta para a
+    /// próxima entrada diante de bloqueio e **falha fechado** se todas estiverem
+    /// inacessíveis — nunca há conexão direta ao destino final. O circuito LIVE
+    /// (Guard → Middle → Exit, pins GhostId, QEL) é preservado.
+    pub async fn connect_production_via_entries(
+        circuit_id: u32,
+        hops: Vec<CircuitHopNode>,
+        trusted: &[TrustedIdentity],
+        entries: &EntryPool,
+    ) -> Result<Self, VeilError> {
+        Self::connect_internal(circuit_id, hops, DeploymentMode::Production, trusted, Some(entries)).await
     }
 
     async fn connect_internal(
@@ -976,6 +993,7 @@ impl LiveCircuitClient {
         hops: Vec<CircuitHopNode>,
         deployment: DeploymentMode,
         trusted: &[TrustedIdentity],
+        entries: Option<&EntryPool>,
     ) -> Result<Self, VeilError> {
         if hops.is_empty() {
             return Err(VeilError::Circuit("Circuito deve conter pelo menos 1 nó".into()));
@@ -1014,10 +1032,19 @@ impl LiveCircuitClient {
             }
         }
 
-        // Conecta ao Guard (primeiro salto) com enquadramento PQC autenticado sobre o fio
-        let guard_stream = TcpStream::connect(&hops[0].endpoint)
-            .await
-            .map_err(|e| VeilError::Circuit(format!("Falha ao conectar no nó Guard ({}): {e}", hops[0].endpoint)))?;
+        // Conecta ao Guard (primeiro salto) com enquadramento PQC autenticado sobre o fio.
+        // O transporte de entrada é intercambiável (P1.3): direto ao endpoint do Guard ou
+        // através de bridges independentes. Nenhum caminho conecta o destino final.
+        let guard_stream = match entries {
+            Some(pool) => {
+                let conn = pool.connect(&hops[0].endpoint).await?;
+                tracing::info!(entry = %conn.entry_id, guard = %hops[0].endpoint, "enlace de entrada estabelecido via pool de bridges");
+                conn.stream
+            }
+            None => TcpStream::connect(&hops[0].endpoint)
+                .await
+                .map_err(|e| VeilError::Circuit(format!("Falha ao conectar no nó Guard ({}): {e}", hops[0].endpoint)))?,
+        };
 
         let guard_sec = link_handshake_client(guard_stream, &hops[0].public_kem_key).await?;
         let (mut guard_r, guard_w) = tokio::io::split(guard_sec);
@@ -1811,6 +1838,143 @@ mod tests {
         assert_ne!(observed_ip, "127.0.0.1", "o cliente não pode aparecer como origem");
 
         stream.close().await.expect("stream fechado");
+    }
+
+    /// Verifica que o destino observa o IP do Exit (127.0.0.4) e que a contagem
+    /// de conexões diretas recebidas bate com o esperado (fail-closed).
+    async fn assert_destination_observes_exit(
+        client: &LiveCircuitClient,
+        target_addr: std::net::SocketAddr,
+        direct_hits: &std::sync::atomic::AtomicUsize,
+        expected_hits: usize,
+    ) {
+        let target = Socks5Target::Ip(target_addr);
+        let mut stream = client.open_stream(&target).await.expect("stream para o destino");
+        stream.send_data(b"WHO-AM-I").await.expect("consulta enviada");
+        let observed = stream.receive_data().await.expect("resposta do destino").expect("dados presentes");
+        let observed_str = String::from_utf8_lossy(&observed).to_string();
+        let observed_ip = observed_str.split(':').next().unwrap_or_default();
+        assert_eq!(observed_ip, "127.0.0.4", "destino deve observar o IP do Exit, obtido: {observed_str}");
+        assert_ne!(observed_ip, "127.0.0.2", "o Guard não pode aparecer como origem");
+        assert_ne!(observed_ip, "127.0.0.1", "o cliente não pode aparecer como origem");
+        stream.close().await.expect("stream fechado");
+        assert_eq!(direct_hits.load(Ordering::SeqCst), expected_hits, "contagem de conexões no destino divergiu");
+    }
+
+    /// P1.3: circuito LIVE (Guard -> Middle -> Exit) com transporte de entrada via duas
+    /// bridges independentes. Bloqueio da bridge primária comuta para a secundária;
+    /// bloqueio total falha fechado — nenhuma conexão direta ao destino final.
+    #[tokio::test]
+    async fn test_p1_3_circuit_switches_between_two_bridges_fail_closed() {
+        use crate::bridge::{BridgeEntry, BridgeRelay, EntryPool};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // Destino controlado que observa a origem e contabiliza conexões diretas.
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let counter = direct_hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, peer)) = target_listener.accept().await else { break };
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    if let Ok(n) = stream.read(&mut buf).await {
+                        if n > 0 {
+                            let reply = format!("{}:{}", peer.ip(), peer.port());
+                            let _ = stream.write_all(reply.as_bytes()).await;
+                        }
+                    }
+                });
+            }
+        });
+
+        let exit_policy = ExitPolicy {
+            allowed_ports: vec![target_addr.port()],
+            blocked_ports: vec![],
+            block_private_networks: false,
+            max_bandwidth_bps: 0,
+        };
+
+        // Guard, Middle e Exit em endereços loopback distintos (127.0.0.2/3/4).
+        let (guard_desc, _ga) = spawn_hop_on("127.0.0.2", "guard-bridge-remoto", None).await;
+        let (middle_desc, _ma) = spawn_hop_on("127.0.0.3", "middle-bridge-remoto", None).await;
+        let (exit_desc, _ea) = spawn_hop_on("127.0.0.4", "exit-bridge-remoto", Some(exit_policy)).await;
+
+        // Endpoint real do Guard (o listener) para as bridges encaminharem.
+        let guard_endpoint: std::net::SocketAddr = guard_desc.endpoint.parse().expect("endpoint do Guard");
+
+        // Duas bridges independentes encaminhando o enlace bruto (opaco) para o Guard.
+        let bridge_a = BridgeRelay::spawn("127.0.0.1:0".parse().unwrap(), guard_endpoint)
+            .await
+            .expect("bridge A sobe");
+        let bridge_b = BridgeRelay::spawn("127.0.0.1:0".parse().unwrap(), guard_endpoint)
+            .await
+            .expect("bridge B sobe");
+        let addr_a = bridge_a.listen_addr();
+        let addr_b = bridge_b.listen_addr();
+
+        let mut pool = EntryPool::new();
+        pool.push(Arc::new(BridgeEntry::new("bridge-a", addr_a)));
+        pool.push(Arc::new(BridgeEntry::new("bridge-b", addr_b)));
+
+        // Descritores recebidos pela rede como JSON (mesmo fluxo do teste P1.2).
+        let guard_desc = NodeDescriptor::from_json(&guard_desc.to_json().unwrap()).unwrap();
+        let middle_desc = NodeDescriptor::from_json(&middle_desc.to_json().unwrap()).unwrap();
+        let exit_desc = NodeDescriptor::from_json(&exit_desc.to_json().unwrap()).unwrap();
+
+        let trusted = vec![
+            TrustedIdentity::new("guard-prod".into(), guard_desc.identity_pubkey, guard_desc.public_kem_key.clone())
+                .with_endpoint(guard_desc.endpoint.clone()),
+            TrustedIdentity::new("middle-prod".into(), middle_desc.identity_pubkey, middle_desc.public_kem_key.clone())
+                .with_endpoint(middle_desc.endpoint.clone()),
+            TrustedIdentity::new("exit-prod".into(), exit_desc.identity_pubkey, exit_desc.public_kem_key.clone())
+                .with_endpoint(exit_desc.endpoint.clone()),
+        ];
+
+        let make_hops = || {
+            vec![
+                CircuitHopNode::from_descriptor(guard_desc.clone()),
+                CircuitHopNode::from_descriptor(middle_desc.clone()),
+                CircuitHopNode::from_descriptor(exit_desc.clone()),
+            ]
+        };
+
+        // Fase 1: circuito completo através da bridge primária.
+        let client1 = LiveCircuitClient::connect_production_via_entries(8201, make_hops(), &trusted, &pool)
+            .await
+            .expect("circuito distribuído via bridge primária");
+        assert_eq!(client1.hop_keys.len(), 3);
+        assert_destination_observes_exit(&client1, target_addr, &direct_hits, 1).await;
+
+        // Bloqueio da bridge primária (queda da entrada principal).
+        bridge_a.stop().await;
+
+        // Fase 2: comutação para a bridge secundária, mesmo circuito LIVE/pins.
+        let client2 = LiveCircuitClient::connect_production_via_entries(8202, make_hops(), &trusted, &pool)
+            .await
+            .expect("comutação para a bridge secundária");
+        assert_eq!(client2.hop_keys.len(), 3);
+        assert_destination_observes_exit(&client2, target_addr, &direct_hits, 2).await;
+
+        // Fase 3: ambas as bridges bloqueadas -> fail-closed, sem conexão direta.
+        bridge_b.stop().await;
+        let hits_before = direct_hits.load(Ordering::SeqCst);
+        let res = LiveCircuitClient::connect_production_via_entries(8203, make_hops(), &trusted, &pool).await;
+        let err = match res {
+            Ok(_) => panic!("circuito sucedeu com todas as bridges bloqueadas!"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("fail-closed"), "erro deve ser fail-closed, obtido: {err}");
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            direct_hits.load(Ordering::SeqCst),
+            hits_before,
+            "fail-closed violado: cliente tentou conexão direta ao destino"
+        );
     }
 
     /// Modo produção rejeita descritor com identidade não fixada (proteção contra substituição).

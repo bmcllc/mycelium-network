@@ -17,6 +17,7 @@
 //! - Nó de Saída (Exit Node) com Proteção Anti-SSRF.
 //! - Kill Switch Fail-Closed e Abstração de Túnel de Sistema.
 
+pub mod bridge;
 pub mod config;
 pub mod crypto;
 pub mod exit;
@@ -28,6 +29,7 @@ pub mod transport;
 pub mod tunnel;
 
 pub use config::{ExitPolicy, VeilConfig, VeilMode};
+pub use bridge::{BridgeEntry, BridgeHandle, BridgeRelay, DirectEntry, EntryConnection, EntryPool, EntryTransport};
 pub use crypto::cell::{CellCommand, VeilCell, CELL_SIZE};
 pub use crypto::{HopKeys, CryptoError};
 pub use identity::{VeilNodeIdentity, VEIL_NODE_IDENTITY_TTL};
