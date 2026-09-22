@@ -106,6 +106,25 @@ enum Commands {
         /// Modo de operação VEIL: veil (3 saltos), geo (1 salto), mix (mixnet).
         #[arg(long = "veil-mode")]
         veil_mode: Option<String>,
+        /// Papel do nó no VEIL Ω: client, relay, exit, all.
+        #[arg(long = "veil-role")]
+        veil_role: Option<String>,
+        /// Endereço de escuta para roteador de salto VEIL (relay ou exit).
+        #[arg(long = "veil-listen")]
+        veil_listen: Option<std::net::SocketAddr>,
+        /// Descritor de nó Guard (caminho para arquivo JSON ou string JSON). Repetível.
+        #[arg(long = "veil-guard")]
+        veil_guards: Vec<String>,
+        /// Descritor de nó Middle (caminho para arquivo JSON ou string JSON). Repetível.
+        #[arg(long = "veil-middle")]
+        veil_middles: Vec<String>,
+        /// Descritor de nó Exit (caminho para arquivo JSON ou string JSON). Repetível.
+        #[arg(long = "veil-exit")]
+        veil_exits: Vec<String>,
+        /// Pinning de identidade de produção: "<nome>:<hex_identity_pubkey>" por salto (ex.: guard:<hex>).
+        /// Ativa autenticação estrita anti-substituição no modo client.
+        #[arg(long = "veil-trust")]
+        veil_trust: Vec<String>,
     },
     Status,
     Sow {
@@ -368,9 +387,20 @@ enum VeilCmd {
         /// Porta local SOCKS5 (default: 1080).
         #[arg(long, default_value_t = 1080)]
         port: u16,
+        /// Papel do nó: client, relay, exit, all.
+        #[arg(long)]
+        role: Option<String>,
+        /// Endereço de escuta para relay/exit.
+        #[arg(long)]
+        listen: Option<String>,
+        /// Pinning de identidade de produção: "<nome>:<hex_identity_pubkey>" por salto.
+        #[arg(long, value_name = "NOME:HEX")]
+        trust: Vec<String>,
     },
     /// Encerra o serviço VEIL Ω e desliga o SOCKS5 proxy.
     Stop,
+    /// Exibe o descritor criptográfico assinado deste nó (para compartilhar com clientes).
+    Descriptor,
 }
 
 #[derive(Subcommand)]
@@ -602,6 +632,12 @@ fn main() {
             veil,
             veil_socks5,
             veil_mode,
+            veil_role,
+            veil_listen,
+            veil_guards,
+            veil_middles,
+            veil_exits,
+            veil_trust,
         } => {
             #[cfg(not(feature = "license"))]
             let _ = licensed_peers;
@@ -642,6 +678,12 @@ fn main() {
                 veil_enabled: veil,
                 veil_socks5_addr: veil_socks5,
                 veil_mode,
+                veil_role,
+                veil_listen,
+                veil_guards,
+                veil_middles,
+                veil_exits,
+                veil_trust,
             },
             upnp,
             ))
@@ -2273,8 +2315,11 @@ fn print_response(resp: Response) -> Result<(), String> {
         }
         Response::VeilStatusResult {
             active,
+            role,
             mode,
             socks5_addr,
+            listen_addr,
+            descriptor,
             session_id,
             bytes_routed,
             mac_address,
@@ -2283,11 +2328,17 @@ fn print_response(resp: Response) -> Result<(), String> {
         } => {
             println!("[🛡️] Mycelium VEIL Ω");
             println!("    estado     : {}", if active { "ativo 🟢" } else { "inativo ⚪" });
+            if let Some(r) = role {
+                println!("    papel      : {r}");
+            }
             if let Some(m) = mode {
                 println!("    modo       : {m}");
             }
             if let Some(s) = socks5_addr {
                 println!("    socks5     : {s}");
+            }
+            if let Some(l) = listen_addr {
+                println!("    escuta     : {l}");
             }
             if let Some(id) = session_id {
                 println!("    sessão_id  : {id}");
@@ -2298,6 +2349,10 @@ fn print_response(resp: Response) -> Result<(), String> {
             println!("    kill_switch: {kill_switch}");
             println!("    camadas    : {active_layers}/7 ativas");
             println!("    tráfego    : {bytes_routed} bytes");
+            if let Some(d) = descriptor {
+                println!("    descritor  : (use 'mycelium veil descriptor' para ver completo)");
+                let _ = d; // silencia unused
+            }
             Ok(())
         }
         Response::Err { message } => Err(message),
@@ -2667,14 +2722,20 @@ async fn veil_cmd(home: &PathBuf, action: VeilCmd) -> Result<(), String> {
         VeilCmd::Status => {
             print_response(call(&sock, Request::VeilStatus).await?)
         }
-        VeilCmd::Start { mode, port } => {
+        VeilCmd::Start { mode, port, role, listen, trust } => {
             print_response(call(&sock, Request::VeilStart {
                 mode: Some(mode),
                 socks5_port: Some(port),
+                role,
+                listen,
+                trust,
             }).await?)
         }
         VeilCmd::Stop => {
             print_response(call(&sock, Request::VeilStop).await?)
+        }
+        VeilCmd::Descriptor => {
+            print_response(call(&sock, Request::VeilDescriptor).await?)
         }
     }
 }

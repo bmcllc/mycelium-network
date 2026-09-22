@@ -59,6 +59,18 @@ pub struct DaemonOptions {
     pub veil_socks5_addr: Option<std::net::SocketAddr>,
     /// Modo de operação do Veil ("geo", "veil", "mix").
     pub veil_mode: Option<String>,
+    /// Papel do nó no VEIL Ω ("client", "relay", "exit", "all").
+    pub veil_role: Option<String>,
+    /// Endereço de escuta do roteador de salto VEIL Ω (para nós relay ou exit).
+    pub veil_listen: Option<std::net::SocketAddr>,
+    /// Descritores de nós Guard autorizados/conhecidos (JSON ou caminho para arquivo JSON).
+    pub veil_guards: Vec<String>,
+    /// Descritores de nós Middle autorizados/conhecidos.
+    pub veil_middles: Vec<String>,
+    /// Descritores de nós Exit autorizados/conhecidos.
+    pub veil_exits: Vec<String>,
+    /// Pinning de identidade para modo produção: `"<papel>:<hex_identity_pubkey>"`.
+    pub veil_trust: Vec<String>,
 }
 
 impl Default for DaemonOptions {
@@ -87,6 +99,12 @@ impl Default for DaemonOptions {
             veil_enabled: false,
             veil_socks5_addr: None,
             veil_mode: None,
+            veil_role: None,
+            veil_listen: None,
+            veil_guards: Vec::new(),
+            veil_middles: Vec::new(),
+            veil_exits: Vec::new(),
+            veil_trust: Vec::new(),
         }
     }
 }
@@ -121,6 +139,12 @@ pub async fn run_daemon(home: PathBuf, opts: DaemonOptions) -> Result<(), Organi
         veil_enabled: opts.veil_enabled,
         veil_socks5_addr: opts.veil_socks5_addr,
         veil_mode: opts.veil_mode,
+        veil_role: opts.veil_role,
+        veil_listen: opts.veil_listen,
+        veil_guards: opts.veil_guards,
+        veil_middles: opts.veil_middles,
+        veil_exits: opts.veil_exits,
+        veil_trust: opts.veil_trust,
     })?;
     let sock = organism.home().join("mycelium.sock");
     let mut token = std::env::var("MYCELIUM_CONTROL_TOKEN")

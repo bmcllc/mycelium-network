@@ -241,11 +241,20 @@ pub enum Request {
         mode: Option<String>,
         #[serde(default)]
         socks5_port: Option<u16>,
+        #[serde(default)]
+        role: Option<String>,
+        #[serde(default)]
+        listen: Option<String>,
+        /// Pinning de identidade `"<nome>:<hex_identity>"` por salto (modo produção).
+        #[serde(default)]
+        trust: Vec<String>,
     },
     /// Encerra o serviço VEIL Ω.
     VeilStop,
     /// Consulta o estado do serviço VEIL Ω.
     VeilStatus,
+    /// Consulta o descritor criptográfico assinado deste nó.
+    VeilDescriptor,
     Shutdown,
 }
 
@@ -306,8 +315,11 @@ pub enum Response {
     /// Relatório de estado do serviço VEIL Ω.
     VeilStatusResult {
         active: bool,
+        role: Option<String>,
         mode: Option<String>,
         socks5_addr: Option<String>,
+        listen_addr: Option<String>,
+        descriptor: Option<String>,
         session_id: Option<String>,
         bytes_routed: u64,
         mac_address: Option<String>,

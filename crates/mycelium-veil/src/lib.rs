@@ -23,6 +23,7 @@ pub mod exit;
 pub mod layers;
 pub mod planes;
 pub mod socks5;
+pub mod transport;
 pub mod tunnel;
 
 pub use config::{ExitPolicy, VeilConfig, VeilMode};
@@ -32,10 +33,12 @@ pub use exit::{ExitForwarder, ExitPolicyValidator};
 pub use layers::{LayerPipeline, VeilLayer};
 pub use planes::live::{
     CircuitHopNode, CircuitStreamReader, CircuitStreamWriter, FrameType, InnerMessage,
-    LiveCircuit, LiveCircuitClient, LiveCircuitManager, LiveCircuitStream, VeilHopRouter,
+    LiveCircuit, LiveCircuitClient, LiveCircuitManager, LiveCircuitStream, NodeDescriptor,
+    RelayExtendChunk, RelayExtendPayload, VeilHopRouter,
 };
 pub use planes::mix::{MixMessage, MixPlane};
 pub use socks5::{proxy_socks5_connection, Socks5Server, Socks5Target};
+pub use transport::{link_handshake_client, link_handshake_server, VeilSecureStream};
 pub use tunnel::{KillSwitch, KillSwitchState, PlatformTunnelType, SystemTunnel};
 pub use mycelium_pqc;
 

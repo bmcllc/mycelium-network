@@ -169,6 +169,9 @@ mod veil_tests {
             Request::VeilStart {
                 mode: Some("geo".to_string()),
                 socks5_port: Some(0),
+                role: None,
+                listen: None,
+                trust: vec![],
             },
         )
         .await

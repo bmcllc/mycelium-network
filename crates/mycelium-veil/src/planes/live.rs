@@ -2,6 +2,15 @@
 //!
 //! Transporta conexões interativas (TCP, SOCKS5, HTTP, chamadas)
 //! através de circuitos onion criptografados com células de 512 bytes fixos.
+//!
+//! # P1.2 — Modo Distribuído e Proteção de Metadados
+//!
+//! Este módulo agora suporta:
+//! - Circuitos distribuídos entre máquinas remotas (descritores recebidos pela rede)
+//! - Proteção reforçada de metadados nos comandos de extensão (sais aleatórios por salto,
+//!   identificadores de circuito link-local, sem identificadores globais observáveis)
+//! - Autenticação estrita de descritores no modo produção (identidade fixada, validade temporal,
+//!   proteção contra substituição)
 
 use crate::crypto::{
     client_kem_handshake, onion_encrypt_layers_stateful, onion_peel_backward_stateful,
@@ -11,6 +20,7 @@ use crate::crypto::{
 use crate::config::ExitPolicy;
 use crate::exit::ExitForwarder;
 use crate::socks5::Socks5Target;
+use crate::transport::{link_handshake_client, link_handshake_server, VeilSecureStream};
 use crate::VeilError;
 use mycelium_ghostid::GhostId;
 use mycelium_pqc::KemKeyPair;
@@ -18,10 +28,37 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::OwnedWriteHalf;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex, RwLock};
+
+pub type SecureStreamHalfWriter = Arc<Mutex<WriteHalf<VeilSecureStream<TcpStream>>>>;
+
+/// Modo de operação de implantação do Veil: testes (local) ou produção (distribuído, estrito).
+///
+/// Não confundir com `crate::config::VeilMode` (plano de sessão Veil/Geo/Mix). Este enum
+/// controla o rigor da autenticação de descritores ao montar circuitos.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeploymentMode {
+    /// Modo teste: circuitos locais, descritores auto-assinados, validação criptográfica + temporal.
+    Test,
+    /// Modo produção: circuitos distribuídos, descritores de terceiros de confiança,
+    /// autenticação estrita com identidade fixada e validade temporal.
+    Production,
+}
+
+impl Default for DeploymentMode {
+    fn default() -> Self {
+        DeploymentMode::Test
+    }
+}
+
+impl DeploymentMode {
+    /// Verifica se o modo atual exige autenticação estrita de descritores.
+    pub fn requires_strict_descriptor_auth(&self) -> bool {
+        matches!(self, DeploymentMode::Production)
+    }
+}
 
 /// Magic header padronizado para quadros de controle e células Veil ("VL01").
 pub const VEIL_FRAME_MAGIC: [u8; 4] = *b"VL01";
@@ -127,7 +164,10 @@ impl InnerMessage {
     }
 }
 
-/// Descritor assinado de um nó participante do circuito com validação criptográfica.
+pub const DEFAULT_DESCRIPTOR_TTL: u64 = 86400; // 24 horas
+pub const DEFAULT_MAX_CLOCK_DRIFT: u64 = 300;  // 5 minutos
+
+/// Descritor assinado de um nó participante do circuito com validação criptográfica e temporal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeDescriptor {
     pub node_id: String,
@@ -136,6 +176,68 @@ pub struct NodeDescriptor {
     pub endpoint: String,
     pub timestamp: u64,
     pub signature: [u8; 64],            // GhostId Schnorr signature
+}
+
+/// Identidade de confiança fixada para autenticação estrita no modo produção.
+/// Impede a substituição de descritores: o nó deve apresentar exatamente esta identidade.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrustedIdentity {
+    /// Identificador humano-legível do nó (ex: "guard-prod-01").
+    pub name: String,
+    /// Chave pública de identidade GhostId (Schnorr x-only, 32 bytes).
+    pub identity_pubkey: [u8; 32],
+    /// Chave pública KEM esperada (ML-KEM-1024).
+    pub public_kem_key: Vec<u8>,
+    /// Endpoint esperado (opcional; se fornecido, deve corresponder).
+    pub endpoint: Option<String>,
+}
+
+impl TrustedIdentity {
+    pub fn new(name: String, identity_pubkey: [u8; 32], public_kem_key: Vec<u8>) -> Self {
+        Self { name, identity_pubkey, public_kem_key, endpoint: None }
+    }
+
+    pub fn with_endpoint(mut self, endpoint: String) -> Self {
+        self.endpoint = Some(endpoint);
+        self
+    }
+
+    /// Valida que um descritor corresponde a esta identidade de confiança.
+    /// Verifica: assinatura válida, identidade coincide, KEM key coincide, endpoint coincide (se configurado).
+    pub fn verify_descriptor(&self, desc: &NodeDescriptor, now: u64, max_age: u64, max_clock_drift: u64) -> Result<(), VeilError> {
+        // 1. Verifica que a identidade pública coincide exatamente
+        if desc.identity_pubkey != self.identity_pubkey {
+            return Err(VeilError::Crypto(format!(
+                "Substituição de identidade detectada no nó '{}': esperado {:?}, obtido {:?}",
+                self.name,
+                hex::encode(self.identity_pubkey),
+                hex::encode(desc.identity_pubkey)
+            )));
+        }
+
+        // 2. Verifica que a chave KEM coincide
+        if desc.public_kem_key != self.public_kem_key {
+            return Err(VeilError::Crypto(format!(
+                "Substituição de chave KEM detectada no nó '{}': esperada {} bytes, obtida {} bytes",
+                self.name,
+                self.public_kem_key.len(),
+                desc.public_kem_key.len()
+            )));
+        }
+
+        // 3. Verifica endpoint, se configurado
+        if let Some(ref expected_ep) = self.endpoint {
+            if desc.endpoint != *expected_ep {
+                return Err(VeilError::Crypto(format!(
+                    "Endpoint inconsistente para nó '{}': esperado '{}', obtido '{}'",
+                    self.name, expected_ep, desc.endpoint
+                )));
+            }
+        }
+
+        // 4. Verifica validade temporal e assinatura
+        desc.verify_validity_at(now, max_clock_drift, max_age)
+    }
 }
 
 impl serde::Serialize for NodeDescriptor {
@@ -233,7 +335,8 @@ impl NodeDescriptor {
         *hasher.finalize().as_bytes()
     }
 
-    pub fn verify(&self) -> Result<(), VeilError> {
+    /// Valida assinatura e temporalidade (janela de clock drift e expiração TTL).
+    pub fn verify_validity_at(&self, now: u64, max_clock_drift: u64, max_age: u64) -> Result<(), VeilError> {
         let digest = Self::compute_digest(
             &self.node_id,
             &self.identity_pubkey,
@@ -243,7 +346,163 @@ impl NodeDescriptor {
         );
         GhostId::verify(&self.identity_pubkey, &digest, &self.signature)
             .map_err(|e| VeilError::Crypto(format!("Assinatura do descritor do nó inválida: {e:?}")))?;
+
+        if self.timestamp > now + max_clock_drift {
+            return Err(VeilError::Crypto(format!(
+                "Descritor do nó emitido no futuro (clock drift excessivo: ts={}, now={})",
+                self.timestamp, now
+            )));
+        }
+
+        if now.saturating_sub(self.timestamp) > max_age {
+            return Err(VeilError::Crypto(format!(
+                "Descritor do nó expirado (idade: {}s > ttl: {}s)",
+                now.saturating_sub(self.timestamp),
+                max_age
+            )));
+        }
+
         Ok(())
+    }
+
+    pub fn verify(&self) -> Result<(), VeilError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.verify_validity_at(now, DEFAULT_MAX_CLOCK_DRIFT, DEFAULT_DESCRIPTOR_TTL)
+    }
+
+    pub fn to_json(&self) -> Result<String, VeilError> {
+        serde_json::to_string(self).map_err(|e| VeilError::Circuit(e.to_string()))
+    }
+
+    pub fn from_json(json: &str) -> Result<Self, VeilError> {
+        serde_json::from_str(json).map_err(|e| VeilError::Circuit(e.to_string()))
+    }
+}
+
+/// Carga útil para comando de extensão de circuito onion.
+///
+/// # P1.2 — Proteção de Metadados
+///
+/// O Extend payload é sempre onion-encryptado através de todas as camadas estabelecidas.
+/// Cada salto intermediário vê apenas células opacas de 512 bytes; apenas o salto alvo
+/// (após descascar todas as camadas) pode decifrar estes dados.
+///
+/// Para evitar identificadores globalmente observáveis:
+/// - `link_circuit_id`: identificador de circuito local para este enlace (aleatório, não global)
+/// - `salt`: valor aleatório por salto, não derivado de identificadores globais
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayExtendPayload {
+    /// Endpoint do próximo nó (apenas visível após descascar todas as camadas onion).
+    pub target_endpoint: String,
+    /// Chave pública KEM do próximo nó.
+    pub target_kem_key: Vec<u8>,
+    /// Sal aleatório para este salto específico (não derivado de circuit_id global).
+    pub salt: Vec<u8>,
+    /// Ciphertext ML-KEM encapsulado para o próximo nó.
+    pub ciphertext: Vec<u8>,
+    /// Identificador de circuito local para este enlace (evita tracking global).
+    pub link_circuit_id: u32,
+}
+
+impl RelayExtendPayload {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let ep_bytes = self.target_endpoint.as_bytes();
+        buf.extend_from_slice(&(ep_bytes.len() as u16).to_be_bytes());
+        buf.extend_from_slice(ep_bytes);
+        buf.extend_from_slice(&(self.target_kem_key.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&self.target_kem_key);
+        buf.extend_from_slice(&(self.salt.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&self.salt);
+        buf.extend_from_slice(&(self.ciphertext.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&self.ciphertext);
+        buf.extend_from_slice(&self.link_circuit_id.to_be_bytes());
+        buf
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, VeilError> {
+        let mut cursor = 0;
+        if bytes.len() < cursor + 2 {
+            return Err(VeilError::Circuit("Payload extend truncado".into()));
+        }
+        let ep_len = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]) as usize;
+        cursor += 2;
+        if bytes.len() < cursor + ep_len + 2 {
+            return Err(VeilError::Circuit("Payload extend truncado".into()));
+        }
+        let target_endpoint = String::from_utf8_lossy(&bytes[cursor..cursor + ep_len]).to_string();
+        cursor += ep_len;
+
+        let pk_len = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]) as usize;
+        cursor += 2;
+        if bytes.len() < cursor + pk_len + 2 {
+            return Err(VeilError::Circuit("Payload extend truncado".into()));
+        }
+        let target_kem_key = bytes[cursor..cursor + pk_len].to_vec();
+        cursor += pk_len;
+
+        let salt_len = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]) as usize;
+        cursor += 2;
+        if bytes.len() < cursor + salt_len + 2 {
+            return Err(VeilError::Circuit("Payload extend truncado".into()));
+        }
+        let salt = bytes[cursor..cursor + salt_len].to_vec();
+        cursor += salt_len;
+
+        let ct_len = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]) as usize;
+        cursor += 2;
+        if bytes.len() < cursor + ct_len + 4 {
+            return Err(VeilError::Circuit("Payload extend truncado".into()));
+        }
+        let ciphertext = bytes[cursor..cursor + ct_len].to_vec();
+        cursor += ct_len;
+
+        let link_circuit_id = u32::from_be_bytes([bytes[cursor], bytes[cursor + 1], bytes[cursor + 2], bytes[cursor + 3]]);
+
+        Ok(Self {
+            target_endpoint,
+            target_kem_key,
+            salt,
+            ciphertext,
+            link_circuit_id,
+        })
+    }
+}
+
+pub const RELAY_EXTEND_CHUNK_SIZE: usize = 350;
+
+/// Fragmento de extensão para caber na célula de 512 bytes com cifragem em camadas.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayExtendChunk {
+    pub chunk_idx: u8,
+    pub total_chunks: u8,
+    pub data: Vec<u8>,
+}
+
+impl RelayExtendChunk {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(2 + self.data.len());
+        buf.push(self.chunk_idx);
+        buf.push(self.total_chunks);
+        buf.extend_from_slice(&self.data);
+        buf
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, VeilError> {
+        if bytes.len() < 2 {
+            return Err(VeilError::Circuit("Chunk RelayExtend truncado".into()));
+        }
+        let chunk_idx = bytes[0];
+        let total_chunks = bytes[1];
+        let data = bytes[2..].to_vec();
+        Ok(Self {
+            chunk_idx,
+            total_chunks,
+            data,
+        })
     }
 }
 
@@ -258,11 +517,13 @@ pub struct CircuitHopNode {
 
 impl CircuitHopNode {
     pub fn new(node_id: String, public_kem_key: Vec<u8>, endpoint: String) -> Self {
+        let ghost = GhostId::spawn_quick(86400 * 365).expect("spawn ghost for hop");
+        let descriptor = NodeDescriptor::sign(node_id.clone(), &ghost, public_kem_key.clone(), endpoint.clone());
         Self {
             node_id,
             public_kem_key,
             endpoint,
-            descriptor: None,
+            descriptor: Some(descriptor),
         }
     }
 
@@ -282,6 +543,8 @@ pub struct VeilHopRouter {
     pub identity: Arc<GhostId>,
     pub keypair: Arc<KemKeyPair>,
     pub exit_policy: Option<ExitPolicy>,
+    /// IP ao qual as conexões de saída do Exit devem ser vinculadas (endereço público do nó).
+    pub bind_source: Option<std::net::IpAddr>,
 }
 
 impl VeilHopRouter {
@@ -299,7 +562,14 @@ impl VeilHopRouter {
             identity: Arc::new(identity),
             keypair: Arc::new(keypair),
             exit_policy,
+            bind_source: None,
         }
+    }
+
+    /// Configura o IP de origem para as conexões de egresso (comportamento WAN do nó Exit).
+    pub fn with_bind_source(mut self, bind_source: std::net::IpAddr) -> Self {
+        self.bind_source = Some(bind_source);
+        self
     }
 
     pub fn descriptor(&self, node_id: String, endpoint: String) -> NodeDescriptor {
@@ -312,8 +582,9 @@ impl VeilHopRouter {
         let keypair = Arc::clone(&self.keypair);
         let exit_policy = self.exit_policy.clone();
 
+        let bind_source = self.bind_source;
         loop {
-            let (stream, _peer_addr) = listener
+            let (tcp_stream, _peer_addr) = listener
                 .accept()
                 .await
                 .map_err(|e| VeilError::Circuit(format!("Erro no accept do roteador: {e}")))?;
@@ -323,7 +594,7 @@ impl VeilHopRouter {
             let ep = exit_policy.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_connection(stream, id, kp, ep).await {
+                if let Err(e) = Self::handle_connection(tcp_stream, id, kp, ep, bind_source).await {
                     tracing::debug!(error = %e, "Conexão no roteador de salto finalizada");
                 }
             });
@@ -331,13 +602,17 @@ impl VeilHopRouter {
     }
 
     async fn handle_connection(
-        mut stream: TcpStream,
+        tcp_stream: TcpStream,
         identity: Arc<GhostId>,
         keypair: Arc<KemKeyPair>,
         exit_policy: Option<ExitPolicy>,
+        bind_source: Option<std::net::IpAddr>,
     ) -> Result<(), VeilError> {
+        // Enlace PQC autenticado sobre o fio com chaves de sessão ML-KEM
+        let mut secure_stream = link_handshake_server(tcp_stream, &keypair).await?;
+
         // 1. Handshake inicial com o nó upstream (Frame Create)
-        let (ft, payload) = read_frame(&mut stream).await?;
+        let (ft, payload) = read_frame(&mut secure_stream).await?;
         if ft != FrameType::Create {
             return Err(VeilError::Circuit(format!("Esperado quadro Create, obtido {:?}", ft)));
         }
@@ -365,294 +640,278 @@ impl VeilHopRouter {
         created_payload.extend_from_slice(&in_circuit_id.to_be_bytes());
         created_payload.extend_from_slice(auth_tag.as_bytes());
 
-        write_frame(&mut stream, FrameType::Created, &created_payload).await?;
+        write_frame(&mut secure_stream, FrameType::Created, &created_payload).await?;
 
-        // 2. Aguarda próximo comando: Extend (Intermediate) ou Cell (Exit)
-        let (ft, payload) = read_frame(&mut stream).await?;
-        match ft {
-            FrameType::Extend => {
-                Self::handle_intermediate_relay(stream, hop_keys, payload, in_circuit_id).await
-            }
-            FrameType::Cell => {
-                Self::handle_exit_node(stream, hop_keys, exit_policy, payload, in_circuit_id).await
-            }
-            _ => Err(VeilError::Circuit("Comando inválido pós-handshake".into())),
-        }
-    }
-
-    async fn handle_intermediate_relay(
-        mut upstream: TcpStream,
-        hop_keys: HopKeys,
-        extend_payload: Vec<u8>,
-        in_circuit_id: u32,
-    ) -> Result<(), VeilError> {
-        if extend_payload.len() < 6 {
-            return Err(VeilError::Circuit("Payload Extend truncado".into()));
-        }
-        let ep_len = u16::from_be_bytes([extend_payload[4], extend_payload[5]]) as usize;
-        if extend_payload.len() < 6 + ep_len {
-            return Err(VeilError::Circuit("Payload Extend inválido para endpoint".into()));
-        }
-        let endpoint = String::from_utf8_lossy(&extend_payload[6..6 + ep_len]).to_string();
-        let mut nested_create = extend_payload[6 + ep_len..].to_vec();
-
-        // Gera identificador de circuito link-local downstream aleatório e descorrelacionado
-        let out_circuit_id = loop {
-            let id = rand::random::<u32>() & 0x7FFFFFFF | 1;
-            if id != in_circuit_id {
-                break id;
-            }
-        };
-
-        // Reescreve o circuit_id no quadro Create downstream
-        if nested_create.len() >= 4 {
-            nested_create[0..4].copy_from_slice(&out_circuit_id.to_be_bytes());
-        }
-
-        let mut downstream = TcpStream::connect(&endpoint)
-            .await
-            .map_err(|e| VeilError::Circuit(format!("Falha ao estender para {endpoint}: {e}")))?;
-
-        write_frame(&mut downstream, FrameType::Create, &nested_create).await?;
-
-        let (ft, mut created_resp) = read_frame(&mut downstream).await?;
-        if ft != FrameType::Created {
-            return Err(VeilError::Circuit("Resposta inválida do próximo salto (esperado Created)".into()));
-        }
-
-        // Reescreve o circuit_id na resposta Extended para o in_circuit_id do link upstream
-        if created_resp.len() >= 4 {
-            created_resp[0..4].copy_from_slice(&in_circuit_id.to_be_bytes());
-        }
-
-        write_frame(&mut upstream, FrameType::Extended, &created_resp).await?;
-
-        let (mut up_r, mut up_w) = upstream.into_split();
-        let (mut down_r, mut down_w) = downstream.into_split();
-
-        // Instancia encryptor e decryptor persistentes para o salto
-        let mut hop_decryptor_fwd = HopDecryptor::new(&hop_keys.forward_key);
-        let mut hop_encryptor_bwd = HopEncryptor::new(&hop_keys.backward_key);
-
-        // Upstream -> Downstream: Descasca 1 camada forward com estado persistente
-        // e remapeia in_circuit_id -> out_circuit_id
-        let forward_relay = async move {
-            loop {
-                let (ft, mut frame_data) = read_frame(&mut up_r).await?;
-                match ft {
-                    FrameType::Extend => {
-                        // Reescreve in_circuit_id para out_circuit_id no payload Extend downstream
-                        if frame_data.len() >= 4 {
-                            frame_data[0..4].copy_from_slice(&out_circuit_id.to_be_bytes());
-                        }
-                        write_frame(&mut down_w, FrameType::Extend, &frame_data).await?;
-                    }
-                    FrameType::Cell => {
-                        if frame_data.len() != CELL_SIZE {
-                            return Err(VeilError::Circuit("Célula recebida com tamanho divergente de 512 bytes".into()));
-                        }
-                        let mut cell_bytes = [0u8; CELL_SIZE];
-                        cell_bytes.copy_from_slice(&frame_data);
-                        let cell = VeilCell::from_bytes(&cell_bytes)
-                            .map_err(|e| VeilError::Circuit(e))?;
-
-                        if cell.circuit_id != in_circuit_id {
-                            return Err(VeilError::Circuit("Circuit ID divergente no enlace upstream".into()));
-                        }
-
-                        let peeled = hop_decryptor_fwd.decrypt(cell.data())
-                            .map_err(|e| VeilError::Crypto(e.to_string()))?;
-
-                        // Reescreve o CID para out_circuit_id no salto downstream
-                        let peeled_cell = VeilCell::new(out_circuit_id, CellCommand::RelayData, cell.stream_id, &peeled);
-                        write_frame(&mut down_w, FrameType::Cell, &peeled_cell.to_bytes()).await?;
-                    }
-                    FrameType::Destroy => {
-                        let _ = write_frame(&mut down_w, FrameType::Destroy, &frame_data).await;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            Ok::<(), VeilError>(())
-        };
-
-        // Downstream -> Upstream: Cifra 1 camada backward com estado persistente
-        // e remapeia out_circuit_id -> in_circuit_id
-        let backward_relay = async move {
-            loop {
-                let (ft, frame_data) = read_frame(&mut down_r).await?;
-                match ft {
-                    FrameType::Extended => {
-                        let mut resp = frame_data;
-                        if resp.len() >= 4 {
-                            resp[0..4].copy_from_slice(&in_circuit_id.to_be_bytes());
-                        }
-                        write_frame(&mut up_w, FrameType::Extended, &resp).await?;
-                    }
-                    FrameType::Cell => {
-                        if frame_data.len() != CELL_SIZE {
-                            return Err(VeilError::Circuit("Célula backward com tamanho divergente de 512 bytes".into()));
-                        }
-                        let mut cell_bytes = [0u8; CELL_SIZE];
-                        cell_bytes.copy_from_slice(&frame_data);
-                        let cell = VeilCell::from_bytes(&cell_bytes)
-                            .map_err(|e| VeilError::Circuit(e))?;
-
-                        if cell.circuit_id != out_circuit_id {
-                            return Err(VeilError::Circuit("Circuit ID divergente no enlace downstream".into()));
-                        }
-
-                        let enc = hop_encryptor_bwd.encrypt(cell.data())
-                            .map_err(|e| VeilError::Crypto(e.to_string()))?;
-
-                        // Reescreve o CID para in_circuit_id no salto upstream
-                        let enc_cell = VeilCell::new(in_circuit_id, CellCommand::RelayData, cell.stream_id, &enc);
-                        write_frame(&mut up_w, FrameType::Cell, &enc_cell.to_bytes()).await?;
-                    }
-                    FrameType::Destroy => {
-                        let _ = write_frame(&mut up_w, FrameType::Destroy, &frame_data).await;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            Ok::<(), VeilError>(())
-        };
-
-        tokio::select! {
-            res = forward_relay => res,
-            res = backward_relay => res,
-        }
-    }
-
-    async fn handle_exit_node(
-        upstream: TcpStream,
-        hop_keys: HopKeys,
-        exit_policy: Option<ExitPolicy>,
-        first_cell_bytes: Vec<u8>,
-        circuit_id: u32,
-    ) -> Result<(), VeilError> {
-        let policy = exit_policy.ok_or_else(|| VeilError::Exit("Este nó não tem permissão para atuar como nó de saída".into()))?;
-        let forwarder = Arc::new(ExitForwarder::new(policy));
-
-        let (mut up_r, up_w) = upstream.into_split();
+        // 2. Transiciona para o loop assíncrono de roteamento de células
+        let (up_r, up_w) = tokio::io::split(secure_stream);
         let up_w = Arc::new(Mutex::new(up_w));
 
-        let streams: Arc<RwLock<HashMap<u16, mpsc::Sender<Vec<u8>>>>> = Arc::new(RwLock::new(HashMap::new()));
-        let hop_decryptor_fwd = Arc::new(Mutex::new(HopDecryptor::new(&hop_keys.forward_key)));
+        Self::handle_router_loop(up_r, up_w, hop_keys, in_circuit_id, exit_policy, bind_source).await
+    }
+
+    async fn handle_router_loop(
+        mut up_r: ReadHalf<VeilSecureStream<TcpStream>>,
+        up_w: SecureStreamHalfWriter,
+        hop_keys: HopKeys,
+        in_circuit_id: u32,
+        exit_policy: Option<ExitPolicy>,
+        bind_source: Option<std::net::IpAddr>,
+    ) -> Result<(), VeilError> {
+        let mut hop_decryptor_fwd = HopDecryptor::new(&hop_keys.forward_key);
         let hop_encryptor_bwd = Arc::new(Mutex::new(HopEncryptor::new(&hop_keys.backward_key)));
 
-        let process_cell = |cell_data: Vec<u8>,
-                            dec: Arc<Mutex<HopDecryptor>>,
-                            enc: Arc<Mutex<HopEncryptor>>,
-                            fwd: Arc<ExitForwarder>,
-                            strms: Arc<RwLock<HashMap<u16, mpsc::Sender<Vec<u8>>>>>,
-                            w: Arc<Mutex<OwnedWriteHalf>>,
-                            expected_cid: u32| {
-            tokio::spawn(async move {
-                if cell_data.len() != CELL_SIZE {
-                    return;
-                }
-                let mut cb = [0u8; CELL_SIZE];
-                cb.copy_from_slice(&cell_data);
-                let Ok(cell) = VeilCell::from_bytes(&cb) else { return; };
-                if cell.circuit_id != expected_cid { return; }
+        let mut downstream_w: Option<SecureStreamHalfWriter> = None;
+        let mut downstream_cid = 0u32;
+        let mut extend_buffer: HashMap<u8, Vec<u8>> = HashMap::new();
 
-                let peeled = {
-                    let mut d = dec.lock().await;
-                    match d.decrypt(cell.data()) {
-                        Ok(p) => p,
-                        Err(_) => return,
-                    }
-                };
-                let Ok(msg) = InnerMessage::decode(&peeled) else { return; };
-
-                match msg.command {
-                    CellCommand::StreamBegin => {
-                        let Ok(target) = Socks5Target::decode(&msg.data) else {
-                            let _ = Self::send_exit_cell(&w, &enc, cell.circuit_id, CellCommand::StreamRefused, msg.stream_id, b"target invalido").await;
-                            return;
-                        };
-
-                        // Executa conexão de saída no Exit com resolução DNS remota e anti-SSRF
-                        match fwd.connect_to_target(&target).await {
-                            Ok(target_stream) => {
-                                let _ = Self::send_exit_cell(&w, &enc, cell.circuit_id, CellCommand::StreamConnected, msg.stream_id, &[]).await;
-
-                                let (mut t_r, mut t_w) = target_stream.into_split();
-                                let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
-                                {
-                                    let mut map = strms.write().await;
-                                    map.insert(msg.stream_id, tx);
-                                }
-
-                                let w_clone = Arc::clone(&w);
-                                let enc_clone = Arc::clone(&enc);
-                                let strms_clone = Arc::clone(&strms);
-                                let stream_id = msg.stream_id;
-                                let circuit_id = cell.circuit_id;
-
-                                // Lê do target remoto e envia StreamData cells backward
-                                tokio::spawn(async move {
-                                    let mut buf = [0u8; MAX_STREAM_DATA_CHUNK];
-                                    loop {
-                                        match t_r.read(&mut buf).await {
-                                            Ok(0) => {
-                                                let _ = Self::send_exit_cell(&w_clone, &enc_clone, circuit_id, CellCommand::StreamEnd, stream_id, &[]).await;
-                                                break;
-                                            }
-                                            Ok(n) => {
-                                                let _ = Self::send_exit_cell(&w_clone, &enc_clone, circuit_id, CellCommand::StreamData, stream_id, &buf[..n]).await;
-                                            }
-                                            Err(_) => {
-                                                let _ = Self::send_exit_cell(&w_clone, &enc_clone, circuit_id, CellCommand::StreamEnd, stream_id, &[]).await;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    let mut map = strms_clone.write().await;
-                                    map.remove(&stream_id);
-                                });
-
-                                // Escreve dados vindos do cliente no target remoto
-                                tokio::spawn(async move {
-                                    while let Some(data) = rx.recv().await {
-                                        if t_w.write_all(&data).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                let _ = Self::send_exit_cell(&w, &enc, cell.circuit_id, CellCommand::StreamRefused, msg.stream_id, e.to_string().as_bytes()).await;
-                            }
-                        }
-                    }
-                    CellCommand::StreamData => {
-                        let map = strms.read().await;
-                        if let Some(tx) = map.get(&msg.stream_id) {
-                            let _ = tx.send(msg.data).await;
-                        }
-                    }
-                    CellCommand::StreamEnd => {
-                        let mut map = strms.write().await;
-                        map.remove(&msg.stream_id);
-                    }
-                    _ => {}
-                }
-            });
+        let forwarder = match (exit_policy, bind_source) {
+            (Some(p), Some(src)) => Some(Arc::new(ExitForwarder::with_bind_source(p, src))),
+            (Some(p), None) => Some(Arc::new(ExitForwarder::new(p))),
+            (None, _) => None,
         };
-
-        // Processa a primeira célula recebida
-        process_cell(first_cell_bytes, Arc::clone(&hop_decryptor_fwd), Arc::clone(&hop_encryptor_bwd), Arc::clone(&forwarder), Arc::clone(&streams), Arc::clone(&up_w), circuit_id);
+        let streams: Arc<RwLock<HashMap<u16, mpsc::Sender<Vec<u8>>>>> = Arc::new(RwLock::new(HashMap::new()));
 
         loop {
-            match read_frame(&mut up_r).await {
-                Ok((FrameType::Cell, frame_data)) => {
-                    process_cell(frame_data, Arc::clone(&hop_decryptor_fwd), Arc::clone(&hop_encryptor_bwd), Arc::clone(&forwarder), Arc::clone(&streams), Arc::clone(&up_w), circuit_id);
+            let (ft, frame_data) = match read_frame(&mut up_r).await {
+                Ok(res) => res,
+                Err(_) => break,
+            };
+
+            match ft {
+                FrameType::Cell => {
+                    if frame_data.len() != CELL_SIZE {
+                        continue;
+                    }
+                    let mut cell_bytes = [0u8; CELL_SIZE];
+                    cell_bytes.copy_from_slice(&frame_data);
+                    let Ok(cell) = VeilCell::from_bytes(&cell_bytes) else { continue; };
+                    if cell.circuit_id != in_circuit_id {
+                        continue;
+                    }
+
+                    let peeled = match hop_decryptor_fwd.decrypt(cell.data()) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "Falha ao decifrar camada forward");
+                            continue;
+                        }
+                    };
+
+                    if let Some(ref down_w) = downstream_w {
+                        // Intermediate relay: repassa para downstream com out_circuit_id link-local
+                        let relay_cell = VeilCell::new(downstream_cid, CellCommand::RelayData, cell.stream_id, &peeled);
+                        let mut lock = down_w.lock().await;
+                        let _ = write_frame(&mut *lock, FrameType::Cell, &relay_cell.to_bytes()).await;
+                    } else {
+                        // Tail do circuito: processa comandos locais
+                        let Ok(msg) = InnerMessage::decode(&peeled) else { continue; };
+                        match msg.command {
+                            CellCommand::Extend => {
+                                let Ok(chunk) = RelayExtendChunk::decode(&msg.data) else { continue; };
+                                extend_buffer.insert(chunk.chunk_idx, chunk.data);
+                                if extend_buffer.len() == chunk.total_chunks as usize {
+                                    let mut full_payload = Vec::new();
+                                    for idx in 0..chunk.total_chunks {
+                                        if let Some(part) = extend_buffer.get(&idx) {
+                                            full_payload.extend_from_slice(part);
+                                        }
+                                    }
+                                    extend_buffer.clear();
+
+                                    let Ok(extend_req) = RelayExtendPayload::decode(&full_payload) else {
+                                        continue;
+                                    };
+
+                                    // Usa o identificador link-local escolhido pelo cliente (descorrelacionado
+                                    // do circuit_id global). Regenera apenas em caso de colisão defensiva.
+                                    let out_circuit_id = if extend_req.link_circuit_id != in_circuit_id {
+                                        extend_req.link_circuit_id
+                                    } else {
+                                        loop {
+                                            let id = rand::random::<u32>() & 0x7FFFFFFF | 1;
+                                            if id != in_circuit_id {
+                                                break id;
+                                            }
+                                        }
+                                    };
+
+                                    let down_tcp = match TcpStream::connect(&extend_req.target_endpoint).await {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, endpoint = %extend_req.target_endpoint, "Falha ao conectar downstream");
+                                            continue;
+                                        }
+                                    };
+
+                                    let down_sec = match link_handshake_client(down_tcp, &extend_req.target_kem_key).await {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "Falha no link handshake downstream");
+                                            continue;
+                                        }
+                                    };
+
+                                    let (mut down_r_half, down_w_half) = tokio::io::split(down_sec);
+                                    let down_w_half = Arc::new(Mutex::new(down_w_half));
+
+                                    // Envia Create downstream com link-local CID
+                                    let mut create_payload = Vec::with_capacity(6 + extend_req.salt.len() + extend_req.ciphertext.len());
+                                    create_payload.extend_from_slice(&out_circuit_id.to_be_bytes());
+                                    create_payload.extend_from_slice(&(extend_req.salt.len() as u16).to_be_bytes());
+                                    create_payload.extend_from_slice(&extend_req.salt);
+                                    create_payload.extend_from_slice(&extend_req.ciphertext);
+
+                                    {
+                                        let mut lock = down_w_half.lock().await;
+                                        if write_frame(&mut *lock, FrameType::Create, &create_payload).await.is_err() {
+                                            continue;
+                                        }
+                                    }
+
+                                    let (resp_ft, created_resp) = match read_frame(&mut down_r_half).await {
+                                        Ok(r) => r,
+                                        Err(_) => continue,
+                                    };
+                                    if resp_ft != FrameType::Created {
+                                        continue;
+                                    }
+
+                                    // Envia Extended cell backward para o upstream
+                                    let ext_inner = InnerMessage::new(CellCommand::Extended, 0, created_resp);
+                                    let ext_enc = {
+                                        let mut enc = hop_encryptor_bwd.lock().await;
+                                        match enc.encrypt(&ext_inner.encode()) {
+                                            Ok(e) => e,
+                                            Err(_) => continue,
+                                        }
+                                    };
+                                    let ext_cell = VeilCell::new(in_circuit_id, CellCommand::RelayData, 0, &ext_enc);
+                                    {
+                                        let mut lock = up_w.lock().await;
+                                        let _ = write_frame(&mut *lock, FrameType::Cell, &ext_cell.to_bytes()).await;
+                                    }
+
+                                    downstream_cid = out_circuit_id;
+                                    downstream_w = Some(Arc::clone(&down_w_half));
+
+                                    // Spawna loop de retransmissão Downstream -> Upstream
+                                    let up_w_clone = Arc::clone(&up_w);
+                                    let enc_bwd_clone = Arc::clone(&hop_encryptor_bwd);
+                                    tokio::spawn(async move {
+                                        loop {
+                                            match read_frame(&mut down_r_half).await {
+                                                Ok((FrameType::Cell, f_data)) => {
+                                                    if f_data.len() != CELL_SIZE {
+                                                        continue;
+                                                    }
+                                                    let mut b = [0u8; CELL_SIZE];
+                                                    b.copy_from_slice(&f_data);
+                                                    let Ok(d_cell) = VeilCell::from_bytes(&b) else { continue; };
+                                                    if d_cell.circuit_id != out_circuit_id {
+                                                        continue;
+                                                    }
+
+                                                    let enc = {
+                                                        let mut e = enc_bwd_clone.lock().await;
+                                                        match e.encrypt(d_cell.data()) {
+                                                            Ok(res) => res,
+                                                            Err(_) => continue,
+                                                        }
+                                                    };
+
+                                                    let u_cell = VeilCell::new(in_circuit_id, CellCommand::RelayData, d_cell.stream_id, &enc);
+                                                    let mut lock = up_w_clone.lock().await;
+                                                    let _ = write_frame(&mut *lock, FrameType::Cell, &u_cell.to_bytes()).await;
+                                                }
+                                                Ok((FrameType::Destroy, _)) | Err(_) => {
+                                                    break;
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                            CellCommand::StreamBegin => {
+                                let Some(ref fwd) = forwarder else {
+                                    let _ = Self::send_exit_cell_direct(&up_w, &hop_encryptor_bwd, in_circuit_id, CellCommand::StreamRefused, msg.stream_id, b"No Exit policy").await;
+                                    continue;
+                                };
+
+                                let Ok(target) = Socks5Target::decode(&msg.data) else {
+                                    let _ = Self::send_exit_cell_direct(&up_w, &hop_encryptor_bwd, in_circuit_id, CellCommand::StreamRefused, msg.stream_id, b"Target invalido").await;
+                                    continue;
+                                };
+
+                                match fwd.connect_to_target(&target).await {
+                                    Ok(target_stream) => {
+                                        let _ = Self::send_exit_cell_direct(&up_w, &hop_encryptor_bwd, in_circuit_id, CellCommand::StreamConnected, msg.stream_id, &[]).await;
+
+                                        let (mut t_r, mut t_w) = target_stream.into_split();
+                                        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+                                        {
+                                            let mut map = streams.write().await;
+                                            map.insert(msg.stream_id, tx);
+                                        }
+
+                                        let up_w_clone = Arc::clone(&up_w);
+                                        let enc_clone = Arc::clone(&hop_encryptor_bwd);
+                                        let strms_clone = Arc::clone(&streams);
+                                        let stream_id = msg.stream_id;
+
+                                        tokio::spawn(async move {
+                                            let mut buf = [0u8; MAX_STREAM_DATA_CHUNK];
+                                            loop {
+                                                match t_r.read(&mut buf).await {
+                                                    Ok(0) => {
+                                                        let _ = Self::send_exit_cell_direct(&up_w_clone, &enc_clone, in_circuit_id, CellCommand::StreamEnd, stream_id, &[]).await;
+                                                        break;
+                                                    }
+                                                    Ok(n) => {
+                                                        let _ = Self::send_exit_cell_direct(&up_w_clone, &enc_clone, in_circuit_id, CellCommand::StreamData, stream_id, &buf[..n]).await;
+                                                    }
+                                                    Err(_) => {
+                                                        let _ = Self::send_exit_cell_direct(&up_w_clone, &enc_clone, in_circuit_id, CellCommand::StreamEnd, stream_id, &[]).await;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            let mut map = strms_clone.write().await;
+                                            map.remove(&stream_id);
+                                        });
+
+                                        tokio::spawn(async move {
+                                            while let Some(data) = rx.recv().await {
+                                                if t_w.write_all(&data).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                        });
+                                    }
+                                    Err(e) => {
+                                        let _ = Self::send_exit_cell_direct(&up_w, &hop_encryptor_bwd, in_circuit_id, CellCommand::StreamRefused, msg.stream_id, e.to_string().as_bytes()).await;
+                                    }
+                                }
+                            }
+                            CellCommand::StreamData => {
+                                let map = streams.read().await;
+                                if let Some(tx) = map.get(&msg.stream_id) {
+                                    let _ = tx.send(msg.data).await;
+                                }
+                            }
+                            CellCommand::StreamEnd => {
+                                let mut map = streams.write().await;
+                                map.remove(&msg.stream_id);
+                            }
+                            _ => {}
+                        }
+                    }
                 }
-                Ok((FrameType::Destroy, _)) | Err(_) => {
+                FrameType::Destroy => {
+                    if let Some(ref down_w) = downstream_w {
+                        let mut lock = down_w.lock().await;
+                        let _ = write_frame(&mut *lock, FrameType::Destroy, &[]).await;
+                    }
                     break;
                 }
                 _ => {}
@@ -662,8 +921,8 @@ impl VeilHopRouter {
         Ok(())
     }
 
-    async fn send_exit_cell(
-        writer: &Arc<Mutex<OwnedWriteHalf>>,
+    async fn send_exit_cell_direct(
+        writer: &SecureStreamHalfWriter,
         encryptor: &Arc<Mutex<HopEncryptor>>,
         circuit_id: u32,
         command: CellCommand,
@@ -687,41 +946,86 @@ pub struct LiveCircuitClient {
     pub hops: Vec<CircuitHopNode>,
     pub hop_keys: Vec<HopKeys>,
     encryptors: Arc<Mutex<Vec<HopEncryptor>>>,
-    writer: Arc<Mutex<OwnedWriteHalf>>,
+    writer: SecureStreamHalfWriter,
     stream_senders: Arc<RwLock<HashMap<u16, mpsc::Sender<InnerMessage>>>>,
     next_stream_id: Arc<AtomicU16>,
 }
 
 impl LiveCircuitClient {
     /// Estabelece um circuito de 1 ou 3 saltos usando handshake telescópico ML-KEM-1024 e autenticação de descritores.
+    ///
+    /// Modo de confiança `Test` (TOFU): verifica assinatura, validade temporal e consistência
+    /// interna de cada descritor, sem identidade fixada externamente.
     pub async fn connect(circuit_id: u32, hops: Vec<CircuitHopNode>) -> Result<Self, VeilError> {
+        Self::connect_internal(circuit_id, hops, DeploymentMode::Test, &[]).await
+    }
+
+    /// Modo produção: além da verificação criptográfica e temporal, cada salto deve corresponder
+    /// exatamente a uma `TrustedIdentity` fixada fora de banda — protegendo contra substituição
+    /// de descritores, troca de chaves KEM e endpoints divergentes.
+    pub async fn connect_production(
+        circuit_id: u32,
+        hops: Vec<CircuitHopNode>,
+        trusted: &[TrustedIdentity],
+    ) -> Result<Self, VeilError> {
+        Self::connect_internal(circuit_id, hops, DeploymentMode::Production, trusted).await
+    }
+
+    async fn connect_internal(
+        circuit_id: u32,
+        hops: Vec<CircuitHopNode>,
+        deployment: DeploymentMode,
+        trusted: &[TrustedIdentity],
+    ) -> Result<Self, VeilError> {
         if hops.is_empty() {
             return Err(VeilError::Circuit("Circuito deve conter pelo menos 1 nó".into()));
         }
 
-        // Validação estrita de descritores de nós assinados
-        for hop in &hops {
-            if let Some(ref desc) = hop.descriptor {
-                desc.verify()?;
-                if desc.public_kem_key != hop.public_kem_key
-                    || desc.endpoint != hop.endpoint
-                    || desc.node_id != hop.node_id
-                {
-                    return Err(VeilError::Crypto(format!("Descriptor do nó {} adulterado", hop.node_id)));
-                }
+        if deployment.requires_strict_descriptor_auth() && trusted.len() != hops.len() {
+            return Err(VeilError::Crypto(format!(
+                "Modo produção exige uma identidade confiável por salto: {} saltos, {} identidades fixadas",
+                hops.len(),
+                trusted.len()
+            )));
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Validação estrita e temporal de descritores de nós assinados
+        for (i, hop) in hops.iter().enumerate() {
+            let desc = hop.descriptor.as_ref().ok_or_else(|| {
+                VeilError::Crypto(format!("Salto {i} ({}) não possui descritor assinado obrigatório", hop.node_id))
+            })?;
+
+            if deployment.requires_strict_descriptor_auth() {
+                trusted[i].verify_descriptor(desc, now, DEFAULT_DESCRIPTOR_TTL, DEFAULT_MAX_CLOCK_DRIFT)?;
+            } else {
+                desc.verify_validity_at(now, DEFAULT_MAX_CLOCK_DRIFT, DEFAULT_DESCRIPTOR_TTL)?;
+            }
+
+            if desc.public_kem_key != hop.public_kem_key
+                || desc.endpoint != hop.endpoint
+                || desc.node_id != hop.node_id
+            {
+                return Err(VeilError::Crypto(format!("Descritor do nó {} adulterado ou inconsistente", hop.node_id)));
             }
         }
 
-        // Conecta ao Guard (primeiro salto)
+        // Conecta ao Guard (primeiro salto) com enquadramento PQC autenticado sobre o fio
         let guard_stream = TcpStream::connect(&hops[0].endpoint)
             .await
             .map_err(|e| VeilError::Circuit(format!("Falha ao conectar no nó Guard ({}): {e}", hops[0].endpoint)))?;
 
-        let (mut guard_r, mut guard_w) = guard_stream.into_split();
+        let guard_sec = link_handshake_client(guard_stream, &hops[0].public_kem_key).await?;
+        let (mut guard_r, guard_w) = tokio::io::split(guard_sec);
+        let guard_w = Arc::new(Mutex::new(guard_w));
 
-        // Handshake inicial com Guard vinculando a chave de identidade
-        let identity_pubkey0 = hops[0].descriptor.as_ref().map(|d| d.identity_pubkey).unwrap_or([0u8; 32]);
-        let mut salt0 = format!("circuit-{circuit_id}-hop-0").into_bytes();
+        // Handshake inicial com Guard usando sal aleatório por sessão (sem derivar do circuit_id global)
+        let identity_pubkey0 = hops[0].descriptor.as_ref().unwrap().identity_pubkey;
+        let mut salt0 = rand::random::<[u8; 32]>().to_vec();
         salt0.extend_from_slice(&identity_pubkey0);
 
         let (keys0, ct0) = client_kem_handshake(&hops[0].public_kem_key, &salt0)
@@ -733,7 +1037,10 @@ impl LiveCircuitClient {
         create_payload.extend_from_slice(&salt0);
         create_payload.extend_from_slice(&ct0);
 
-        write_frame(&mut guard_w, FrameType::Create, &create_payload).await?;
+        {
+            let mut lock = guard_w.lock().await;
+            write_frame(&mut *lock, FrameType::Create, &create_payload).await?;
+        }
 
         let (ft, created_data) = read_frame(&mut guard_r).await?;
         if ft != FrameType::Created {
@@ -748,52 +1055,86 @@ impl LiveCircuitClient {
         }
 
         let mut hop_keys = vec![keys0];
+        let mut encryptors: Vec<HopEncryptor> = vec![HopEncryptor::new(&hop_keys[0].forward_key)];
+        let mut decryptors: Vec<HopDecryptor> = vec![HopDecryptor::new(&hop_keys[0].backward_key)];
 
-        // Handshake telescópico para saltos subsequentes
+        // Handshake telescópico via células onion encapsuladas (RelayExtend)
         for (i, hop) in hops.iter().enumerate().skip(1) {
-            let identity_pubkey = hop.descriptor.as_ref().map(|d| d.identity_pubkey).unwrap_or([0u8; 32]);
-            let mut salt = format!("circuit-{circuit_id}-hop-{i}").into_bytes();
+            let identity_pubkey = hop.descriptor.as_ref().unwrap().identity_pubkey;
+            // Sal aleatório por salto: nunca derivado do circuit_id global (metadado observável).
+            let mut salt = rand::random::<[u8; 32]>().to_vec();
             salt.extend_from_slice(&identity_pubkey);
 
             let (keys, ct) = client_kem_handshake(&hop.public_kem_key, &salt)
                 .map_err(|e| VeilError::Crypto(e.to_string()))?;
 
-            let mut hop_create = Vec::with_capacity(6 + salt.len() + ct.len());
-            hop_create.extend_from_slice(&circuit_id.to_be_bytes());
-            hop_create.extend_from_slice(&(salt.len() as u16).to_be_bytes());
-            hop_create.extend_from_slice(&salt);
-            hop_create.extend_from_slice(&ct);
+            // Identificador de circuito link-local para o novo enlace: aleatório e descorrelacionado
+            // do circuit_id global; cada salto vê apenas o CID do seu próprio enlace.
+            let link_circuit_id = loop {
+                let id = rand::random::<u32>() & 0x7FFFFFFF | 1;
+                if id != circuit_id {
+                    break id;
+                }
+            };
 
-            let ep_bytes = hop.endpoint.as_bytes();
-            let mut extend_payload = Vec::with_capacity(6 + ep_bytes.len() + hop_create.len());
-            extend_payload.extend_from_slice(&circuit_id.to_be_bytes());
-            extend_payload.extend_from_slice(&(ep_bytes.len() as u16).to_be_bytes());
-            extend_payload.extend_from_slice(ep_bytes);
-            extend_payload.extend_from_slice(&hop_create);
+            let extend_payload = RelayExtendPayload {
+                target_endpoint: hop.endpoint.clone(),
+                target_kem_key: hop.public_kem_key.clone(),
+                salt,
+                ciphertext: ct,
+                link_circuit_id,
+            };
 
-            write_frame(&mut guard_w, FrameType::Extend, &extend_payload).await?;
+            let encoded_extend = extend_payload.encode();
+            let chunks: Vec<&[u8]> = encoded_extend.chunks(RELAY_EXTEND_CHUNK_SIZE).collect();
+            let total_chunks = chunks.len() as u8;
 
-            let (ft, extended_data) = read_frame(&mut guard_r).await?;
-            if ft != FrameType::Extended {
+            for (chunk_idx, chunk_data) in chunks.iter().enumerate() {
+                let chunk = RelayExtendChunk {
+                    chunk_idx: chunk_idx as u8,
+                    total_chunks,
+                    data: chunk_data.to_vec(),
+                };
+                let inner = InnerMessage::new(CellCommand::Extend, 0, chunk.encode());
+                let layered = onion_encrypt_layers_stateful(&inner.encode(), &mut encryptors)
+                    .map_err(|e| VeilError::Crypto(e.to_string()))?;
+
+                let cell = VeilCell::new(circuit_id, CellCommand::RelayData, 0, &layered);
+                let mut lock = guard_w.lock().await;
+                write_frame(&mut *lock, FrameType::Cell, &cell.to_bytes()).await?;
+            }
+
+            // Aguarda resposta Extended do novo salto através do circuito estabelecido
+            let (ft, frame_data) = read_frame(&mut guard_r).await?;
+            if ft != FrameType::Cell || frame_data.len() != CELL_SIZE {
                 return Err(VeilError::Circuit(format!("Resposta inválida ao estender salto {i}")));
             }
+            let mut cell_b = [0u8; CELL_SIZE];
+            cell_b.copy_from_slice(&frame_data);
+            let resp_cell = VeilCell::from_bytes(&cell_b).map_err(|e| VeilError::Circuit(e))?;
+            let peeled = onion_peel_backward_stateful(resp_cell.data(), &mut decryptors)
+                .map_err(|e| VeilError::Crypto(e.to_string()))?;
+            let ext_msg = InnerMessage::decode(&peeled)?;
+            if ext_msg.command != CellCommand::Extended {
+                return Err(VeilError::Circuit(format!("Comando divergente ao estender: {:?}", ext_msg.command)));
+            }
+
             let mut expected_auth_input = b"veil-hop-auth".to_vec();
             expected_auth_input.extend_from_slice(&identity_pubkey);
             let expected_auth = blake3::keyed_hash(&keys.forward_key, &expected_auth_input);
-            if extended_data.len() < 36 || &extended_data[4..36] != expected_auth.as_bytes() {
+            if ext_msg.data.len() < 36 || &ext_msg.data[4..36] != expected_auth.as_bytes() {
                 return Err(VeilError::Crypto(format!("Falha de autenticação ao estender nó {i}")));
             }
 
+            encryptors.push(HopEncryptor::new(&keys.forward_key));
+            decryptors.push(HopDecryptor::new(&keys.backward_key));
             hop_keys.push(keys);
         }
 
         let stream_senders: Arc<RwLock<HashMap<u16, mpsc::Sender<InnerMessage>>>> = Arc::new(RwLock::new(HashMap::new()));
         let stream_senders_clone = Arc::clone(&stream_senders);
 
-        let encryptors: Vec<HopEncryptor> = hop_keys.iter().map(|k| HopEncryptor::new(&k.forward_key)).collect();
         let encryptors_arc = Arc::new(Mutex::new(encryptors));
-
-        let mut decryptors: Vec<HopDecryptor> = hop_keys.iter().map(|k| HopDecryptor::new(&k.backward_key)).collect();
 
         tokio::spawn(async move {
             loop {
@@ -806,7 +1147,6 @@ impl LiveCircuitClient {
                         cb.copy_from_slice(&frame_data);
                         let Ok(cell) = VeilCell::from_bytes(&cb) else { continue; };
 
-                        // Descasca camadas backward com decryptors persistentes e validação anti-replay
                         let peeled = match onion_peel_backward_stateful(cell.data(), &mut decryptors) {
                             Ok(p) => p,
                             Err(_) => continue,
@@ -832,7 +1172,7 @@ impl LiveCircuitClient {
             hops,
             hop_keys,
             encryptors: encryptors_arc,
-            writer: Arc::new(Mutex::new(guard_w)),
+            writer: guard_w,
             stream_senders,
             next_stream_id: Arc::new(AtomicU16::new(1)),
         })
@@ -915,7 +1255,7 @@ impl CircuitStreamReader {
 pub struct CircuitStreamWriter {
     circuit_id: u32,
     stream_id: u16,
-    writer: Arc<Mutex<OwnedWriteHalf>>,
+    writer: SecureStreamHalfWriter,
     encryptors: Arc<Mutex<Vec<HopEncryptor>>>,
     stream_senders: Arc<RwLock<HashMap<u16, mpsc::Sender<InnerMessage>>>>,
 }
@@ -958,7 +1298,7 @@ pub struct LiveCircuitStream {
     pub circuit_id: u32,
     pub stream_id: u16,
     rx: mpsc::Receiver<InnerMessage>,
-    writer: Arc<Mutex<OwnedWriteHalf>>,
+    writer: SecureStreamHalfWriter,
     encryptors: Arc<Mutex<Vec<HopEncryptor>>>,
     stream_senders: Arc<RwLock<HashMap<u16, mpsc::Sender<InnerMessage>>>>,
 }
@@ -1342,5 +1682,240 @@ mod tests {
         assert_eq!(recv, msg);
 
         stream.close().await.expect("fechado");
+    }
+
+    #[test]
+    fn test_descriptor_temporal_validity_and_expiration() {
+        let ghost = GhostId::spawn_quick(86400 * 365).expect("ghost");
+        let kp = mlkem_keygen();
+        let now = 1_700_000_000u64;
+
+        // 1. Descritor válido gerado no tempo 'now'
+        let mut desc = NodeDescriptor::sign("valid-node".into(), &ghost, kp.public_key.clone(), "127.0.0.1:9001".into());
+        desc.timestamp = now;
+        let digest = NodeDescriptor::compute_digest(&desc.node_id, &desc.identity_pubkey, &desc.public_kem_key, &desc.endpoint, desc.timestamp);
+        desc.signature = ghost.sign(&digest);
+        assert!(desc.verify_validity_at(now, 300, 86400).is_ok());
+
+        // 2. Descritor expirado (idade: 90000s > ttl: 86400s)
+        let check_time_expired = now + 90_000;
+        let expired_err = desc.verify_validity_at(check_time_expired, 300, 86400);
+        match expired_err {
+            Err(VeilError::Crypto(msg)) => assert!(msg.contains("expirado")),
+            other => panic!("Esperado erro de expiracao, obtido: {other:?}"),
+        }
+
+        // 3. Descritor no futuro além da tolerância de clock drift (ts = now + 400s > max_drift: 300s)
+        let mut future_desc = desc.clone();
+        future_desc.timestamp = now + 400;
+        let f_digest = NodeDescriptor::compute_digest(&future_desc.node_id, &future_desc.identity_pubkey, &future_desc.public_kem_key, &future_desc.endpoint, future_desc.timestamp);
+        future_desc.signature = ghost.sign(&f_digest);
+        let future_err = future_desc.verify_validity_at(now, 300, 86400);
+        match future_err {
+            Err(VeilError::Crypto(msg)) => assert!(msg.contains("no futuro")),
+            other => panic!("Esperado erro de clock drift futuro, obtido: {other:?}"),
+        }
+
+        // 4. Roundtrip de serialização JSON
+        let json = desc.to_json().expect("to_json");
+        let parsed = NodeDescriptor::from_json(&json).expect("from_json");
+        assert_eq!(parsed, desc);
+    }
+/// Monta um roteador de salto em um endereço loopback distinto (simula máquinas/rede distintas).
+    async fn spawn_hop_on(ip: &str, node_id: &str, exit_policy: Option<ExitPolicy>) -> (NodeDescriptor, String) {
+        let kp = mlkem_keygen();
+        let router = match &exit_policy {
+            Some(p) => VeilHopRouter::new(kp, Some(p.clone())).with_bind_source(ip.parse().unwrap()),
+            None => VeilHopRouter::new(kp, None),
+        };
+        let listener = tokio::net::TcpListener::bind((ip, 0)).await.expect("bind hop em loopback distinto");
+        let addr = listener.local_addr().unwrap();
+        let desc = router.descriptor(node_id.into(), addr.to_string());
+        tokio::spawn(async move {
+            let _ = router.run(listener).await;
+        });
+        (desc, addr.to_string())
+    }
+
+    /// Entrega prioritária P1.2: circuito distribuído Guard -> Middle -> Exit entre endereços
+    /// distintos (máquinas/rede distintas), descritores recebidos pela rede como JSON,
+    /// autenticação de produção com identidade fixada e comprovação de que o destino
+    /// observa o IP do Exit (e não o do Guard nem o do cliente).
+    #[tokio::test]
+    async fn test_wan_distributed_3hop_production_descriptors_via_json_and_exit_ip() {
+        // Target que informa a origem observada da conexão
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, peer)) = target_listener.accept().await {
+                let mut buf = [0u8; 1024];
+                if let Ok(n) = stream.read(&mut buf).await {
+                    if n > 0 {
+                        let reply = format!("{}:{}", peer.ip(), peer.port());
+                        let _ = stream.write_all(reply.as_bytes()).await;
+                    }
+                }
+            }
+        });
+
+        let exit_policy = ExitPolicy {
+            allowed_ports: vec![target_addr.port()],
+            blocked_ports: vec![],
+            block_private_networks: false,
+            max_bandwidth_bps: 0,
+        };
+
+        // Guard, Middle e Exit em endereços loopback distintos (127.0.0.2/3/4)
+        let (guard_desc, _ga) = spawn_hop_on("127.0.0.2", "guard-remoto", None).await;
+        let (middle_desc, _ma) = spawn_hop_on("127.0.0.3", "middle-remoto", None).await;
+        let (exit_desc, _ea) = spawn_hop_on("127.0.0.4", "exit-remoto", Some(exit_policy)).await;
+
+        // Descritores recebidos pela rede: JSON transmitido e reaproveitado pelo cliente
+        let guard_desc = NodeDescriptor::from_json(&guard_desc.to_json().expect("guard json")).expect("parse guard");
+        let middle_desc = NodeDescriptor::from_json(&middle_desc.to_json().expect("middle json")).expect("parse middle");
+        let exit_desc = NodeDescriptor::from_json(&exit_desc.to_json().expect("exit json")).expect("parse exit");
+
+        // Modo produção: identidade de confiança fixada fora de banda (pinning)
+        let trusted = vec![
+            TrustedIdentity::new("guard-prod".into(), guard_desc.identity_pubkey, guard_desc.public_kem_key.clone())
+                .with_endpoint(guard_desc.endpoint.clone()),
+            TrustedIdentity::new("middle-prod".into(), middle_desc.identity_pubkey, middle_desc.public_kem_key.clone())
+                .with_endpoint(middle_desc.endpoint.clone()),
+            TrustedIdentity::new("exit-prod".into(), exit_desc.identity_pubkey, exit_desc.public_kem_key.clone())
+                .with_endpoint(exit_desc.endpoint.clone()),
+        ];
+
+        let hops = vec![
+            CircuitHopNode::from_descriptor(guard_desc),
+            CircuitHopNode::from_descriptor(middle_desc),
+            CircuitHopNode::from_descriptor(exit_desc),
+        ];
+
+        let client = LiveCircuitClient::connect_production(6060, hops, &trusted)
+            .await
+            .expect("circuito distribuído em modo produção");
+        assert_eq!(client.hop_keys.len(), 3);
+
+        // Destino observa o IP do Exit
+        let target = Socks5Target::Ip(target_addr);
+        let mut stream = client.open_stream(&target).await.expect("stream para o destino");
+
+        stream.send_data(b"WHO-AM-I").await.expect("consulta enviada");
+        let observed = stream.receive_data().await.expect("resposta do destino").expect("dados presentes");
+        let observed_str = String::from_utf8_lossy(&observed).to_string();
+        let observed_ip = observed_str.split(':').next().unwrap_or_default();
+
+        assert_eq!(observed_ip, "127.0.0.4", "destino deve observar o IP do Exit, obtido: {observed_str}");
+        assert_ne!(observed_ip, "127.0.0.2", "o Guard não pode aparecer como origem");
+        assert_ne!(observed_ip, "127.0.0.1", "o cliente não pode aparecer como origem");
+
+        stream.close().await.expect("stream fechado");
+    }
+
+    /// Modo produção rejeita descritor com identidade não fixada (proteção contra substituição).
+    #[tokio::test]
+    async fn test_production_mode_rejects_descriptor_substitution() {
+        let (guard_desc, _) = spawn_hop_on("127.0.0.2", "guard-remoto", None).await;
+
+        // Atacante tenta se passar pelo guard fixando uma identidade pública diferente
+        let impostor = TrustedIdentity::new("guard-prod".into(), [0u8; 32], guard_desc.public_kem_key.clone())
+            .with_endpoint(guard_desc.endpoint.clone());
+
+        let hops = vec![CircuitHopNode::from_descriptor(guard_desc)];
+
+        let res = LiveCircuitClient::connect_production(7001, hops, &[impostor]).await;
+        match res {
+            Ok(_) => panic!("Conexão sucedeu com identidade não fixada!"),
+            Err(VeilError::Crypto(msg)) => assert!(msg.contains("Substitui"), "mensagem inesperada: {msg}"),
+            Err(e) => panic!("Esperado erro de criptografia (substituição), obtido: {e}"),
+        }
+
+        // Modo produção exige uma identidade fixada por salto
+        let (guard_desc2, _) = spawn_hop_on("127.0.0.2", "guard-remoto", None).await;
+        let hops2 = vec![CircuitHopNode::from_descriptor(guard_desc2)];
+        let res2 = LiveCircuitClient::connect_production(7002, hops2, &[]).await;
+        match res2 {
+            Ok(_) => panic!("Conexão sucedeu sem identidade fixada no modo produção!"),
+            Err(VeilError::Crypto(msg)) => assert!(msg.contains("identidade confiável") || msg.contains("Modo produção"), "mensagem inesperada: {msg}"),
+            Err(e) => panic!("Esperado erro de criptografia (sem identidade fixada), obtido: {e}"),
+        }
+    }
+
+    /// O Guard não descobre a rota completa: ao estender o circuito, ele descasca apenas uma
+    /// camada e vê uma célula opaca; apenas o salto alvo (Middle) recupera o Extend com o
+    /// endpoint do próximo nó (Exit). O link_circuit_id é link-local e o sal é aleatório.
+    #[test]
+    fn test_guard_cannot_recover_route_from_extend_cells() {
+        let global_cid = 6060u32;
+        let kp_exit = mlkem_keygen();
+
+        let keys = [
+            HopKeys::derive(&[1u8; 32], b"salt-guard"),
+            HopKeys::derive(&[2u8; 32], b"salt-middle"),
+        ];
+
+        // Sal aleatório e link_circuit_id descorrelacionado do circuit_id global
+        let salt = rand::random::<[u8; 32]>().to_vec();
+        let link_circuit_id = loop {
+            let id = rand::random::<u32>() & 0x7FFFFFFF | 1;
+            if id != global_cid {
+                break id;
+            }
+        };
+
+        let extend_payload = RelayExtendPayload {
+            target_endpoint: "203.0.113.9:9051".into(),
+            target_kem_key: kp_exit.public_key.clone(),
+            salt: salt.clone(),
+            ciphertext: vec![0xAA; 1568],
+            link_circuit_id,
+        };
+        assert_ne!(link_circuit_id, global_cid, "link_circuit_id não pode reutilizar o id global");
+        assert_ne!(salt, format!("circuit-{global_cid}").into_bytes(), "sal não pode derivar do id global");
+
+        let encoded = extend_payload.encode();
+        let chunks: Vec<&[u8]> = encoded.chunks(RELAY_EXTEND_CHUNK_SIZE).collect();
+
+        let mut encryptors = vec![
+            HopEncryptor::new(&keys[0].forward_key),
+            HopEncryptor::new(&keys[1].forward_key),
+        ];
+
+        let mut first_chunk_data: Option<Vec<u8>> = None;
+
+        for (idx, chunk_data) in chunks.iter().enumerate() {
+            let chunk = RelayExtendChunk {
+                chunk_idx: idx as u8,
+                total_chunks: chunks.len() as u8,
+                data: chunk_data.to_vec(),
+            };
+            let inner = InnerMessage::new(CellCommand::Extend, 0, chunk.encode());
+            let layered = onion_encrypt_layers_stateful(&inner.encode(), &mut encryptors).expect("cifragem onion");
+
+            // Visão do Guard: descasca uma camada -> célula opaca, rota permanece oculta
+            let mut guard_dec = HopDecryptor::new(&keys[0].forward_key);
+            let guard_view = guard_dec.decrypt(&layered).expect("guard peel");
+            let guard_text = String::from_utf8_lossy(&guard_view);
+            assert!(!guard_text.contains("203.0.113.9"), "Guard não pode descobrir o endpoint do Exit");
+            assert!(!guard_text.contains("exit"), "Guard não pode inferir o próximo salto");
+
+            // Visão do Middle (salto alvo do Extend): recupera o comando Extend
+            let mut middle_dec = HopDecryptor::new(&keys[1].forward_key);
+            let middle_view = middle_dec.decrypt(&guard_view).expect("middle peel");
+            let msg = InnerMessage::decode(&middle_view).expect("middle decode");
+            assert_eq!(msg.command, CellCommand::Extend, "salto alvo recebe o comando Extend");
+            let chunk_rx = RelayExtendChunk::decode(&msg.data).expect("chunk decode");
+            if idx == 0 {
+                first_chunk_data = Some(chunk_rx.data);
+            }
+        }
+
+        // Reconstitui o endpoint a partir do primeiro chunk: somente o salto alvo o vê
+        let first = first_chunk_data.expect("primeiro chunk presente");
+        assert!(
+            String::from_utf8_lossy(&first).contains("203.0.113.9"),
+            "somente o salto alvo (Middle) recupera o endpoint do Exit"
+        );
     }
 }

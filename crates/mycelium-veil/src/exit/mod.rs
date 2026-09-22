@@ -126,12 +126,25 @@ impl ExitPolicyValidator {
 /// Encaminhador do Nó de Saída (conecta ao destino na internet real).
 pub struct ExitForwarder {
     validator: ExitPolicyValidator,
+    /// IP ao qual as conexões de saída devem ser vinculadas (o IP público do próprio Exit).
+    /// Sem este vínculo, o kernel escolhe o IP de origem pela rota, o que pode mascarar
+    /// o endereço do Exit em hosts multi-homed.
+    bind_source: Option<IpAddr>,
 }
 
 impl ExitForwarder {
     pub fn new(policy: ExitPolicy) -> Self {
         Self {
             validator: ExitPolicyValidator::new(policy),
+            bind_source: None,
+        }
+    }
+
+    /// Construtor com vínculo de IP de origem explícito (endereço público do nó Exit).
+    pub fn with_bind_source(policy: ExitPolicy, bind_source: IpAddr) -> Self {
+        Self {
+            validator: ExitPolicyValidator::new(policy),
+            bind_source: Some(bind_source),
         }
     }
 
@@ -169,9 +182,31 @@ impl ExitForwarder {
         // Log sem dados identificáveis de tráfego de navegação (Zero Logging)
         tracing::debug!("Nó Exit abrindo conexão de saída autorizada");
 
-        let stream = TcpStream::connect(connect_addr)
-            .await
-            .map_err(|e| VeilError::Exit(format!("Falha ao conectar no destino remoto: {e}")))?;
+        let stream = match self.bind_source {
+            Some(src) => {
+                // Vincula a conexão de saída ao próprio IP do Exit para que o destino
+                // (servidores web, APIs, etc.) observe o endereço real do nó de saída.
+                let socket = match src {
+                    IpAddr::V4(_) => tokio::net::TcpSocket::new_v4(),
+                    IpAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
+                }
+                .map_err(|e| VeilError::Exit(format!("Falha ao criar socket de saída: {e}")))?;
+
+                socket
+                    .bind(std::net::SocketAddr::new(src, 0))
+                    .map_err(|e| VeilError::Exit(format!("Falha ao vincular IP de origem do Exit {src}: {e}")))?;
+
+                socket
+                    .connect(connect_addr)
+                    .await
+                    .map_err(|e| VeilError::Exit(format!("Falha ao conectar no destino remoto: {e}")))?
+            }
+            None => {
+                TcpStream::connect(connect_addr)
+                    .await
+                    .map_err(|e| VeilError::Exit(format!("Falha ao conectar no destino remoto: {e}")))?
+            }
+        };
 
         // Dupla validação pós-conexão para prevenir race conditions de DNS rebinding
         if self.validator.policy.block_private_networks {

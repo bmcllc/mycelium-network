@@ -246,56 +246,10 @@ pub fn onion_peel_backward_stateful(
     Ok(current)
 }
 
-/// Cifra um payload em camadas no estilo Onion (Exit -> Middle -> Guard).
-pub fn onion_encrypt_layers(
-    inner_payload: &[u8],
-    hop_keys: &[HopKeys],
-) -> Result<Vec<u8>, CryptoError> {
-    let mut current = inner_payload.to_vec();
-
-    // Itera na ordem reversa: primeiro cifra para o Exit, depois Middle, depois Guard
-    for keys in hop_keys.iter().rev() {
-        let mut cipher = HopCipher::new(&keys.forward_key);
-        current = cipher.encrypt(&current)?;
-    }
-
-    Ok(current)
-}
-
-/// Decifra uma camada de cebola em um nó intermediário (sentido forward).
-pub fn onion_peel_layer(
-    layer_data: &[u8],
-    keys: &HopKeys,
-) -> Result<Vec<u8>, CryptoError> {
-    let mut cipher = HopCipher::new(&keys.forward_key);
-    cipher.decrypt(layer_data)
-}
-
-/// Decifra uma camada de cebola no cliente (sentido backward).
-pub fn onion_peel_layer_backward(
-    layer_data: &[u8],
-    keys: &HopKeys,
-) -> Result<Vec<u8>, CryptoError> {
-    let mut cipher = HopCipher::new(&keys.backward_key);
-    cipher.decrypt(layer_data)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use mycelium_pqc::mlkem_keygen;
-
-    #[test]
-    fn hop_cipher_encrypt_decrypt_roundtrip() {
-        let key = [42u8; 32];
-        let mut enc = HopCipher::new(&key);
-        let mut dec = HopCipher::new(&key);
-
-        let msg = b"teste de cifra de fluxo onion veil";
-        let ct = enc.encrypt(msg).expect("encrypt");
-        let pt = dec.decrypt(&ct).expect("decrypt");
-        assert_eq!(pt, msg);
-    }
 
     #[test]
     fn test_two_consecutive_cells_do_not_reuse_nonce() {
@@ -374,24 +328,6 @@ mod tests {
         assert_eq!(client_keys.backward_key, server_keys.backward_key);
     }
 
-    #[test]
-    fn multi_hop_onion_encryption_and_peeling() {
-        let hops = vec![
-            HopKeys { forward_key: [1u8; 32], backward_key: [11u8; 32] },
-            HopKeys { forward_key: [2u8; 32], backward_key: [22u8; 32] },
-            HopKeys { forward_key: [3u8; 32], backward_key: [33u8; 32] },
-        ];
-
-        let payload = b"mensagem secreta que alcanca a internet via Exit";
-
-        let onion = onion_encrypt_layers(payload, &hops).expect("onion encrypt");
-
-        let peeled_guard = onion_peel_layer(&onion, &hops[0]).expect("guard peel");
-        let peeled_middle = onion_peel_layer(&peeled_guard, &hops[1]).expect("middle peel");
-        let recovered = onion_peel_layer(&peeled_middle, &hops[2]).expect("exit peel");
-
-        assert_eq!(recovered, payload);
-    }
 
     #[test]
     fn stateful_multi_hop_onion_encryption_and_peeling() {
