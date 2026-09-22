@@ -74,6 +74,12 @@ pub trait EntryTransport: Send + Sync + fmt::Debug {
 /// Tempo limite padrão para estabelecimento de uma entrada.
 pub const DEFAULT_ENTRY_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Tempo limite padrão para o handshake autenticado de uma entrada (pós-TCP).
+///
+/// Cobre o caso de bridge que aceita a conexão e não responde (blackhole) ou
+/// encerra/corrompe o fluxo no meio do handshake com o Guard.
+pub const ENTRY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Entrada direta: TCP ao endpoint anunciado do Guard (sem bridge).
 ///
 /// É o comportamento histórico do cliente; mantido como baseline intercambiável.
@@ -180,6 +186,8 @@ impl EntryTransport for BridgeEntry {
 #[derive(Debug)]
 pub struct EntryPool {
     entries: Vec<Arc<dyn EntryTransport>>,
+    /// Tempo limite aplicado ao handshake autenticado por tentativa.
+    handshake_timeout: Duration,
     /// Índice da entrada que funcionou por último (ordem preferencial).
     active: StdMutex<Option<usize>>,
 }
@@ -193,7 +201,13 @@ impl Default for EntryPool {
 impl EntryPool {
     /// Pool vazio (use [`EntryPool::push`] para registrar as entradas).
     pub fn new() -> Self {
-        Self { entries: Vec::new(), active: StdMutex::new(None) }
+        Self { entries: Vec::new(), handshake_timeout: ENTRY_HANDSHAKE_TIMEOUT, active: StdMutex::new(None) }
+    }
+
+    /// Ajusta o tempo limite do handshake autenticado por tentativa de entrada.
+    pub fn set_handshake_timeout(&mut self, timeout: Duration) -> &mut Self {
+        self.handshake_timeout = timeout;
+        self
     }
 
     /// Registra uma entrada de transporte (ordem = prioridade inicial).
@@ -252,6 +266,79 @@ impl EntryPool {
         Err(VeilError::Circuit(format!(
             "fail-closed: todas as {} entradas de transporte inacessíveis — circuito abortado \
              sem fallback direto ao destino (falhas: {})",
+            self.entries.len(),
+            failures.join("; ")
+        )))
+    }
+
+    /// Estabelece a entrada **e só a considera operacional após o handshake
+    /// autenticado com o Guard** concluir com sucesso (P1.3.1).
+    ///
+    /// `handshake` recebe a stream TCP de cada tentativa e executa o handshake
+    /// de enlace + autenticação de identidade — nunca reduzindo a exigência de
+    /// autenticação. Uma falha nesse estágio (erro ou timeout) libera a
+    /// conexão e tenta a próxima entrada, cobrindo bridges que aceitam TCP mas
+    /// bloqueiam, encerram ou corrompem o fluxo depois. Se todas falharem,
+    /// retorna erro **fail-closed**, sem qualquer conexão direta ao destino.
+    ///
+    /// `T` é o artefato produzido pelo handshake (ex.: stream segura + chaves
+    /// do primeiro salto); o par retornado inclui o identificador da entrada
+    /// que autenticou.
+    pub async fn connect_authenticated<T, F>(
+        &self,
+        guard_endpoint: &str,
+        handshake: &mut F,
+    ) -> Result<(T, String), VeilError>
+    where
+        F: FnMut(TcpStream) -> Pin<Box<dyn Future<Output = Result<T, VeilError>> + Send>>,
+    {
+        if self.entries.is_empty() {
+            return Err(VeilError::Circuit(
+                "fail-closed: nenhuma entrada de transporte registrada no pool".into(),
+            ));
+        }
+
+        let active_idx = self.active.lock().unwrap().unwrap_or(0);
+        let mut failures: Vec<String> = Vec::new();
+
+        for offset in 0..self.entries.len() {
+            let idx = (active_idx + offset) % self.entries.len();
+            let entry = &self.entries[idx];
+            let attempted_id = entry.id().to_string();
+
+            // Estágio 1: estabelecimento TCP.
+            let stream = match entry.connect(guard_endpoint).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(entry = %attempted_id, error = %e, "entrada falhou no TCP; tentando próxima");
+                    failures.push(format!("{attempted_id} (TCP): {e}"));
+                    continue;
+                }
+            };
+
+            // Estágio 2: handshake autenticado com o Guard. Aceitar TCP sem
+            // encaminhar corretamente NÃO conta como entrada operacional.
+            match tokio::time::timeout(self.handshake_timeout, handshake(stream)).await {
+                Ok(Ok(result)) => {
+                    *self.active.lock().unwrap() = Some(idx);
+                    tracing::info!(entry = %attempted_id, guard = %guard_endpoint, "entrada autenticada com o Guard");
+                    return Ok((result, attempted_id));
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(entry = %attempted_id, error = %e, "entrada falhou no handshake autenticado; tentando próxima");
+                    failures.push(format!("{attempted_id} (handshake): {e}"));
+                }
+                Err(_) => {
+                    let msg = format!("handshake excedeu {:?}", self.handshake_timeout);
+                    tracing::warn!(entry = %attempted_id, error = %msg, "entrada silenciosa no handshake; tentando próxima");
+                    failures.push(format!("{attempted_id} (handshake): {msg}"));
+                }
+            }
+        }
+
+        Err(VeilError::Circuit(format!(
+            "fail-closed: todas as {} entradas falharam no TCP ou no handshake autenticado — \
+             circuito abortado sem fallback direto ao destino (falhas: {})",
             self.entries.len(),
             failures.join("; ")
         )))
@@ -518,5 +605,196 @@ mod tests {
         let pool = EntryPool::new();
         let err = pool.connect("127.0.0.1:1").await.expect_err("pool vazio deve falhar");
         assert!(err.to_string().contains("fail-closed"));
+    }
+
+    // ----- P1.3.1: comutação também quando o handshake autenticado falha -----
+
+    /// Guard de teste que responde `PONG` a `PING` (contrato do probe de teste).
+    async fn spawn_guard_handshake_ok() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _peer)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4];
+                    if sock.read_exact(&mut buf).await.is_ok() && &buf == b"PING" {
+                        let _ = sock.write_all(b"PONG").await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// Bridge defeituosa: aceita a conexão e a encerra imediatamente.
+    async fn spawn_defective_bridge_accept_and_close() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _peer)) = listener.accept().await else { break };
+                drop(sock); // aceita e fecha: o handshake seguinte morre com EOF
+            }
+        });
+        addr
+    }
+
+    /// Bridge defeituosa: aceita a conexão e não responde (blackhole).
+    async fn spawn_defective_bridge_blackhole() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _peer)) = listener.accept().await else { break };
+                // Segura o socket vivo sem ler nem escrever: o handshake expira.
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(Duration::from_secs(30), sock.readable()).await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// Bridge defeituosa: aceita e despeja bytes inválidos no fluxo.
+    async fn spawn_defective_bridge_garbage() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _peer)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let _ = sock.write_all(b"NAO-E-UM-GUARD").await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// Probe de handshake de teste: envia `PING` e exige `PONG` de volta.
+    /// Modela o estágio de autenticação independente dos internals do LIVE.
+    fn test_handshake_probe(
+    ) -> impl FnMut(TcpStream) -> Pin<Box<dyn Future<Output = Result<(), VeilError>> + Send>> {
+        |stream: TcpStream| {
+            Box::pin(async move {
+                let (mut r, mut w) = tokio::io::split(stream);
+                w.write_all(b"PING")
+                    .await
+                    .map_err(|e| VeilError::Circuit(format!("envio no handshake: {e}")))?;
+                let mut buf = [0u8; 4];
+                r.read_exact(&mut buf)
+                    .await
+                    .map_err(|e| VeilError::Circuit(format!("leitura no handshake: {e}")))?;
+                if &buf != b"PONG" {
+                    return Err(VeilError::Crypto(format!("resposta inválida do Guard no handshake: {buf:?}")));
+                }
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pool_switches_when_entry_accepts_tcp_and_closes() {
+        let guard_addr = spawn_guard_handshake_ok().await;
+
+        // Entrada A: aceita TCP e fecha — o TCP "sucede", o handshake não.
+        let defective = spawn_defective_bridge_accept_and_close().await;
+        let bridge_b = BridgeRelay::spawn("127.0.0.1:0".parse().unwrap(), guard_addr)
+            .await
+            .expect("bridge B sobe");
+        let addr_b = bridge_b.listen_addr();
+
+        let mut pool = EntryPool::new();
+        pool.push(Arc::new(BridgeEntry::new("bridge-a", defective)));
+        pool.push(Arc::new(BridgeEntry::new("bridge-b", addr_b)));
+
+        let mut probe = test_handshake_probe();
+        let ((), entry_id) = pool
+            .connect_authenticated(&guard_addr.to_string(), &mut probe)
+            .await
+            .expect("handshake deve comutar para a entrada B");
+        assert_eq!(entry_id, "bridge-b", "aceitar TCP e fechar não pode contar como entrada operacional");
+
+        bridge_b.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_pool_switches_when_entry_accepts_tcp_and_stays_silent() {
+        let guard_addr = spawn_guard_handshake_ok().await;
+
+        // Entrada A: blackhole — o handshake expira e a comutação ocorre.
+        let blackhole = spawn_defective_bridge_blackhole().await;
+        let bridge_b = BridgeRelay::spawn("127.0.0.1:0".parse().unwrap(), guard_addr)
+            .await
+            .expect("bridge B sobe");
+        let addr_b = bridge_b.listen_addr();
+
+        let mut pool = EntryPool::new();
+        pool.set_handshake_timeout(Duration::from_millis(400));
+        pool.push(Arc::new(BridgeEntry::new("bridge-a", blackhole)));
+        pool.push(Arc::new(BridgeEntry::new("bridge-b", addr_b)));
+
+        let started = std::time::Instant::now();
+        let mut probe = test_handshake_probe();
+        let ((), entry_id) = pool
+            .connect_authenticated(&guard_addr.to_string(), &mut probe)
+            .await
+            .expect("handshake deve comutar para a entrada B após timeout");
+        assert_eq!(entry_id, "bridge-b", "blackhole deve ser abandonado por timeout no handshake");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "comutação deve respeitar o timeout curto configurado"
+        );
+
+        bridge_b.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_pool_switches_when_entry_forwards_garbage() {
+        let guard_addr = spawn_guard_handshake_ok().await;
+
+        // Entrada A: encaminha dados inválidos — o handshake falha na autenticação.
+        let garbage = spawn_defective_bridge_garbage().await;
+        let bridge_b = BridgeRelay::spawn("127.0.0.1:0".parse().unwrap(), guard_addr)
+            .await
+            .expect("bridge B sobe");
+        let addr_b = bridge_b.listen_addr();
+
+        let mut pool = EntryPool::new();
+        pool.push(Arc::new(BridgeEntry::new("bridge-a", garbage)));
+        pool.push(Arc::new(BridgeEntry::new("bridge-b", addr_b)));
+
+        let mut probe = test_handshake_probe();
+        let ((), entry_id) = pool
+            .connect_authenticated(&guard_addr.to_string(), &mut probe)
+            .await
+            .expect("handshake deve comutar para a entrada B após dados inválidos");
+        assert_eq!(entry_id, "bridge-b", "fluxo corrompido não pode contar como entrada operacional");
+
+        bridge_b.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_pool_fail_closed_when_all_handshakes_fail() {
+        let guard_addr = spawn_guard_handshake_ok().await;
+
+        // Todas as entradas aceitam TCP mas nenhuma conclui o handshake.
+        let bad_a = spawn_defective_bridge_accept_and_close().await;
+        let bad_b = spawn_defective_bridge_blackhole().await;
+
+        let mut pool = EntryPool::new();
+        pool.set_handshake_timeout(Duration::from_millis(400));
+        pool.push(Arc::new(BridgeEntry::new("bridge-a", bad_a)));
+        pool.push(Arc::new(BridgeEntry::new("bridge-b", bad_b)));
+
+        let mut probe = test_handshake_probe();
+        let err = pool
+            .connect_authenticated(&guard_addr.to_string(), &mut probe)
+            .await
+            .expect_err("todas as entradas falhando no handshake devem abortar o circuito");
+        let msg = err.to_string();
+        assert!(msg.contains("fail-closed"), "erro deve ser fail-closed, obtido: {msg}");
+        assert!(msg.contains("bridge-a") && msg.contains("bridge-b"), "erro deve citar as bridges, obtido: {msg}");
+        assert!(msg.contains("handshake"), "erro deve indicar falha de handshake, obtido: {msg}");
     }
 }

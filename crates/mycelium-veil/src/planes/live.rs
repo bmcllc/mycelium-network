@@ -26,6 +26,8 @@ use crate::VeilError;
 use mycelium_ghostid::GhostId;
 use mycelium_pqc::KemKeyPair;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -125,6 +127,62 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(
         reader.read_exact(&mut payload).await.map_err(|e| VeilError::Circuit(e.to_string()))?;
     }
     Ok((frame_type, payload))
+}
+
+/// Artefatos do handshake autenticado do primeiro salto (Guard).
+pub type FirstHopArtifacts = (
+    ReadHalf<VeilSecureStream<TcpStream>>,
+    Arc<Mutex<WriteHalf<VeilSecureStream<TcpStream>>>>,
+    HopKeys,
+);
+
+/// Handshake autenticado do primeiro salto (Guard): enlace PQC
+/// (`link_handshake_client`) + troca `Create`/`Created` com autenticação
+/// vinculada à identidade fixada (auth tag `veil-hop-auth`).
+///
+/// Toma posse de todos os dados (sem empréstimos) para que o probe possa ser
+/// re-executado por cada tentativa de entrada no [`EntryPool`] (P1.3.1).
+async fn first_hop_handshake(
+    stream: TcpStream,
+    circuit_id: u32,
+    guard_kem_key: Vec<u8>,
+    identity_pubkey0: [u8; 32],
+) -> Result<FirstHopArtifacts, VeilError> {
+    let guard_sec = link_handshake_client(stream, &guard_kem_key).await?;
+    let (mut guard_r, guard_w) = tokio::io::split(guard_sec);
+    let guard_w = Arc::new(Mutex::new(guard_w));
+
+    // Sal aleatório por sessão, vinculado à identidade do Guard (nunca do circuit_id global).
+    let mut salt0 = rand::random::<[u8; 32]>().to_vec();
+    salt0.extend_from_slice(&identity_pubkey0);
+
+    let (keys0, ct0) = client_kem_handshake(&guard_kem_key, &salt0)
+        .map_err(|e| VeilError::Crypto(e.to_string()))?;
+
+    let mut create_payload = Vec::with_capacity(6 + salt0.len() + ct0.len());
+    create_payload.extend_from_slice(&circuit_id.to_be_bytes());
+    create_payload.extend_from_slice(&(salt0.len() as u16).to_be_bytes());
+    create_payload.extend_from_slice(&salt0);
+    create_payload.extend_from_slice(&ct0);
+
+    {
+        let mut lock = guard_w.lock().await;
+        write_frame(&mut *lock, FrameType::Create, &create_payload).await?;
+    }
+
+    let (ft, created_data) = read_frame(&mut guard_r).await?;
+    if ft != FrameType::Created {
+        return Err(VeilError::Circuit("Resposta inválida no handshake do Guard".into()));
+    }
+
+    let mut expected_auth0_input = b"veil-hop-auth".to_vec();
+    expected_auth0_input.extend_from_slice(&identity_pubkey0);
+    let expected_auth0 = blake3::keyed_hash(&keys0.forward_key, &expected_auth0_input);
+    if created_data.len() < 36 || &created_data[4..36] != expected_auth0.as_bytes() {
+        return Err(VeilError::Crypto("Falha de autenticação no nó Guard".into()));
+    }
+
+    Ok((guard_r, guard_w, keys0))
 }
 
 /// Mensagem interna transportada no payload útil protegido por cifragem onion.
@@ -1032,54 +1090,31 @@ impl LiveCircuitClient {
             }
         }
 
-        // Conecta ao Guard (primeiro salto) com enquadramento PQC autenticado sobre o fio.
-        // O transporte de entrada é intercambiável (P1.3): direto ao endpoint do Guard ou
-        // através de bridges independentes. Nenhum caminho conecta o destino final.
-        let guard_stream = match entries {
-            Some(pool) => {
-                let conn = pool.connect(&hops[0].endpoint).await?;
-                tracing::info!(entry = %conn.entry_id, guard = %hops[0].endpoint, "enlace de entrada estabelecido via pool de bridges");
-                conn.stream
-            }
-            None => TcpStream::connect(&hops[0].endpoint)
-                .await
-                .map_err(|e| VeilError::Circuit(format!("Falha ao conectar no nó Guard ({}): {e}", hops[0].endpoint)))?,
-        };
-
-        let guard_sec = link_handshake_client(guard_stream, &hops[0].public_kem_key).await?;
-        let (mut guard_r, guard_w) = tokio::io::split(guard_sec);
-        let guard_w = Arc::new(Mutex::new(guard_w));
-
-        // Handshake inicial com Guard usando sal aleatório por sessão (sem derivar do circuit_id global)
+        // Entrada autenticada (P1.3.1): cada transporte só é considerado operacional após o
+        // handshake autenticado com o Guard (enlace PQC + Create/Created com auth tag
+        // vinculada à identidade fixada). Falha nesse estágio libera a conexão e tenta a
+        // próxima entrada; nenhum caminho conecta o destino final.
         let identity_pubkey0 = hops[0].descriptor.as_ref().unwrap().identity_pubkey;
-        let mut salt0 = rand::random::<[u8; 32]>().to_vec();
-        salt0.extend_from_slice(&identity_pubkey0);
 
-        let (keys0, ct0) = client_kem_handshake(&hops[0].public_kem_key, &salt0)
-            .map_err(|e| VeilError::Crypto(e.to_string()))?;
-
-        let mut create_payload = Vec::with_capacity(6 + salt0.len() + ct0.len());
-        create_payload.extend_from_slice(&circuit_id.to_be_bytes());
-        create_payload.extend_from_slice(&(salt0.len() as u16).to_be_bytes());
-        create_payload.extend_from_slice(&salt0);
-        create_payload.extend_from_slice(&ct0);
-
-        {
-            let mut lock = guard_w.lock().await;
-            write_frame(&mut *lock, FrameType::Create, &create_payload).await?;
-        }
-
-        let (ft, created_data) = read_frame(&mut guard_r).await?;
-        if ft != FrameType::Created {
-            return Err(VeilError::Circuit("Resposta inválida no handshake do Guard".into()));
-        }
-
-        let mut expected_auth0_input = b"veil-hop-auth".to_vec();
-        expected_auth0_input.extend_from_slice(&identity_pubkey0);
-        let expected_auth0 = blake3::keyed_hash(&keys0.forward_key, &expected_auth0_input);
-        if created_data.len() < 36 || &created_data[4..36] != expected_auth0.as_bytes() {
-            return Err(VeilError::Crypto("Falha de autenticação no nó Guard".into()));
-        }
+        let (mut guard_r, guard_w, keys0) = match entries {
+            Some(pool) => {
+                let guard_ep = hops[0].endpoint.clone();
+                let guard_kem = hops[0].public_kem_key.clone();
+                let mut probe = move |stream: TcpStream| -> Pin<Box<dyn Future<Output = Result<FirstHopArtifacts, VeilError>> + Send>> {
+                    let guard_kem = guard_kem.clone();
+                    Box::pin(first_hop_handshake(stream, circuit_id, guard_kem, identity_pubkey0))
+                };
+                let ((r, w, keys), entry_id) = pool.connect_authenticated(&guard_ep, &mut probe).await?;
+                tracing::info!(entry = %entry_id, guard = %guard_ep, "entrada autenticada com o Guard via pool de bridges");
+                (r, w, keys)
+            }
+            None => {
+                let guard_stream = TcpStream::connect(&hops[0].endpoint)
+                    .await
+                    .map_err(|e| VeilError::Circuit(format!("Falha ao conectar no nó Guard ({}): {e}", hops[0].endpoint)))?;
+                first_hop_handshake(guard_stream, circuit_id, hops[0].public_kem_key.clone(), identity_pubkey0).await?
+            }
+        };
 
         let mut hop_keys = vec![keys0];
         let mut encryptors: Vec<HopEncryptor> = vec![HopEncryptor::new(&hop_keys[0].forward_key)];
@@ -1965,6 +2000,117 @@ mod tests {
         let res = LiveCircuitClient::connect_production_via_entries(8203, make_hops(), &trusted, &pool).await;
         let err = match res {
             Ok(_) => panic!("circuito sucedeu com todas as bridges bloqueadas!"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("fail-closed"), "erro deve ser fail-closed, obtido: {err}");
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            direct_hits.load(Ordering::SeqCst),
+            hits_before,
+            "fail-closed violado: cliente tentou conexão direta ao destino"
+        );
+    }
+
+    /// P1.3.1: uma entrada que aceita TCP mas bloqueia o handshake autenticado
+    /// (fecha o fluxo) NÃO conta como operacional. O pool deve autenticar via
+    /// bridge B e o circuito LIVE (Guard -> Middle -> Exit, pins) se completa;
+    /// com todas as entradas defeituosas, fail-closed sem conexão direta.
+    #[tokio::test]
+    async fn test_p1_3_switches_when_primary_accepts_tcp_but_blocks_handshake() {
+        use crate::bridge::{BridgeEntry, BridgeRelay, EntryPool};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // Destino controlado com contador de conexões diretas.
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let counter = direct_hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, peer)) = target_listener.accept().await else { break };
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    if let Ok(n) = stream.read(&mut buf).await {
+                        if n > 0 {
+                            let reply = format!("{}:{}", peer.ip(), peer.port());
+                            let _ = stream.write_all(reply.as_bytes()).await;
+                        }
+                    }
+                });
+            }
+        });
+
+        let exit_policy = ExitPolicy {
+            allowed_ports: vec![target_addr.port()],
+            blocked_ports: vec![],
+            block_private_networks: false,
+            max_bandwidth_bps: 0,
+        };
+
+        let (guard_desc, _ga) = spawn_hop_on("127.0.0.2", "guard-handshake-remoto", None).await;
+        let (middle_desc, _ma) = spawn_hop_on("127.0.0.3", "middle-handshake-remoto", None).await;
+        let (exit_desc, _ea) = spawn_hop_on("127.0.0.4", "exit-handshake-remoto", Some(exit_policy)).await;
+
+        let guard_endpoint: std::net::SocketAddr = guard_desc.endpoint.parse().expect("endpoint do Guard");
+
+        // Entrada A defeituosa: aceita TCP e fecha — o handshake autenticado morre com EOF.
+        let defective_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let defective_addr = defective_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _peer)) = defective_listener.accept().await else { break };
+                drop(sock);
+            }
+        });
+
+        // Entrada B: relay real para o Guard.
+        let bridge_b = BridgeRelay::spawn("127.0.0.1:0".parse().unwrap(), guard_endpoint)
+            .await
+            .expect("bridge B sobe");
+        let addr_b = bridge_b.listen_addr();
+
+        let mut pool = EntryPool::new();
+        pool.push(Arc::new(BridgeEntry::new("bridge-a", defective_addr)));
+        pool.push(Arc::new(BridgeEntry::new("bridge-b", addr_b)));
+
+        let guard_desc = NodeDescriptor::from_json(&guard_desc.to_json().unwrap()).unwrap();
+        let middle_desc = NodeDescriptor::from_json(&middle_desc.to_json().unwrap()).unwrap();
+        let exit_desc = NodeDescriptor::from_json(&exit_desc.to_json().unwrap()).unwrap();
+
+        let trusted = vec![
+            TrustedIdentity::new("guard-prod".into(), guard_desc.identity_pubkey, guard_desc.public_kem_key.clone())
+                .with_endpoint(guard_desc.endpoint.clone()),
+            TrustedIdentity::new("middle-prod".into(), middle_desc.identity_pubkey, middle_desc.public_kem_key.clone())
+                .with_endpoint(middle_desc.endpoint.clone()),
+            TrustedIdentity::new("exit-prod".into(), exit_desc.identity_pubkey, exit_desc.public_kem_key.clone())
+                .with_endpoint(exit_desc.endpoint.clone()),
+        ];
+
+        let make_hops = || {
+            vec![
+                CircuitHopNode::from_descriptor(guard_desc.clone()),
+                CircuitHopNode::from_descriptor(middle_desc.clone()),
+                CircuitHopNode::from_descriptor(exit_desc.clone()),
+            ]
+        };
+
+        // A bridge A aceita TCP, mas o handshake autenticado falha (EOF); o pool
+        // comuta para B e o circuito LIVE (Guard -> Middle -> Exit, pins) se completa.
+        let client = LiveCircuitClient::connect_production_via_entries(8301, make_hops(), &trusted, &pool)
+            .await
+            .expect("comutação pós-TCP: handshake autenticado deve alcançar o Guard via bridge B");
+        assert_eq!(client.hop_keys.len(), 3);
+        assert_destination_observes_exit(&client, target_addr, &direct_hits, 1).await;
+
+        // Agora B também fica inacessível: fail-closed, sem conexão direta ao destino.
+        bridge_b.stop().await;
+        let hits_before = direct_hits.load(Ordering::SeqCst);
+        let res = LiveCircuitClient::connect_production_via_entries(8302, make_hops(), &trusted, &pool).await;
+        let err = match res {
+            Ok(_) => panic!("circuito sucedeu com todas as entradas bloqueadas no handshake!"),
             Err(e) => e,
         };
         assert!(err.to_string().contains("fail-closed"), "erro deve ser fail-closed, obtido: {err}");
