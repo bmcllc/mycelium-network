@@ -28,6 +28,10 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
 #[derive(Debug, Error)]
 pub enum PqcTransportError {
     #[error("{0}")]
@@ -36,15 +40,281 @@ pub enum PqcTransportError {
     Io(#[from] std::io::Error),
 }
 
-type IncomingTx = mpsc::UnboundedSender<(TcpStream, Multiaddr)>;
+enum RxState {
+    ReadingHeader { buf: [u8; 14], pos: usize },
+    ReadingBody { nonce: [u8; 12], buf: Vec<u8>, pos: usize, target: usize },
+}
+
+/// Fluxo de transporte pós-quântico com criptografia de quadro simétrica ChaCha20-Poly1305.
+pub struct PqcSecureStream<S> {
+    inner: S,
+    tx_cipher: ChaCha20Poly1305,
+    tx_seq: u64,
+    rx_cipher: ChaCha20Poly1305,
+    rx_seq: u64,
+    rx_state: RxState,
+    read_buf: Vec<u8>,
+    read_pos: usize,
+    write_buf: Vec<u8>,
+    write_pos: usize,
+}
+
+impl<S> PqcSecureStream<S> {
+    pub fn new(inner: S, tx_key: [u8; 32], rx_key: [u8; 32]) -> Self {
+        Self {
+            inner,
+            tx_cipher: ChaCha20Poly1305::new(Key::from_slice(&tx_key)),
+            tx_seq: 0,
+            rx_cipher: ChaCha20Poly1305::new(Key::from_slice(&rx_key)),
+            rx_seq: 0,
+            rx_state: RxState::ReadingHeader { buf: [0u8; 14], pos: 0 },
+            read_buf: Vec::new(),
+            read_pos: 0,
+            write_buf: Vec::new(),
+            write_pos: 0,
+        }
+    }
+
+    pub fn get_ref(&self) -> &S {
+        &self.inner
+    }
+
+    pub fn get_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for PqcSecureStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+
+        loop {
+            // Se temos dados decifrados no buffer de leitura, entregamos ao chamador
+            if this.read_pos < this.read_buf.len() {
+                let to_copy = std::cmp::min(buf.remaining(), this.read_buf.len() - this.read_pos);
+                buf.put_slice(&this.read_buf[this.read_pos..this.read_pos + to_copy]);
+                this.read_pos += to_copy;
+                if this.read_pos == this.read_buf.len() {
+                    this.read_buf.clear();
+                    this.read_pos = 0;
+                }
+                return Poll::Ready(Ok(()));
+            }
+
+            // Caso o chamador não tenha espaço no buffer, retornamos Ok
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            // Máquina de estados para ler o próximo quadro do stream subjacente
+            match &mut this.rx_state {
+                RxState::ReadingHeader { buf: h_buf, pos } => {
+                    while *pos < 14 {
+                        let mut read_slice = ReadBuf::new(&mut h_buf[*pos..14]);
+                        match Pin::new(&mut this.inner).poll_read(cx, &mut read_slice) {
+                            Poll::Ready(Ok(())) => {
+                                let n = read_slice.filled().len();
+                                if n == 0 {
+                                    if *pos == 0 {
+                                        // Fechamento limpo na fronteira do quadro
+                                        return Poll::Ready(Ok(()));
+                                    } else {
+                                        return Poll::Ready(Err(std::io::Error::new(
+                                            std::io::ErrorKind::UnexpectedEof,
+                                            "EOF prematuro no cabeçalho do quadro PQC",
+                                        )));
+                                    }
+                                }
+                                *pos += n;
+                            }
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+
+                    let target = u16::from_be_bytes([h_buf[0], h_buf[1]]) as usize;
+                    let mut nonce = [0u8; 12];
+                    nonce.copy_from_slice(&h_buf[2..14]);
+
+                    this.rx_state = RxState::ReadingBody {
+                        nonce,
+                        buf: vec![0u8; target],
+                        pos: 0,
+                        target,
+                    };
+                }
+                RxState::ReadingBody { nonce, buf: b_buf, pos, target } => {
+                    let target_len = *target;
+                    let nonce_val = *nonce;
+                    while *pos < target_len {
+                        let mut read_slice = ReadBuf::new(&mut b_buf[*pos..target_len]);
+                        match Pin::new(&mut this.inner).poll_read(cx, &mut read_slice) {
+                            Poll::Ready(Ok(())) => {
+                                let n = read_slice.filled().len();
+                                if n == 0 {
+                                    return Poll::Ready(Err(std::io::Error::new(
+                                        std::io::ErrorKind::UnexpectedEof,
+                                        "EOF prematuro no corpo do quadro PQC",
+                                    )));
+                                }
+                                *pos += n;
+                            }
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+
+                    // Verifica número de sequência monotônico do nonce
+                    let seq = u64::from_be_bytes(nonce_val[4..12].try_into().unwrap());
+                    if seq != this.rx_seq {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("Sequência PQC inesperada: {seq} (esperado: {})", this.rx_seq),
+                        )));
+                    }
+                    this.rx_seq += 1;
+
+                    let pt = this.rx_cipher
+                        .decrypt(Nonce::from_slice(&nonce_val), b_buf.as_slice())
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+
+                    this.read_buf = pt;
+                    this.read_pos = 0;
+                    this.rx_state = RxState::ReadingHeader { buf: [0u8; 14], pos: 0 };
+                }
+            }
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for PqcSecureStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+
+        // 1. Drena buffer pendente caso haja gravação em andamento
+        while this.write_pos < this.write_buf.len() {
+            match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf[this.write_pos..]) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "write zero ao drenar quadro PQC",
+                    )));
+                }
+                Poll::Ready(Ok(n)) => {
+                    this.write_pos += n;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        if this.write_pos == this.write_buf.len() {
+            this.write_buf.clear();
+            this.write_pos = 0;
+        }
+
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        // 2. Fragmenta até 16KB por quadro criptografado ChaCha20-Poly1305
+        let chunk_size = std::cmp::min(buf.len(), 16384);
+        let chunk = &buf[..chunk_size];
+
+        let mut nonce = [0u8; 12];
+        nonce[4..12].copy_from_slice(&this.tx_seq.to_be_bytes());
+        this.tx_seq += 1;
+
+        let ciphertext = this.tx_cipher
+            .encrypt(Nonce::from_slice(&nonce), chunk)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+        let frame_len = ciphertext.len() as u16;
+        let mut frame = Vec::with_capacity(2 + 12 + ciphertext.len());
+        frame.extend_from_slice(&frame_len.to_be_bytes());
+        frame.extend_from_slice(&nonce);
+        frame.extend_from_slice(&ciphertext);
+
+        this.write_buf = frame;
+        this.write_pos = 0;
+
+        // Tenta gravar imediatamente parte do quadro montado
+        while this.write_pos < this.write_buf.len() {
+            match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf[this.write_pos..]) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "write zero ao gravar quadro PQC",
+                    )));
+                }
+                Poll::Ready(Ok(n)) => {
+                    this.write_pos += n;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => break,
+            }
+        }
+
+        Poll::Ready(Ok(chunk_size))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        while this.write_pos < this.write_buf.len() {
+            match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf[this.write_pos..]) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "write zero ao flush PQC",
+                    )));
+                }
+                Poll::Ready(Ok(n)) => {
+                    this.write_pos += n;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        if this.write_pos == this.write_buf.len() {
+            this.write_buf.clear();
+            this.write_pos = 0;
+        }
+        Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        while this.write_pos < this.write_buf.len() {
+            match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf[this.write_pos..]) {
+                Poll::Ready(Ok(0)) => break,
+                Poll::Ready(Ok(n)) => {
+                    this.write_pos += n;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
+}
+
+type IncomingTx = mpsc::UnboundedSender<(PqcSecureStream<TcpStream>, Multiaddr)>;
 
 struct ListenerState {
     addr: Multiaddr,
     tell_new_addr: bool,
-    incoming_rx: mpsc::UnboundedReceiver<(TcpStream, Multiaddr)>,
+    incoming_rx: mpsc::UnboundedReceiver<(PqcSecureStream<TcpStream>, Multiaddr)>,
 }
 
-/// Transporte TCP + KEM. Output = Compat<TcpStream>, pipeline aplica Noise + Yamux.
+/// Transporte TCP + KEM com encriptação AEAD simétrica de fio (ChaCha20-Poly1305).
 pub struct PqcTransport {
     local_kp: Arc<mycelium_pqc::KemKeyPair>,
     local_pk_hex: String,
@@ -117,7 +387,7 @@ pub fn derive_pqc_session_key(shared_secret: &[u8], context: &[u8]) -> [u8; 32] 
 }
 
 impl Transport for PqcTransport {
-    type Output = tokio_util::compat::Compat<TcpStream>;
+    type Output = tokio_util::compat::Compat<PqcSecureStream<TcpStream>>;
     type Error = PqcTransportError;
     type ListenerUpgrade = Ready<Result<Self::Output, Self::Error>>;
     type Dial = Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send>>;
@@ -179,9 +449,15 @@ impl Transport for PqcTransport {
                         if stream.flush().await.is_err() {
                             continue;
                         }
+
+                        // Encripta todo o tráfego subsequente no fio com ChaCha20-Poly1305
+                        let rx_key = blake3::keyed_hash(&session_key, b"pqc-wire-client-to-server");
+                        let tx_key = blake3::keyed_hash(&session_key, b"pqc-wire-server-to-client");
+                        let secure_stream = PqcSecureStream::new(stream, *tx_key.as_bytes(), *rx_key.as_bytes());
+
                         let peer_maddr = Multiaddr::empty()
                             .with(Protocol::Tcp(peer_addr.port()));
-                        let _ = tx.unbounded_send((stream, peer_maddr));
+                        let _ = tx.unbounded_send((secure_stream, peer_maddr));
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "pqc accept");
@@ -238,7 +514,12 @@ impl Transport for PqcTransport {
                 return Err(PqcTransportError::Msg("Autenticação mútua do servidor PQC falhou".into()));
             }
 
-            Ok(stream.compat())
+            // Encripta todo o tráfego de discagem no fio com ChaCha20-Poly1305
+            let tx_key = blake3::keyed_hash(&session_key, b"pqc-wire-client-to-server");
+            let rx_key = blake3::keyed_hash(&session_key, b"pqc-wire-server-to-client");
+            let secure_stream = PqcSecureStream::new(stream, *tx_key.as_bytes(), *rx_key.as_bytes());
+
+            Ok(secure_stream.compat())
         }))
     }
 
@@ -414,6 +695,62 @@ mod tests {
         let mut server_auth = [0u8; 32];
         client_stream.read_exact(&mut server_auth).await.unwrap();
         assert_eq!(server_auth, *blake3::keyed_hash(&session_key, b"mycelium-pqc-server-auth").as_bytes());
+
+        srv_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_pqc_stream_wire_ciphertext_verification() {
+        let server_kp = generate_pqc_keypair();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let srv_priv = server_kp.private_bytes().to_vec();
+        let srv_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut ct = vec![0u8; 1568];
+            stream.read_exact(&mut ct).await.unwrap();
+            let ss = mlkem_decapsulate(&srv_priv, &ct).unwrap();
+            let session_key = derive_pqc_session_key(&ss, b"mycelium-pqc-v1-hybrid-transcript");
+            let mut client_auth = [0u8; 32];
+            stream.read_exact(&mut client_auth).await.unwrap();
+            let server_auth = blake3::keyed_hash(&session_key, b"mycelium-pqc-server-auth");
+            stream.write_all(server_auth.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+
+            let rx_key = blake3::keyed_hash(&session_key, b"pqc-wire-client-to-server");
+            let tx_key = blake3::keyed_hash(&session_key, b"pqc-wire-server-to-client");
+            let mut secure = PqcSecureStream::new(stream, *tx_key.as_bytes(), *rx_key.as_bytes());
+
+            let mut buf = vec![0u8; 1024];
+            let n = secure.read(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"top-secret-pqc-payload");
+
+            secure.write_all(b"resposta-servidor-pqc").await.unwrap();
+            secure.flush().await.unwrap();
+        });
+
+        let mut client_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let enc = mlkem_encapsulate(&server_kp.public_key).unwrap();
+        let session_key = derive_pqc_session_key(&enc.shared_secret, b"mycelium-pqc-v1-hybrid-transcript");
+        let client_auth = blake3::keyed_hash(&session_key, b"mycelium-pqc-client-auth");
+        client_stream.write_all(&enc.ciphertext).await.unwrap();
+        client_stream.write_all(client_auth.as_bytes()).await.unwrap();
+        client_stream.flush().await.unwrap();
+
+        let mut server_auth = [0u8; 32];
+        client_stream.read_exact(&mut server_auth).await.unwrap();
+
+        let tx_key = blake3::keyed_hash(&session_key, b"pqc-wire-client-to-server");
+        let rx_key = blake3::keyed_hash(&session_key, b"pqc-wire-server-to-client");
+        let mut client_secure = PqcSecureStream::new(client_stream, *tx_key.as_bytes(), *rx_key.as_bytes());
+
+        client_secure.write_all(b"top-secret-pqc-payload").await.unwrap();
+        client_secure.flush().await.unwrap();
+
+        let mut resp = vec![0u8; 1024];
+        let n = client_secure.read(&mut resp).await.unwrap();
+        assert_eq!(&resp[..n], b"resposta-servidor-pqc");
 
         srv_task.await.unwrap();
     }

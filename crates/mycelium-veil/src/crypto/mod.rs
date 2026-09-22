@@ -19,6 +19,10 @@ pub enum CryptoError {
     InvalidLength(String),
     #[error("célula corrompida ou tag de integridade inválida")]
     CorruptedCell,
+    #[error("reutilização ou replay de célula detectado (seq: {0})")]
+    ReplayDetected(u64),
+    #[error("esgotamento do contador de sequência criptográfica")]
+    SequenceExhaustion,
 }
 
 /// Chaves de salto (Hop) derivadas a partir do handshake pós-quântico ML-KEM-1024.
@@ -63,13 +67,16 @@ impl HopKeys {
     }
 }
 
-/// Encriptador/Decifrador AEAD por salto com ChaCha20-Poly1305.
-pub struct HopCipher {
+/// Limite de segurança de sequência antes da rotação obrigatória de chaves (2^48).
+pub const MAX_HOP_CIPHER_SEQ: u64 = 1 << 48;
+
+/// Encriptador AEAD por salto com ChaCha20-Poly1305 e controle monotônico de nonce.
+pub struct HopEncryptor {
     cipher: ChaCha20Poly1305,
     seq: u64,
 }
 
-impl HopCipher {
+impl HopEncryptor {
     pub fn new(key: &[u8; 32]) -> Self {
         Self {
             cipher: ChaCha20Poly1305::new(Key::from_slice(key)),
@@ -77,31 +84,63 @@ impl HopCipher {
         }
     }
 
-    /// Gera um nonce monotônico de 12 bytes combinando sequência e identificador.
-    fn next_nonce(&mut self) -> [u8; 12] {
-        let mut n = [0u8; 12];
-        n[4..12].copy_from_slice(&self.seq.to_be_bytes());
-        self.seq = self.seq.wrapping_add(1);
-        n
+    pub fn current_seq(&self) -> u64 {
+        self.seq
     }
 
-    /// Cifra dados com tag de autenticação Poly1305.
+    #[cfg(test)]
+    pub fn set_seq_for_test(&mut self, seq: u64) {
+        self.seq = seq;
+    }
+
+    /// Gera o próximo nonce de 12 bytes combinando padding e contador monotônico.
+    fn next_nonce(&mut self) -> Result<[u8; 12], CryptoError> {
+        if self.seq >= MAX_HOP_CIPHER_SEQ {
+            return Err(CryptoError::SequenceExhaustion);
+        }
+        let mut n = [0u8; 12];
+        n[4..12].copy_from_slice(&self.seq.to_be_bytes());
+        self.seq += 1;
+        Ok(n)
+    }
+
+    /// Cifra dados com tag de autenticação Poly1305 garantindo nonce único monotônico.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        let nonce_bytes = self.next_nonce();
+        let nonce_bytes = self.next_nonce()?;
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = self
             .cipher
             .encrypt(nonce, plaintext)
             .map_err(|e| CryptoError::Aead(e.to_string()))?;
 
-        // Anexa o nonce no início (12 bytes)
         let mut out = Vec::with_capacity(12 + ciphertext.len());
         out.extend_from_slice(&nonce_bytes);
         out.extend_from_slice(&ciphertext);
         Ok(out)
     }
+}
 
-    /// Decifra dados autenticados verificando a integridade.
+/// Decifrador AEAD por salto com ChaCha20-Poly1305 e proteção estrita anti-replay.
+pub struct HopDecryptor {
+    cipher: ChaCha20Poly1305,
+    next_expected_seq: u64,
+    seen_seqs: std::collections::HashSet<u64>,
+}
+
+impl HopDecryptor {
+    pub fn new(key: &[u8; 32]) -> Self {
+        Self {
+            cipher: ChaCha20Poly1305::new(Key::from_slice(key)),
+            next_expected_seq: 0,
+            seen_seqs: std::collections::HashSet::new(),
+        }
+    }
+
+    pub fn last_seq(&self) -> u64 {
+        self.next_expected_seq
+    }
+
+    /// Decifra dados verificando integridade AEAD e rejeitando repetição ou replay de sequência.
     pub fn decrypt(&mut self, data: &[u8]) -> Result<Vec<u8>, CryptoError> {
         if data.len() < 12 + 16 {
             return Err(CryptoError::InvalidLength(
@@ -111,11 +150,54 @@ impl HopCipher {
 
         let nonce_bytes = &data[0..12];
         let ciphertext = &data[12..];
-        let nonce = Nonce::from_slice(nonce_bytes);
+        let seq = u64::from_be_bytes(nonce_bytes[4..12].try_into().unwrap());
 
-        self.cipher
+        // Verificação anti-replay: rejeita sequências repetidas ou anteriores à janela
+        if self.seen_seqs.contains(&seq) || seq < self.next_expected_seq {
+            return Err(CryptoError::ReplayDetected(seq));
+        }
+
+        let nonce = Nonce::from_slice(nonce_bytes);
+        let plaintext = self
+            .cipher
             .decrypt(nonce, ciphertext)
-            .map_err(|_| CryptoError::CorruptedCell)
+            .map_err(|_| CryptoError::CorruptedCell)?;
+
+        self.seen_seqs.insert(seq);
+        if seq >= self.next_expected_seq {
+            self.next_expected_seq = seq + 1;
+        }
+
+        // Mantém janela anti-replay limpa
+        if self.seen_seqs.len() > 4096 {
+            let cutoff = self.next_expected_seq.saturating_sub(2048);
+            self.seen_seqs.retain(|&s| s >= cutoff);
+        }
+
+        Ok(plaintext)
+    }
+}
+
+/// Wrapper compatível com estado duplo de encriptação e decifração.
+pub struct HopCipher {
+    pub encryptor: HopEncryptor,
+    pub decryptor: HopDecryptor,
+}
+
+impl HopCipher {
+    pub fn new(key: &[u8; 32]) -> Self {
+        Self {
+            encryptor: HopEncryptor::new(key),
+            decryptor: HopDecryptor::new(key),
+        }
+    }
+
+    pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        self.encryptor.encrypt(plaintext)
+    }
+
+    pub fn decrypt(&mut self, data: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        self.decryptor.decrypt(data)
     }
 }
 
@@ -138,6 +220,30 @@ pub fn server_kem_handshake(
     let shared = mlkem_decapsulate(keypair.private_bytes(), ciphertext)?;
     let hop_keys = HopKeys::derive(&shared, salt);
     Ok(hop_keys)
+}
+
+/// Cifra um payload em camadas no estilo Onion usando encryptors com estado persistente.
+pub fn onion_encrypt_layers_stateful(
+    inner_payload: &[u8],
+    encryptors: &mut [HopEncryptor],
+) -> Result<Vec<u8>, CryptoError> {
+    let mut current = inner_payload.to_vec();
+    for enc in encryptors.iter_mut().rev() {
+        current = enc.encrypt(&current)?;
+    }
+    Ok(current)
+}
+
+/// Descasca camadas no sentido backward no cliente usando decryptors com estado persistente.
+pub fn onion_peel_backward_stateful(
+    layer_data: &[u8],
+    decryptors: &mut [HopDecryptor],
+) -> Result<Vec<u8>, CryptoError> {
+    let mut current = layer_data.to_vec();
+    for dec in decryptors.iter_mut() {
+        current = dec.decrypt(&current)?;
+    }
+    Ok(current)
 }
 
 /// Cifra um payload em camadas no estilo Onion (Exit -> Middle -> Guard).
@@ -192,6 +298,69 @@ mod tests {
     }
 
     #[test]
+    fn test_two_consecutive_cells_do_not_reuse_nonce() {
+        let key = [99u8; 32];
+        let mut encryptor = HopEncryptor::new(&key);
+
+        let msg1 = b"primeira celula no circuito";
+        let msg2 = b"segunda celula no circuito";
+
+        let ct1 = encryptor.encrypt(msg1).expect("encrypt 1");
+        let ct2 = encryptor.encrypt(msg2).expect("encrypt 2");
+
+        let nonce1 = &ct1[0..12];
+        let nonce2 = &ct2[0..12];
+
+        // Nonces devem ser estritamente diferentes
+        assert_ne!(nonce1, nonce2);
+
+        let seq1 = u64::from_be_bytes(nonce1[4..12].try_into().unwrap());
+        let seq2 = u64::from_be_bytes(nonce2[4..12].try_into().unwrap());
+        assert_eq!(seq1, 0);
+        assert_eq!(seq2, 1);
+        assert_eq!(encryptor.current_seq(), 2);
+    }
+
+    #[test]
+    fn test_replayed_cell_is_strictly_rejected() {
+        let key = [77u8; 32];
+        let mut encryptor = HopEncryptor::new(&key);
+        let mut decryptor = HopDecryptor::new(&key);
+
+        let msg = b"celula protegida contra replay";
+        let ct = encryptor.encrypt(msg).expect("encrypt");
+
+        // Primeira decifração: aceita com sucesso
+        let pt = decryptor.decrypt(&ct).expect("primeira decifracao deve suceder");
+        assert_eq!(pt, msg);
+
+        // Replay imediato da mesma célula: deve falhar com ReplayDetected
+        let replay_err = decryptor.decrypt(&ct);
+        match replay_err {
+            Err(CryptoError::ReplayDetected(seq)) => {
+                assert_eq!(seq, 0);
+            }
+            other => panic!("Esperado ReplayDetected, obtido: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sequence_counter_exhaustion_terminates_session() {
+        let key = [55u8; 32];
+        let mut encryptor = HopEncryptor::new(&key);
+
+        encryptor.set_seq_for_test(MAX_HOP_CIPHER_SEQ);
+
+        let msg = b"tentativa apos esgotamento do contador de sequencia";
+        let res = encryptor.encrypt(msg);
+
+        match res {
+            Err(CryptoError::SequenceExhaustion) => {}
+            other => panic!("Esperado SequenceExhaustion, obtido: {other:?}"),
+        }
+    }
+
+    #[test]
     fn hybrid_kem_handshake_roundtrip() {
         let server_kp = mlkem_keygen();
         let salt = b"circuito-404-salt";
@@ -207,7 +376,6 @@ mod tests {
 
     #[test]
     fn multi_hop_onion_encryption_and_peeling() {
-        // Simula 3 saltos: Guard (0), Middle (1), Exit (2)
         let hops = vec![
             HopKeys { forward_key: [1u8; 32], backward_key: [11u8; 32] },
             HopKeys { forward_key: [2u8; 32], backward_key: [22u8; 32] },
@@ -216,15 +384,38 @@ mod tests {
 
         let payload = b"mensagem secreta que alcanca a internet via Exit";
 
-        // Cliente encapsula em 3 camadas
         let onion = onion_encrypt_layers(payload, &hops).expect("onion encrypt");
 
-        // Salto 0 (Guard) descasca camada 0
         let peeled_guard = onion_peel_layer(&onion, &hops[0]).expect("guard peel");
-        // Salto 1 (Middle) descasca camada 1
         let peeled_middle = onion_peel_layer(&peeled_guard, &hops[1]).expect("middle peel");
-        // Salto 2 (Exit) descasca camada 2 e recupera payload original
         let recovered = onion_peel_layer(&peeled_middle, &hops[2]).expect("exit peel");
+
+        assert_eq!(recovered, payload);
+    }
+
+    #[test]
+    fn stateful_multi_hop_onion_encryption_and_peeling() {
+        let hop1 = [1u8; 32];
+        let hop2 = [2u8; 32];
+        let hop3 = [3u8; 32];
+
+        let mut client_encryptors = vec![
+            HopEncryptor::new(&hop1),
+            HopEncryptor::new(&hop2),
+            HopEncryptor::new(&hop3),
+        ];
+
+        let mut guard_decryptor = HopDecryptor::new(&hop1);
+        let mut middle_decryptor = HopDecryptor::new(&hop2);
+        let mut exit_decryptor = HopDecryptor::new(&hop3);
+
+        let payload = b"estado persistente atraves dos saltos";
+
+        let onion = onion_encrypt_layers_stateful(payload, &mut client_encryptors).unwrap();
+
+        let peeled1 = guard_decryptor.decrypt(&onion).unwrap();
+        let peeled2 = middle_decryptor.decrypt(&peeled1).unwrap();
+        let recovered = exit_decryptor.decrypt(&peeled2).unwrap();
 
         assert_eq!(recovered, payload);
     }

@@ -35,7 +35,6 @@ mod tests {
 
         // 2. Nó Exit (com política permitindo porta do target para o teste)
         let exit_kp = mlkem_keygen();
-        let exit_pk = exit_kp.public_key.clone();
         let exit_policy = ExitPolicy {
             allowed_ports: vec![target_addr.port()],
             blocked_ports: vec![],
@@ -45,47 +44,36 @@ mod tests {
         let exit_router = VeilHopRouter::new(exit_kp, Some(exit_policy));
         let exit_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let exit_addr = exit_listener.local_addr().unwrap();
+        let exit_desc = exit_router.descriptor("exit-node".into(), exit_addr.to_string());
         let exit_handle = tokio::spawn(async move {
             let _ = exit_router.run(exit_listener).await;
         });
 
         // 3. Nó Middle
         let middle_kp = mlkem_keygen();
-        let middle_pk = middle_kp.public_key.clone();
         let middle_router = VeilHopRouter::new(middle_kp, None);
         let middle_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let middle_addr = middle_listener.local_addr().unwrap();
+        let middle_desc = middle_router.descriptor("middle-node".into(), middle_addr.to_string());
         let middle_handle = tokio::spawn(async move {
             let _ = middle_router.run(middle_listener).await;
         });
 
         // 4. Nó Guard
         let guard_kp = mlkem_keygen();
-        let guard_pk = guard_kp.public_key.clone();
         let guard_router = VeilHopRouter::new(guard_kp, None);
         let guard_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let guard_addr = guard_listener.local_addr().unwrap();
+        let guard_desc = guard_router.descriptor("guard-node".into(), guard_addr.to_string());
         let guard_handle = tokio::spawn(async move {
             let _ = guard_router.run(guard_listener).await;
         });
 
         // 5. Cliente monta circuito de 3 saltos via handshake telescópico ML-KEM-1024
         let hops = vec![
-            CircuitHopNode {
-                node_id: "guard-node".into(),
-                public_kem_key: guard_pk,
-                endpoint: guard_addr.to_string(),
-            },
-            CircuitHopNode {
-                node_id: "middle-node".into(),
-                public_kem_key: middle_pk,
-                endpoint: middle_addr.to_string(),
-            },
-            CircuitHopNode {
-                node_id: "exit-node".into(),
-                public_kem_key: exit_pk,
-                endpoint: exit_addr.to_string(),
-            },
+            CircuitHopNode::from_descriptor(guard_desc),
+            CircuitHopNode::from_descriptor(middle_desc),
+            CircuitHopNode::from_descriptor(exit_desc),
         ];
 
         let circuit_client = Arc::new(
@@ -192,7 +180,6 @@ mod tests {
 
         // 2. Monta nós Guard e Exit
         let exit_kp = mlkem_keygen();
-        let exit_pk = exit_kp.public_key.clone();
         let exit_policy = ExitPolicy {
             allowed_ports: vec![target_addr.port()],
             blocked_ports: vec![],
@@ -202,31 +189,24 @@ mod tests {
         let exit_router = VeilHopRouter::new(exit_kp, Some(exit_policy));
         let exit_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let exit_addr = exit_listener.local_addr().unwrap();
+        let exit_desc = exit_router.descriptor("exit".into(), exit_addr.to_string());
         let exit_handle = tokio::spawn(async move {
             let _ = exit_router.run(exit_listener).await;
         });
 
         let guard_kp = mlkem_keygen();
-        let guard_pk = guard_kp.public_key.clone();
         let guard_router = VeilHopRouter::new(guard_kp, None);
         let guard_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let guard_addr = guard_listener.local_addr().unwrap();
+        let guard_desc = guard_router.descriptor("guard".into(), guard_addr.to_string());
         let guard_handle = tokio::spawn(async move {
             let _ = guard_router.run(guard_listener).await;
         });
 
         // Circuito de 2 saltos: Guard -> Exit
         let hops = vec![
-            CircuitHopNode {
-                node_id: "guard".into(),
-                public_kem_key: guard_pk,
-                endpoint: guard_addr.to_string(),
-            },
-            CircuitHopNode {
-                node_id: "exit".into(),
-                public_kem_key: exit_pk,
-                endpoint: exit_addr.to_string(),
-            },
+            CircuitHopNode::from_descriptor(guard_desc),
+            CircuitHopNode::from_descriptor(exit_desc),
         ];
 
         let circuit_client = Arc::new(LiveCircuitClient::connect(999, hops).await.unwrap());
