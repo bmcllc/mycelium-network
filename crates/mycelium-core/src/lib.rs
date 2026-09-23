@@ -73,6 +73,34 @@ impl<'de> Deserialize<'de> for NodeId {
     }
 }
 
+/// Associação autenticada entre a identidade lógica do The Lattice (`NodeId`)
+/// e a identidade de transporte da camada de hifas (`PeerId`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerBinding {
+    pub node_id: NodeId,
+    pub peer_id: String,
+    pub public_key: Vec<u8>,
+    pub expires_at: u64,
+    pub signature: Vec<u8>,
+}
+
+impl PeerBinding {
+    /// Produz o payload canônico a ser assinado pela chave privada do NodeId.
+    pub fn sign_payload(node_id: &NodeId, peer_id: &str, expires_at: u64) -> Vec<u8> {
+        format!("mycelium:peer-binding:{node_id}:{peer_id}:{expires_at}").into_bytes()
+    }
+
+    /// Retorna `true` se o binding estiver expirado em relação ao timestamp Unix atual.
+    pub fn is_expired(&self, now_secs: u64) -> bool {
+        now_secs >= self.expires_at
+    }
+
+    /// Valida que a chave pública bate com o hash derivado do `NodeId`.
+    pub fn is_identity_consistent(&self) -> bool {
+        NodeId::derive(&self.public_key) == self.node_id
+    }
+}
+
 /// Endereço content-addressed usado por Giggs, Vacuum e Isotope.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ContentId(pub [u8; 32]);

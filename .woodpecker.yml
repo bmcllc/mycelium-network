@@ -1,0 +1,27 @@
+pipeline:
+  check:
+    image: rust:1.80-slim
+    commands:
+      - cargo check --workspace
+
+  clippy:
+    image: rust:1.80-slim
+    commands:
+      - rustup component add clippy
+      - cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    image: rust:1.80-slim
+    commands:
+      - cargo test --workspace
+
+  gate-a:
+    image: rust:1.80-slim
+    commands:
+      - cargo test -p mycelium-hyphae --test multihop_topology_acceptance -- --nocapture
+
+  gate-b:
+    image: rust:1.80-slim
+    commands:
+      - apt-get update && apt-get install -y python3
+      - cargo test -p mycelium-node --test community_service_survival_acceptance -- --nocapture

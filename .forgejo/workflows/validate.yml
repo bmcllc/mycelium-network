@@ -1,0 +1,33 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: native
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cargo Check
+        run: cargo check --workspace
+
+      - name: Cargo Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Workspace Tests
+        run: cargo test --workspace
+
+      - name: Gate A Tests (DTN Multihop & Reboot Survival)
+        run: cargo test -p mycelium-hyphae --test multihop_topology_acceptance -- --nocapture
+
+      - name: Gate B Tests (Community Service & Dynamic Chamber Survival)
+        run: cargo test -p mycelium-node --test community_service_survival_acceptance -- --nocapture

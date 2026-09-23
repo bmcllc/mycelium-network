@@ -409,6 +409,7 @@ impl Organism {
             nostr_home: Some(config.home.clone()),
             nostr_relay: config.nostr_relay.clone(),
             blocked_peers: Vec::new(),
+            dtn_dir: Some(config.home.join("dtn")),
             #[cfg(feature = "license")]
             licensed_peers: config.licensed_peers.as_ref().map(|pids| {
                 pids.iter()
@@ -1372,14 +1373,37 @@ impl Organism {
         };
         if let Ok(bytes) = env.encode() {
             let bundle_id = mycelium_core::ContentId::of(&bytes).to_string();
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            // Produz PeerBinding autenticado do nó emissor para o destinatário
+            let my_node = self.gland.node_id();
+            let my_peer = self.hyphae.peer_id().to_string();
+            let expires_at = now + 86400; // 24h
+            let sign_msg = mycelium_core::PeerBinding::sign_payload(&my_node, &my_peer, expires_at);
+            let sig = self.gland.sign_bytes(&sign_msg);
+            let my_binding = mycelium_core::PeerBinding {
+                node_id: my_node,
+                peer_id: my_peer,
+                public_key: self.gland.verifying_key().to_bytes().to_vec(),
+                expires_at,
+                signature: sig,
+            };
+
+            // Tenta resolver o PeerId de transporte a partir do NodeId
+            let dst_peer_str = self.hyphae.resolve_peer(&to)
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| to.to_string());
+
             let bundle = mycelium_hyphae::DtnBundle {
                 bundle_id,
                 src_peer: self.hyphae.peer_id().to_string(),
-                dst_peer: to.to_string(),
-                created_at: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
+                dst_peer: dst_peer_str,
+                dst_node: Some(to),
+                binding: Some(my_binding),
+                created_at: now,
                 ttl_secs: 3600,
                 hops: 0,
                 max_hops: 16,
@@ -2523,24 +2547,26 @@ impl Organism {
 
             let ion_name = if let Some(stripped) = plot.message.strip_prefix("ion:") {
                 stripped.trim().to_string()
-            } else if let Some(idx) = plot.message.find("Serviço Comunitário: ") {
-                let sub = &plot.message[idx + "Serviço Comunitário: ".len()..];
-                let first_word = sub.split_whitespace().next().unwrap_or("comunidade");
-                let cleaned: String = first_word.chars().filter(|c| c.is_alphanumeric() || *c == '-').collect();
-                cleaned.to_lowercase()
-            } else if let Some(idx) = plot.message.find("Servico Comunitario: ") {
-                let sub = &plot.message[idx + "Servico Comunitario: ".len()..];
-                let first_word = sub.split_whitespace().next().unwrap_or("comunidade");
-                let cleaned: String = first_word.chars().filter(|c| c.is_alphanumeric() || *c == '-').collect();
-                cleaned.to_lowercase()
+            } else if let Some(idx) = plot.message.to_lowercase().find("serviço comunitário: ") {
+                let sub = &plot.message[idx + "serviço comunitário: ".len()..];
+                let title = sub.split(" v").next().unwrap_or(sub).trim();
+                let slug: String = title
+                    .chars()
+                    .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+                    .collect();
+                let clean_slug: String = slug.split('-').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("-");
+                if clean_slug.is_empty() { "servico-comunitario".to_string() } else { clean_slug }
+            } else if let Some(idx) = plot.message.to_lowercase().find("servico comunitario: ") {
+                let sub = &plot.message[idx + "servico comunitario: ".len()..];
+                let title = sub.split(" v").next().unwrap_or(sub).trim();
+                let slug: String = title
+                    .chars()
+                    .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+                    .collect();
+                let clean_slug: String = slug.split('-').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("-");
+                if clean_slug.is_empty() { "servico-comunitario".to_string() } else { clean_slug }
             } else {
                 "servico-comunitario".to_string()
-            };
-
-            let ion_name = if ion_name.is_empty() {
-                "servico-comunitario".to_string()
-            } else {
-                ion_name
             };
 
             if self.chambers.contains_key(&ion_name) {
@@ -3810,8 +3836,10 @@ impl Organism {
                 } else {
                     let found = self.bank.ids().into_iter().find(|id| {
                         self.bank.recall(id).map(|p| {
-                            p.message.to_lowercase().contains(&ion.to_lowercase())
-                                || p.leaves.iter().any(|l| l.path == "index.html")
+                            p.message.to_lowercase().contains(&format!("service:{}", ion.to_lowercase()))
+                                || p.message.to_lowercase().contains(&format!("ion:{}", ion.to_lowercase()))
+                                || p.message.to_lowercase().contains(&ion.to_lowercase().replace('-', " "))
+                                || p.message.to_lowercase().contains(&ion.to_lowercase())
                         }).unwrap_or(false)
                     });
                     match found {
@@ -4674,7 +4702,8 @@ impl Organism {
                             self.check_auto_materialize_orphaned_services();
                         }
                         Some(HyphaEvent::DtnBundleReceived { from: _, bundle }) => {
-                            let is_local = bundle.dst_peer == self.gland.node_id().to_string()
+                            let is_local = bundle.dst_node == Some(self.gland.node_id())
+                                || bundle.dst_peer == self.gland.node_id().to_string()
                                 || bundle.dst_peer == self.hyphae.peer_id().to_string();
                             if is_local {
                                 if let Ok(env) = Envelope::decode(&bundle.payload) {
@@ -4696,7 +4725,24 @@ impl Organism {
                                 Err(e) => tracing::warn!("envelope inválido: {e}"),
                             }
                         }
-                        Some(HyphaEvent::PheromoneReceived { .. }) => {}
+                        Some(HyphaEvent::PheromoneReceived { from, data }) => {
+                            if let Some(peer_id) = from {
+                                if let Ok(pheromone) = serde_json::from_slice::<mycelium_pheromones::Pheromone>(&data) {
+                                    if pheromone.sniff().is_ok() {
+                                        let node_id = pheromone.node_id();
+                                        let expires_at = pheromone.body.emitted_at_secs + pheromone.body.decay_secs;
+                                        let binding = mycelium_core::PeerBinding {
+                                            node_id,
+                                            peer_id: peer_id.to_string(),
+                                            public_key: pheromone.body.identity.to_vec(),
+                                            expires_at,
+                                            signature: pheromone.signature.clone(),
+                                        };
+                                        self.hyphae.register_peer_binding(binding);
+                                    }
+                                }
+                            }
+                        }
                         Some(HyphaEvent::RecordFound { key, value }) => {
                             if key.starts_with(RELAY_DHT_PREFIX) {
                                 if let Ok(adv) =

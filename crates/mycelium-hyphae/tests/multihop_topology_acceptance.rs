@@ -12,7 +12,7 @@
 //!   4. C recebe os dados originados por A com integridade comprovada.
 //!   5. Quando B é desligado, a comunicação A -> C é interrompida, provando que B era o roteador.
 
-use mycelium_hyphae::{HyphaEvent, HyphaeConfig, HyphaeNode};
+use mycelium_hyphae::{DtnBundle, HyphaEvent, HyphaeConfig, HyphaeNode};
 use std::time::Duration;
 
 #[tokio::test]
@@ -308,6 +308,10 @@ async fn test_unicast_dtn_multihop_without_gossip_flood_and_with_store_and_forwa
     let mut d_connected = false;
 
     while tokio::time::Instant::now() < deadline && (!a_connected || !c_connected || !d_connected) {
+        if a.connected_peer_ids().contains(&peer_b) && b.connected_peer_ids().contains(&peer_a) { a_connected = true; }
+        if c.connected_peer_ids().contains(&peer_b) && b.connected_peer_ids().contains(&peer_c) { c_connected = true; }
+        if d.connected_peer_ids().contains(&peer_b) && b.connected_peer_ids().contains(&peer_d) { d_connected = true; }
+        if a_connected && c_connected && d_connected { break; }
         tokio::select! {
             ev = a.pulse() => {
                 if let Some(HyphaEvent::Anastomosis { peer }) = ev {
@@ -331,7 +335,7 @@ async fn test_unicast_dtn_multihop_without_gossip_flood_and_with_store_and_forwa
                     if peer == peer_b { d_connected = true; }
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
         }
     }
 
@@ -362,7 +366,9 @@ async fn test_unicast_dtn_multihop_without_gossip_flood_and_with_store_and_forwa
         bundle_id: "bundle-unicast-gate-a-1".to_string(),
         src_peer: peer_a.to_string(),
         dst_peer: peer_c.to_string(),
-        created_at: 1000,
+        dst_node: None,
+        binding: None,
+        created_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
         ttl_secs: 3600,
         hops: 0,
         max_hops: 16,
@@ -454,7 +460,9 @@ async fn test_unicast_dtn_multihop_without_gossip_flood_and_with_store_and_forwa
         bundle_id: "bundle-async-gate-a-2".to_string(),
         src_peer: peer_a.to_string(),
         dst_peer: peer_c.to_string(),
-        created_at: 2000,
+        dst_node: None,
+        binding: None,
+        created_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
         ttl_secs: 3600,
         hops: 0,
         max_hops: 16,
@@ -520,8 +528,7 @@ async fn test_unicast_dtn_multihop_without_gossip_flood_and_with_store_and_forwa
 
     while tokio::time::Instant::now() < reconnect_deadline && !c_received_async {
         tokio::select! {
-            _ = a.pulse() => {}
-            _ = b.pulse() => {}
+            biased;
             ev_c = c_reborn.pulse() => {
                 if let Some(HyphaEvent::DtnBundleReceived { bundle, .. }) = ev_c {
                     if bundle.bundle_id == "bundle-async-gate-a-2" && bundle.payload == async_payload {
@@ -536,7 +543,9 @@ async fn test_unicast_dtn_multihop_without_gossip_flood_and_with_store_and_forwa
                     }
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            _ = b.pulse() => {}
+            _ = a.pulse() => {}
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
         }
     }
 
@@ -544,4 +553,221 @@ async fn test_unicast_dtn_multihop_without_gossip_flood_and_with_store_and_forwa
         c_received_async,
         "Nó C reconectado deve receber o bundle armazenado no DTN store de B durante a intermitência!"
     );
+}
+
+#[tokio::test]
+async fn test_dtn_store_and_forward_persistence_across_reboot_gate_a2() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let b_dtn_dir = std::env::temp_dir().join(format!("mycelium_dtn_reboot_test_{nonce}"));
+    std::fs::create_dir_all(&b_dtn_dir).expect("criar dir DTN");
+
+    let b_seed = [81u8; 32];
+    let a_seed = [82u8; 32];
+    let c_seed = [83u8; 32];
+
+    // 1. Germina Nó B com persistência em disco
+    let mut b = HyphaeNode::germinate_with(HyphaeConfig {
+        seed: Some(b_seed),
+        listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+        bootstrap: vec![],
+        enable_mdns: false,
+        enable_relay_server: true,
+        dtn_dir: Some(b_dtn_dir.clone()),
+        ..Default::default()
+    })
+    .expect("Nó B germina");
+
+    let peer_b = b.peer_id();
+
+    let b_addr = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(HyphaEvent::Rooted { address }) = b.pulse().await {
+                if address.to_string().contains("/tcp/") {
+                    let mut dialable = address;
+                    dialable.push(libp2p::multiaddr::Protocol::P2p(peer_b));
+                    return dialable;
+                }
+            }
+        }
+    })
+    .await
+    .expect("B enraíza");
+
+    // 2. Germina Nó A conectado a B
+    let mut a = HyphaeNode::germinate_with(HyphaeConfig {
+        seed: Some(a_seed),
+        listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+        bootstrap: vec![b_addr.clone()],
+        enable_mdns: false,
+        ..Default::default()
+    })
+    .expect("Nó A germina");
+
+    // Calcula PeerId de C antes de ligá-lo (C inicia completamente OFFLINE)
+    let peer_c = {
+        let dummy_c = HyphaeNode::germinate_with(HyphaeConfig {
+            seed: Some(c_seed),
+            listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+            enable_mdns: false,
+            ..Default::default()
+        })
+        .expect("dummy C");
+        dummy_c.peer_id()
+    };
+
+    // Conecta A a B
+    let connect_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut a_connected = false;
+    while tokio::time::Instant::now() < connect_deadline && !a_connected {
+        tokio::select! {
+            ev = a.pulse() => {
+                if let Some(HyphaEvent::Anastomosis { peer }) = ev {
+                    if peer == peer_b { a_connected = true; }
+                }
+            }
+            ev = b.pulse() => {
+                if let Some(HyphaEvent::Anastomosis { peer }) = ev {
+                    if peer == a.peer_id() { a_connected = true; }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+    assert!(a_connected, "A deve conectar a B");
+
+    // 3. A emite bundle DTN destinado a C (que está offline) via B
+    let payload = b"PAYLOAD_PERSISTENTE_SOBREVIVE_REBOOT_DE_B".to_vec();
+    let bundle = DtnBundle {
+        bundle_id: "bundle-reboot-survival-proof".to_string(),
+        src_peer: a.peer_id().to_string(),
+        dst_peer: peer_c.to_string(),
+        dst_node: None,
+        binding: None,
+        created_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+        ttl_secs: 7200,
+        hops: 0,
+        max_hops: 16,
+        payload: payload.clone(),
+    };
+
+    let mut sent = false;
+    let send_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < send_deadline {
+        if a.send_unicast_dtn(peer_b, bundle.clone()).is_ok() {
+            sent = true;
+            break;
+        }
+        tokio::select! {
+            _ = a.pulse() => {}
+            _ = b.pulse() => {}
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+    assert!(sent, "A deve conseguir enviar unicast DTN para B");
+
+    // B recebe e persiste o bundle em disco
+    let receive_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < receive_deadline {
+        tokio::select! {
+            _ = a.pulse() => {}
+            ev = b.pulse() => {
+                if let Some(HyphaEvent::DtnBundleReceived { bundle, .. }) = ev {
+                    let _ = b.forward_or_store_dtn(bundle);
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        if b.dtn_store_ref().get("bundle-reboot-survival-proof").is_some() {
+            break;
+        }
+    }
+
+    assert!(
+        b.dtn_store_ref().get("bundle-reboot-survival-proof").is_some(),
+        "B deve ter guardado o bundle"
+    );
+
+    // Confirma que o arquivo .json foi fisicamente gravado no disco
+    let bundle_file = b_dtn_dir.join("bundle-reboot-survival-proof.json");
+    assert!(bundle_file.exists(), "Bundle deve estar persistido no filesystem de B");
+
+    // 4. SIMULA QUEDA TOTAL / REBOOT DO ROTEADOR B
+    drop(b);
+    drop(a);
+
+    // 5. NÓ B RESSURGE (REBOOT) COM O MESMO DIRETÓRIO DE PERSISTÊNCIA DTN
+    let mut b_reborn = HyphaeNode::germinate_with(HyphaeConfig {
+        seed: Some(b_seed),
+        listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+        bootstrap: vec![],
+        enable_mdns: false,
+        enable_relay_server: true,
+        dtn_dir: Some(b_dtn_dir.clone()),
+        ..Default::default()
+    })
+    .expect("Nó B renasce após reboot");
+
+    assert_eq!(b_reborn.peer_id(), peer_b);
+
+    // Comprova que B reidratou o bundle diretamente do disco durante a inicialização
+    assert!(
+        b_reborn.dtn_store_ref().get("bundle-reboot-survival-proof").is_some(),
+        "Bundle DTN deve sobreviver ao reboot de B e estar imediatamente no store"
+    );
+
+    let b_reborn_addr = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(HyphaEvent::Rooted { address }) = b_reborn.pulse().await {
+                if address.to_string().contains("/tcp/") {
+                    let mut dialable = address;
+                    dialable.push(libp2p::multiaddr::Protocol::P2p(peer_b));
+                    return dialable;
+                }
+            }
+        }
+    })
+    .await
+    .expect("B renascido enraíza");
+
+    // 6. NÓ C ENTRA NA REDE PELA PRIMEIRA VEZ
+    let mut c = HyphaeNode::germinate_with(HyphaeConfig {
+        seed: Some(c_seed),
+        listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+        bootstrap: vec![b_reborn_addr],
+        enable_mdns: false,
+        ..Default::default()
+    })
+    .expect("Nó C germina");
+
+    assert_eq!(c.peer_id(), peer_c);
+
+    // 7. B renascido entrega o bundle persistido para C
+    let mut c_received = false;
+    let deliver_deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+
+    while tokio::time::Instant::now() < deliver_deadline && !c_received {
+        tokio::select! {
+            _ = b_reborn.pulse() => {}
+            ev_c = c.pulse() => {
+                if let Some(HyphaEvent::DtnBundleReceived { bundle, .. }) = ev_c {
+                    if bundle.bundle_id == "bundle-reboot-survival-proof" {
+                        assert_eq!(bundle.payload, payload);
+                        c_received = true;
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+
+    assert!(
+        c_received,
+        "Nó C deve receber com sucesso o bundle DTN que sobreviveu ao reboot de B no disco!"
+    );
+
+    // Limpeza
+    let _ = std::fs::remove_dir_all(&b_dtn_dir);
 }

@@ -217,7 +217,7 @@ impl ChamberProcess {
 
         let child = spawn_serve(&spec, &workdir, port, isolation)?;
         let upstream = format!("http://127.0.0.1:{port}");
-        wait_until_listening(port, Duration::from_secs(8))?;
+        wait_until_listening(&workdir, port, Duration::from_secs(8))?;
 
         tracing::info!(ion = %spec.ion, %port, ?isolation, mem = ?opts.memory_mib, "chamber frutificou");
 
@@ -267,7 +267,7 @@ impl ChamberProcess {
         let isolation = self.spec.isolation.resolve();
         let port = free_port()?;
         let child = spawn_serve(&self.spec, &self.workdir, port, isolation)?;
-        wait_until_listening(port, Duration::from_secs(8))?;
+        wait_until_listening(&self.workdir, port, Duration::from_secs(8))?;
         self.port = port;
         self.upstream = format!("http://127.0.0.1:{port}");
         self.child = Some(child);
@@ -460,27 +460,40 @@ fn spawn_plain(
     if which("python3") {
         let rootfs = workdir.join("rootfs");
         let root_dir = if rootfs.exists() { rootfs } else { workdir.to_path_buf() };
-        let py_script = "import http.server, os, sys\n\
-            os.chdir(sys.argv[1])\n\
-            class Handler(http.server.SimpleHTTPRequestHandler):\n\
-                def do_GET(self):\n\
-                    if self.path in ['/', '/health', '']:\n\
-                        self.send_response(200)\n\
-                        self.send_header('Content-Type', 'text/html; charset=utf-8')\n\
-                        self.end_headers()\n\
-                        if os.path.exists('index.html'):\n\
-                            with open('index.html', 'rb') as f: self.wfile.write(f.read())\n\
-                        else:\n\
-                            self.wfile.write(b'<html><body><h1>ok</h1></body></html>')\n\
-                    else:\n\
-                        super().do_GET()\n\
-            http.server.HTTPServer(('127.0.0.1', int(sys.argv[2])), Handler).serve_forever()\n";
+        let py_script = r#"
+import http.server, os, sys
+os.chdir(sys.argv[1])
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header('X-Chamber-Pid', str(os.getpid()))
+        super().end_headers()
+    def do_GET(self):
+        if self.path in ['/', '/health', '']:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.end_headers()
+            if os.path.exists('index.html'):
+                with open('index.html', 'rb') as f:
+                    self.wfile.write(f.read())
+            else:
+                self.wfile.write(b'<html><body><h1>ok</h1></body></html>')
+        elif self.path == '/status':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            ion_name = sys.argv[3] if len(sys.argv) > 3 else 'unknown'
+            self.wfile.write(f'{{"chamber_pid": {os.getpid()}, "status": "active", "ion": "{ion_name}"}}\n'.encode('utf-8'))
+        else:
+            super().do_GET()
+http.server.HTTPServer(('127.0.0.1', int(sys.argv[2])), Handler).serve_forever()
+"#;
         let (out, err) = make_stdio();
         let mut cmd = Command::new("python3");
         cmd.arg("-c")
             .arg(py_script)
             .arg(root_dir)
             .arg(port.to_string())
+            .arg(&spec.ion)
             .stdin(Stdio::null())
             .stdout(out)
             .stderr(err);
@@ -502,7 +515,31 @@ fn spawn_bwrap(
     stdout: Stdio,
     stderr: Stdio,
 ) -> Result<Child, VacuumError> {
-    let bin = &spec.mycelium_bin;
+    let resolved_bin = if spec.mycelium_bin.file_name().map(|f| f == "mycelium").unwrap_or(false) && spec.mycelium_bin.exists() {
+        Some(spec.mycelium_bin.clone())
+    } else {
+        let mut found = None;
+        for candidate in &[
+            "/tmp/target/debug/mycelium",
+            "/tmp/target/release/mycelium",
+            "target/debug/mycelium",
+            "target/release/mycelium",
+        ] {
+            let p = Path::new(candidate);
+            if p.exists() {
+                found = Some(p.to_path_buf());
+                break;
+            }
+        }
+        found
+    };
+
+    let Some(ref bin) = resolved_bin else {
+        return Err(VacuumError::Spawn(
+            "binário mycelium não disponível para execução em bubblewrap".into(),
+        ));
+    };
+
     let ion = &spec.ion;
     // Bind em path estável dentro do sandbox — evita falhas de chdir sob /tmp.
     let sandbox_root = Path::new("/chamber");
@@ -662,7 +699,7 @@ fn free_port() -> Result<u16, VacuumError> {
     Ok(listener.local_addr()?.port())
 }
 
-fn wait_until_listening(port: u16, timeout: Duration) -> Result<(), VacuumError> {
+fn wait_until_listening(workdir: &Path, port: u16, timeout: Duration) -> Result<(), VacuumError> {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
         if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
@@ -670,8 +707,10 @@ fn wait_until_listening(port: u16, timeout: Duration) -> Result<(), VacuumError>
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    let err = std::fs::read_to_string(workdir.join("logs/stderr.log")).unwrap_or_default();
+    let out = std::fs::read_to_string(workdir.join("logs/stdout.log")).unwrap_or_default();
     Err(VacuumError::Spawn(format!(
-        "chamber não abriu a porta {port} a tempo"
+        "chamber não abriu a porta {port} a tempo; stderr='{err}', stdout='{out}'"
     )))
 }
 

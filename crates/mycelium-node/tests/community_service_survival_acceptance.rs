@@ -188,7 +188,18 @@ async fn test_community_service_content_survival_after_publisher_shutdown() {
 
     // 8. CONTINUIDADE REAL DE SERVIÇO HTTP (GATE B):
     // Nó 2 mantém e serve o serviço ativo no seu Event Horizon local.
-    // Uma requisição HTTP real ao endpoint do Event Horizon do Nó 2 deve retornar HTTP 200 OK.
+    // Materializa explicitamente a Chamber soberana no Nó 2 garantindo ativação de processo.
+    let mat_resp = call(
+        &sock_2,
+        Request::MaterializeService {
+            ion: "guia-solar".to_string(),
+            plot: Some(plot_cid_str.clone()),
+        },
+    )
+    .await
+    .expect("MaterializeService no Nó 2");
+    assert!(matches!(mat_resp, Response::Ok { .. }), "Chamber deve ser materializada no Nó 2: {:?}", mat_resp);
+
     let status_2 = call(&sock_2, Request::Status).await.expect("Status Nó 2");
     let horizon_2_url = match status_2 {
         Response::Status(s) => s.event_horizon,
@@ -197,13 +208,20 @@ async fn test_community_service_content_survival_after_publisher_shutdown() {
 
     let http_client = reqwest::Client::builder().no_proxy().build().unwrap();
     let service_endpoint = format!("{}/guia-solar/index.html", horizon_2_url);
+    let status_endpoint = format!("{}/guia-solar/status", horizon_2_url);
 
     let http_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut http_served = false;
     let mut dynamic_body = String::new();
+    let mut chamber_pid_val: Option<u32> = None;
     while tokio::time::Instant::now() < http_deadline {
         if let Ok(resp) = http_client.get(&service_endpoint).send().await {
             if resp.status().is_success() {
+                if let Some(pid_hdr) = resp.headers().get("x-chamber-pid") {
+                    if let Ok(pid_str) = pid_hdr.to_str() {
+                        chamber_pid_val = pid_str.parse().ok();
+                    }
+                }
                 dynamic_body = resp.text().await.unwrap_or_default();
                 http_served = true;
                 break;
@@ -217,6 +235,19 @@ async fn test_community_service_content_survival_after_publisher_shutdown() {
         dynamic_body, service_html,
         "Resposta HTTP servida pelo Nó 2 deve ser idêntica ao serviço publicado originalmente"
     );
+    assert!(
+        chamber_pid_val.is_some() && chamber_pid_val.unwrap() > 0,
+        "A resposta HTTP deve conter o cabeçalho X-Chamber-Pid comprovando execução ativa da Chamber"
+    );
+
+    // Verifica endpoint dinâmico /status servido diretamente pelo processo Chamber
+    let status_resp = http_client.get(&status_endpoint).send().await.expect("Chamber /status");
+    assert!(status_resp.status().is_success());
+    let status_text = status_resp.text().await.expect("read status text");
+    let status_json: serde_json::Value = serde_json::from_str(&status_text).expect("valid JSON status");
+    assert_eq!(status_json["status"], "active");
+    assert_eq!(status_json["ion"], "guia-solar");
+    assert_eq!(status_json["chamber_pid"].as_u64().unwrap(), chamber_pid_val.unwrap() as u64);
 
     // 9. Encerramento limpo do Nó 2
     let shutdown_2 = call(&sock_2, Request::Shutdown).await.expect("Shutdown Nó 2");

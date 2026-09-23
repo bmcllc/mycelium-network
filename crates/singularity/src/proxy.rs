@@ -398,8 +398,10 @@ async fn proxy(State(table): State<HorizonTable>, req: Request) -> Response {
                                 if !plot.is_public() {
                                     continue;
                                 }
-                                let match_ion = plot.message.to_lowercase().contains(&ion.to_lowercase())
-                                    || plot.leaves.iter().any(|l| l.path == "index.html");
+                                let match_ion = plot.message.to_lowercase().contains(&format!("service:{}", ion.to_lowercase()))
+                                    || plot.message.to_lowercase().contains(&format!("ion:{}", ion.to_lowercase()))
+                                    || plot.message.to_lowercase().contains(&ion.to_lowercase().replace('-', " "))
+                                    || plot.message.to_lowercase().contains(&ion.to_lowercase());
                                 if match_ion {
                                     for leaf in &plot.leaves {
                                         if leaf.path == "index.html" || leaf.path.ends_with(".html") {

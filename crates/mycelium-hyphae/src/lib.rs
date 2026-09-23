@@ -108,6 +108,8 @@ pub struct HyphaeConfig {
     pub nostr_relay: Option<String>,
     /// Peers bloqueados para conexões diretas (isolamento de topologia multissalto).
     pub blocked_peers: Vec<PeerId>,
+    /// Diretório para persistência durável do armazém DTN (store-and-forward tolerante a reboot).
+    pub dtn_dir: Option<std::path::PathBuf>,
     /// **Gate de licença VOID-00**: se `Some(peers)`, apenas PeerIds listados
     /// são admitidos como vizinhos (fabrica de peers licenciados). Se `None`,
     /// o gate está desligado (admissão aberta). Requer feature `license`.
@@ -135,6 +137,7 @@ impl Default for HyphaeConfig {
             nostr_home: None,
             nostr_relay: None,
             blocked_peers: Vec::new(),
+            dtn_dir: None,
             #[cfg(feature = "license")]
             licensed_peers: None,
         }
@@ -287,6 +290,19 @@ pub fn sort_addrs_ipv6_first(addrs: &mut [Multiaddr]) {
     });
 }
 
+/// Distância XOR completa de 256 bits (32 bytes) entre duas chaves (métrica canônica Kademlia).
+pub fn xor_distance_256(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = a[i] ^ b[i];
+    }
+    out
+}
+
+fn peer_id_to_key(peer_id: &PeerId) -> [u8; 32] {
+    *blake3::hash(&peer_id.to_bytes()).as_bytes()
+}
+
 /// Um nó do micélio: swarm libp2p + estado dos links vivos.
 pub struct HyphaeNode {
     swarm: Swarm<SubstrateBehaviour>,
@@ -311,6 +327,8 @@ pub struct HyphaeNode {
     licensed_peers: Option<std::collections::HashSet<PeerId>>,
     /// Armazém local de bundles DTN (store-and-forward tolerante a atrasos/intermitência).
     dtn_store: DtnBundleStore,
+    /// Mapeamento de bindings autenticados entre NodeId (The Lattice) e PeerId (Hyphae).
+    peer_bindings: HashMap<mycelium_core::NodeId, mycelium_core::PeerBinding>,
 }
 
 impl HyphaeNode {
@@ -559,7 +577,11 @@ impl HyphaeNode {
             blocked_peers: config.blocked_peers.clone(),
             #[cfg(feature = "license")]
             licensed_peers: config.licensed_peers.clone(),
-            dtn_store: DtnBundleStore::new(),
+            dtn_store: match config.dtn_dir {
+                Some(dir) => DtnBundleStore::with_dir(dir),
+                None => DtnBundleStore::new(),
+            },
+            peer_bindings: HashMap::new(),
         };
 
         // Bootstrap: IPv6 primeiro (SeedBook já ordena; reordena por segurança).
@@ -706,7 +728,19 @@ impl HyphaeNode {
         &self.dtn_store
     }
 
-    /// Encaminha o bundle para o próximo salto mais próximo (XOR) ou armazena se inacessível.
+    /// Registra um binding autenticado entre NodeId (The Lattice) e PeerId (Hyphae).
+    pub fn register_peer_binding(&mut self, binding: mycelium_core::PeerBinding) {
+        if binding.is_identity_consistent() {
+            self.peer_bindings.insert(binding.node_id, binding);
+        }
+    }
+
+    /// Resolve o PeerId de transporte a partir de um NodeId lógico do The Lattice.
+    pub fn resolve_peer(&self, node_id: &mycelium_core::NodeId) -> Option<PeerId> {
+        self.peer_bindings.get(node_id).and_then(|b| b.peer_id.parse::<PeerId>().ok())
+    }
+
+    /// Encaminha o bundle para o próximo salto mais próximo (XOR 256-bit) ou armazena se inacessível.
     /// Retorna `true` se enviado imediatamente, `false` se armazenado no DTN store.
     pub fn forward_or_store_dtn(&mut self, mut bundle: DtnBundle) -> Result<bool, HyphaeError> {
         bundle.hops += 1;
@@ -714,27 +748,61 @@ impl HyphaeNode {
             tracing::warn!(id = %bundle.bundle_id, "DTN bundle excedeu max_hops — descartado");
             return Ok(false);
         }
-        let target_peer = bundle.dst_peer.parse::<PeerId>().ok();
+        if self.forward_or_store_dtn_internal(&mut bundle)? {
+            Ok(true)
+        } else {
+            self.dtn_store.insert(bundle);
+            Ok(false)
+        }
+    }
+
+    fn forward_or_store_dtn_internal(&mut self, bundle: &mut DtnBundle) -> Result<bool, HyphaeError> {
+        // 1. Ingestão de PeerBinding incluído no bundle
+        if let Some(ref b) = bundle.binding {
+            self.register_peer_binding(b.clone());
+        }
+
+        // 2. Resolução do destino de transporte (PeerId)
+        let target_peer = if let Ok(p) = bundle.dst_peer.parse::<PeerId>() {
+            Some(p)
+        } else if let Some(ref node) = bundle.dst_node {
+            self.resolve_peer(node)
+        } else if let Ok(node) = bundle.dst_peer.parse::<mycelium_core::NodeId>() {
+            self.resolve_peer(&node)
+        } else {
+            None
+        };
+
+        if let Some(p) = target_peer {
+            bundle.dst_peer = p.to_string();
+        }
+
         let connected = self.connected_peer_ids();
 
-        // Se o destino é vizinho direto conectado, entrega direta
+        // 3. Se o destino de transporte é conhecido (PeerId resolvido)
         if let Some(target) = target_peer {
             if connected.contains(&target) {
                 if self.send_unicast_dtn(target, bundle.clone()).is_ok() {
                     return Ok(true);
                 }
             }
+            // Destino está temporariamente offline: guarda no store local (Store-and-Forward DTN soberano)
+            // Não vaza para bystanders não envolvidos.
+            return Ok(false);
         }
 
-        // Caso contrário, busca vizinho conectado (que não seja a fonte)
-        // que seja ESTRITAMENTE mais próximo do destino do que nós mesmos (métrica XOR)
-        if let Some(target) = target_peer {
-            let target_bytes = target.to_bytes();
-            let self_bytes = self.peer_id().to_bytes();
-            let mut self_dist = 0u64;
-            for (b1, b2) in self_bytes.iter().zip(target_bytes.iter()) {
-                self_dist = (self_dist << 8) | ((*b1 ^ *b2) as u64);
-            }
+        // 4. Métrica Kademlia 256-bit XOR completa
+        let target_key = if let Some(ref node) = bundle.dst_node {
+            Some(node.0)
+        } else if let Ok(node) = bundle.dst_peer.parse::<mycelium_core::NodeId>() {
+            Some(node.0)
+        } else {
+            target_peer.map(|p| peer_id_to_key(&p))
+        };
+
+        if let Some(t_key) = target_key {
+            let self_key = peer_id_to_key(&self.peer_id());
+            let self_dist = xor_distance_256(&self_key, &t_key);
 
             let src_peer_opt = bundle.src_peer.parse::<PeerId>().ok();
             let mut candidates: Vec<PeerId> = connected
@@ -744,21 +812,14 @@ impl HyphaeNode {
 
             if !candidates.is_empty() {
                 candidates.sort_by_key(|p| {
-                    let pb = p.to_bytes();
-                    let mut dist = 0u64;
-                    for (b1, b2) in pb.iter().zip(target_bytes.iter()) {
-                        dist = (dist << 8) | ((*b1 ^ *b2) as u64);
-                    }
-                    dist
+                    let k = peer_id_to_key(p);
+                    xor_distance_256(&k, &t_key)
                 });
                 let best = candidates[0];
-                let best_bytes = best.to_bytes();
-                let mut best_dist = 0u64;
-                for (b1, b2) in best_bytes.iter().zip(target_bytes.iter()) {
-                    best_dist = (best_dist << 8) | ((*b1 ^ *b2) as u64);
-                }
+                let best_key = peer_id_to_key(&best);
+                let best_dist = xor_distance_256(&best_key, &t_key);
 
-                // Só avança se o salto for estritamente mais próximo do destino do que nós
+                // Só avança se o salto for estritamente mais próximo do destino do que nós (256-bit XOR)
                 if best_dist < self_dist {
                     if self.send_unicast_dtn(best, bundle.clone()).is_ok() {
                         return Ok(true);
@@ -767,24 +828,17 @@ impl HyphaeNode {
             }
         }
 
-        // Se não há salto conectado viável mais próximo, guarda no bundle store DTN (store-and-forward)
-        self.dtn_store.insert(bundle);
         Ok(false)
     }
 
-    /// Despeja bundles pendentes no DTN store para peers que acabaram de reconectar.
+    /// Despeja bundles pendentes no DTN store para peers que acabaram de reconectar ou novos saltos.
     pub fn flush_dtn_bundles(&mut self) -> usize {
         let pending = self.dtn_store.all_bundles();
         let mut delivered = 0;
-        let connected = self.connected_peer_ids();
-        for bundle in pending {
-            if let Ok(dst) = bundle.dst_peer.parse::<PeerId>() {
-                if connected.contains(&dst) {
-                    if self.send_unicast_dtn(dst, bundle.clone()).is_ok() {
-                        self.dtn_store.remove(&bundle.bundle_id);
-                        delivered += 1;
-                    }
-                }
+        for mut bundle in pending {
+            if let Ok(true) = self.forward_or_store_dtn_internal(&mut bundle) {
+                self.dtn_store.remove(&bundle.bundle_id);
+                delivered += 1;
             }
         }
         delivered
@@ -1263,6 +1317,8 @@ impl HyphaeNode {
     /// Avança o organismo: processa o próximo evento do swarm.
     pub async fn pulse(&mut self) -> Option<HyphaEvent> {
         self.decay_idle_links();
+        let now = now_secs();
+        self.dtn_store.prune_expired(now);
         if !self.dtn_store.is_empty() {
             self.flush_dtn_bundles();
         }
@@ -1406,6 +1462,13 @@ impl HyphaeNode {
                     let topic = message.topic.as_str();
                     if topic.starts_with("/mycelium/dtn/") {
                         if let Ok(bundle) = serde_json::from_slice::<DtnBundle>(&message.data) {
+                            if self.dtn_store.is_seen(&bundle.bundle_id) {
+                                continue;
+                            }
+                            self.dtn_store.mark_seen(&bundle.bundle_id);
+                            if let Some(ref b) = bundle.binding {
+                                self.register_peer_binding(b.clone());
+                            }
                             return Some(HyphaEvent::DtnBundleReceived {
                                 from: message.source.unwrap_or_else(|| self.peer_id()),
                                 bundle,
