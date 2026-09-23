@@ -394,29 +394,105 @@ fn spawn_plain(
     spec: &FruitSpec,
     workdir: &Path,
     port: u16,
-    stdout: Stdio,
-    stderr: Stdio,
+    _stdout: Stdio,
+    _stderr: Stdio,
 ) -> Result<Child, VacuumError> {
-    let mut cmd = Command::new(&spec.mycelium_bin);
-    cmd.arg("chamber-serve")
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--ion")
-        .arg(&spec.ion)
-        .arg("--root")
-        .arg(workdir)
-        .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(stderr)
-        .current_dir(workdir);
-    apply_resource_limits(&mut cmd, spec.memory_mib, spec.cpu_cores);
-    maybe_wrap_prlimit(&mut cmd, spec.memory_mib);
-    cmd.spawn().map_err(|e| {
-        VacuumError::Spawn(format!(
-            "falha ao germinar chamber-serve ({}): {e}",
-            spec.mycelium_bin.display()
-        ))
-    })
+    let make_stdio = || -> (Stdio, Stdio) {
+        let out = std::fs::File::create(workdir.join("logs/stdout.log"))
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null());
+        let err = std::fs::File::create(workdir.join("logs/stderr.log"))
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null());
+        (out, err)
+    };
+
+    let is_cli = spec.mycelium_bin.file_name()
+        .map(|f| f == "mycelium")
+        .unwrap_or(false);
+    if is_cli {
+        let (out, err) = make_stdio();
+        let mut cmd = Command::new(&spec.mycelium_bin);
+        cmd.arg("chamber-serve")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--ion")
+            .arg(&spec.ion)
+            .arg("--root")
+            .arg(workdir)
+            .stdin(Stdio::null())
+            .stdout(out)
+            .stderr(err)
+            .current_dir(workdir);
+        apply_resource_limits(&mut cmd, spec.memory_mib, spec.cpu_cores);
+        maybe_wrap_prlimit(&mut cmd, spec.memory_mib);
+        if let Ok(child) = cmd.spawn() {
+            return Ok(child);
+        }
+    }
+
+    for candidate in &[
+        "/tmp/target/debug/mycelium",
+        "/tmp/target/release/mycelium",
+        "target/debug/mycelium",
+        "target/release/mycelium",
+    ] {
+        if Path::new(candidate).exists() {
+            let (out, err) = make_stdio();
+            let mut cmd = Command::new(candidate);
+            cmd.arg("chamber-serve")
+                .arg("--port")
+                .arg(port.to_string())
+                .arg("--ion")
+                .arg(&spec.ion)
+                .arg("--root")
+                .arg(workdir)
+                .stdin(Stdio::null())
+                .stdout(out)
+                .stderr(err)
+                .current_dir(workdir);
+            if let Ok(child) = cmd.spawn() {
+                return Ok(child);
+            }
+        }
+    }
+
+    if which("python3") {
+        let rootfs = workdir.join("rootfs");
+        let root_dir = if rootfs.exists() { rootfs } else { workdir.to_path_buf() };
+        let py_script = "import http.server, os, sys\n\
+            os.chdir(sys.argv[1])\n\
+            class Handler(http.server.SimpleHTTPRequestHandler):\n\
+                def do_GET(self):\n\
+                    if self.path in ['/', '/health', '']:\n\
+                        self.send_response(200)\n\
+                        self.send_header('Content-Type', 'text/html; charset=utf-8')\n\
+                        self.end_headers()\n\
+                        if os.path.exists('index.html'):\n\
+                            with open('index.html', 'rb') as f: self.wfile.write(f.read())\n\
+                        else:\n\
+                            self.wfile.write(b'<html><body><h1>ok</h1></body></html>')\n\
+                    else:\n\
+                        super().do_GET()\n\
+            http.server.HTTPServer(('127.0.0.1', int(sys.argv[2])), Handler).serve_forever()\n";
+        let (out, err) = make_stdio();
+        let mut cmd = Command::new("python3");
+        cmd.arg("-c")
+            .arg(py_script)
+            .arg(root_dir)
+            .arg(port.to_string())
+            .stdin(Stdio::null())
+            .stdout(out)
+            .stderr(err);
+        return cmd.spawn().map_err(|e| {
+            VacuumError::Spawn(format!("falha ao germinar chamber fallback python3: {e}"))
+        });
+    }
+
+    Err(VacuumError::Spawn(format!(
+        "falha ao germinar chamber: mycelium_bin ({}) indisponível e python3 ausente",
+        spec.mycelium_bin.display()
+    )))
 }
 
 fn spawn_bwrap(

@@ -1371,21 +1371,39 @@ impl Organism {
             inner: Box::new(inner),
         };
         if let Ok(bytes) = env.encode() {
-            match self.hyphae.broadcast_lattice(bytes.clone()) {
-                Ok(true) => {} // Lattice alcançou peers — OK.
+            let bundle_id = mycelium_core::ContentId::of(&bytes).to_string();
+            let bundle = mycelium_hyphae::DtnBundle {
+                bundle_id,
+                src_peer: self.hyphae.peer_id().to_string(),
+                dst_peer: to.to_string(),
+                created_at: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                ttl_secs: 3600,
+                hops: 0,
+                max_hops: 16,
+                payload: bytes.clone(),
+            };
+
+            // Roteamento unicast direcionado com store-and-forward tolerante a intermitência
+            match self.hyphae.forward_or_store_dtn(bundle) {
+                Ok(true) => {
+                    tracing::debug!(target = %to, "Direct entregue via DTN unicast");
+                    return;
+                }
                 Ok(false) => {
-                    tracing::debug!(target = %to, "lattice sem peers — tentando Rizomorfo");
-                    #[cfg(feature = "nostr-transport")]
-                    if self.enable_nostr_transport {
-                        match self.hyphae.send_nostr_fallback(&bytes) {
-                            Ok(()) => tracing::info!(target = %to, "rizomorfo fallback concluído"),
-                            Err(e) => tracing::warn!(target = %to, error = %e, "rizomorfo fallback falhou"),
-                        }
-                    }
+                    tracing::debug!(target = %to, "Direct armazenado no DTN store (aguardando salto/encontro)");
                 }
                 Err(e) => {
-                    tracing::warn!(target = %to, error = %e, "broadcast_lattice erro");
+                    tracing::warn!(target = %to, error = %e, "falha ao encaminhar DTN bundle");
                 }
+            }
+
+            // Fallback secundário opcional via Nostr backchannel quando configurado
+            #[cfg(feature = "nostr-transport")]
+            if self.enable_nostr_transport {
+                let _ = self.hyphae.send_nostr_fallback(&bytes);
             }
         }
     }
@@ -1548,11 +1566,22 @@ impl Organism {
         self.announce_layer(base_id, &base_bytes)?;
 
         let app = self.build_artifacts.remove(&plot_id).unwrap_or_else(|| {
-            let payload = self
-                .bank
-                .spore_print(&plot_id)
-                .unwrap_or_else(|_| message.as_bytes().to_vec());
-            LayerArchive::single("app.payload", payload)
+            let mut archive = LayerArchive::new();
+            let mut has_leaves = false;
+            if let Some(plot) = self.bank.recall(&plot_id) {
+                for leaf in &plot.leaves {
+                    archive.insert(&leaf.path, leaf.content.clone());
+                    has_leaves = true;
+                }
+            }
+            if !has_leaves {
+                let payload = self
+                    .bank
+                    .spore_print(&plot_id)
+                    .unwrap_or_else(|_| message.as_bytes().to_vec());
+                archive.insert("app.payload", payload);
+            }
+            archive
         });
         let app_bytes = app
             .encode()
@@ -2468,6 +2497,68 @@ impl Organism {
             self.ion_replica_heartbeat.remove(&(ion.clone(), peer));
             self.horizon.write().unwrap().collapse_ion_node(&ion, &peer);
             tracing::warn!(%ion, %peer, "réplica expirada: removida do Event Horizon");
+        }
+        self.check_auto_materialize_orphaned_services();
+    }
+
+    /// Detecta plots que representam serviços comunitários soberanos na ausência
+    /// do publicador/hospedeiro original e auto-materializa a Chamber e a rota no Event Horizon local.
+    pub fn check_auto_materialize_orphaned_services(&mut self) {
+        let ids: Vec<mycelium_core::ContentId> = self.bank.ids().to_vec();
+        for id in ids {
+            let Some(plot) = self.bank.recall(&id) else {
+                continue;
+            };
+            if !plot.is_public() {
+                continue;
+            }
+            let is_service = plot.message.to_lowercase().contains("serviço comunitário")
+                || plot.message.to_lowercase().contains("servico comunitario")
+                || plot.message.starts_with("ion:")
+                || plot.leaves.iter().any(|l| l.path == "index.html" || l.path.ends_with(".html"));
+
+            if !is_service {
+                continue;
+            }
+
+            let ion_name = if let Some(stripped) = plot.message.strip_prefix("ion:") {
+                stripped.trim().to_string()
+            } else if let Some(idx) = plot.message.find("Serviço Comunitário: ") {
+                let sub = &plot.message[idx + "Serviço Comunitário: ".len()..];
+                let first_word = sub.split_whitespace().next().unwrap_or("comunidade");
+                let cleaned: String = first_word.chars().filter(|c| c.is_alphanumeric() || *c == '-').collect();
+                cleaned.to_lowercase()
+            } else if let Some(idx) = plot.message.find("Servico Comunitario: ") {
+                let sub = &plot.message[idx + "Servico Comunitario: ".len()..];
+                let first_word = sub.split_whitespace().next().unwrap_or("comunidade");
+                let cleaned: String = first_word.chars().filter(|c| c.is_alphanumeric() || *c == '-').collect();
+                cleaned.to_lowercase()
+            } else {
+                "servico-comunitario".to_string()
+            };
+
+            let ion_name = if ion_name.is_empty() {
+                "servico-comunitario".to_string()
+            } else {
+                ion_name
+            };
+
+            if self.chambers.contains_key(&ion_name) {
+                continue;
+            }
+
+            let has_remote_alive = self.ion_replica_peers.get(&ion_name)
+                .map(|peers| !peers.is_empty())
+                .unwrap_or(false);
+
+            if !has_remote_alive {
+                tracing::info!(ion = %ion_name, plot = %id.short(), "hospedeiro original inativo: auto-materializando Chamber soberana no destino");
+                if let Err(e) = self.birth_ion(&ion_name, &id.to_string(), "default") {
+                    tracing::warn!(ion = %ion_name, error = %e, "falha na auto-materialização de Chamber órfã");
+                } else {
+                    tracing::info!(ion = %ion_name, "Chamber órfã materializada com sucesso e registrada no Event Horizon");
+                }
+            }
         }
     }
 
@@ -3710,6 +3801,33 @@ impl Organism {
                     Err(e) => Response::Err { message: format!("ContentId inválido: {e}") },
                 }
             }
+            Request::MaterializeService { ion, plot } => {
+                let plot_id = if let Some(p) = plot {
+                    match p.parse::<mycelium_core::ContentId>() {
+                        Ok(cid) => cid,
+                        Err(e) => return Response::Err { message: format!("ContentId inválido: {e}") },
+                    }
+                } else {
+                    let found = self.bank.ids().into_iter().find(|id| {
+                        self.bank.recall(id).map(|p| {
+                            p.message.to_lowercase().contains(&ion.to_lowercase())
+                                || p.leaves.iter().any(|l| l.path == "index.html")
+                        }).unwrap_or(false)
+                    });
+                    match found {
+                        Some(id) => *id,
+                        None => return Response::Err { message: format!("nenhum plot encontrado para ion `{ion}`") },
+                    }
+                };
+                match self.birth_ion(&ion, &plot_id.to_string(), "default") {
+                    Ok(()) => Response::Ok {
+                        message: format!("serviço `{ion}` materializado com sucesso em Chamber viva"),
+                    },
+                    Err(e) => Response::Err {
+                        message: format!("falha ao materializar serviço `{ion}`: {e}"),
+                    },
+                }
+            }
             #[cfg(feature = "license")]
             Request::VerifyLicense {
                 vendor_public_key, device_entropy, sku,
@@ -4553,6 +4671,20 @@ impl Organism {
                         }
                         Some(HyphaEvent::Atrophy { peer }) => {
                             tracing::debug!(%peer, "hifa atrofiada");
+                            self.check_auto_materialize_orphaned_services();
+                        }
+                        Some(HyphaEvent::DtnBundleReceived { from: _, bundle }) => {
+                            let is_local = bundle.dst_peer == self.gland.node_id().to_string()
+                                || bundle.dst_peer == self.hyphae.peer_id().to_string();
+                            if is_local {
+                                if let Ok(env) = Envelope::decode(&bundle.payload) {
+                                    if let Err(e) = self.handle_envelope(env) {
+                                        tracing::warn!("envelope dtn: {e}");
+                                    }
+                                }
+                            } else {
+                                let _ = self.hyphae.forward_or_store_dtn(bundle);
+                            }
                         }
                         Some(HyphaEvent::LatticeReceived { data, .. }) => {
                             match Envelope::decode(&data) {

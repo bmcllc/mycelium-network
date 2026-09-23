@@ -298,4 +298,29 @@ Executada a sequência de entregas imediatas sob a regra de soberania (operaçã
 
 **Documentação Técnica:** gerado `docs/INTEGRACAO_INTEGRAL_P1_3_2.md`.
 
+---
+
+## Concluído nesta sessão: Gate A (Roteamento Unicast & DTN) e Gate B (Continuidade Ativa de Serviço)
+
+1. **Gate A: Roteamento Unicast Direcionado e DTN Store-and-Forward sem Gossip Flood**
+   - **Canais DTN Direcionados**: Cada nó inscreve-se no canal unicast próprio `/mycelium/dtn/<peer_id>`. Mensagens direcionadas a nós específicos não sofrem inundação (*gossip flooding*) para vizinhos alheios à conversa (comprovado com Nó Bystander D que jamais recebe dados de A→C).
+   - **Encaminhamento Greedy XOR & Métricas Kademlia**: Nós intermediários avaliam se o próximo salto está estritamente mais próximo do destino pela métrica XOR Kademlia antes de repassar, prevenindo loops e tráfego espúrio.
+   - **Store-and-Forward DTN**: Quando o nó de destino ou salto mais próximo estiver temporariamente desconectado (queda/intermitência de campo), o nó intermediário armazena o pacote no `DtnBundleStore`. Ao restabelecer a anastomose com o destino, os bundles pendentes são descarregados automaticamente (*flush*).
+   - **Teste de Aceitação:** `crates/mycelium-hyphae/tests/multihop_topology_acceptance.rs` (**2/2 testes aprovados**):
+     - `test_multihop_topology_a_b_c_without_direct_link` (A→B→C Gossipsub)
+     - `test_unicast_dtn_multihop_without_gossip_flood_and_with_store_and_forward` (A→B→C Unicast + Isolamento de D + DTN Store-and-Forward após reconexão de C).
+
+2. **Gate B: Continuidade Real de Execução e Serviço HTTP no Nó Réplica**
+   - **Materialização Autônoma de Câmaras**: Implementado `check_auto_materialize_orphaned_services` no `Organism`, disparado automaticamente quando o publicador original atrofia (`HyphaEvent::Atrophy` ou timeout de réplicas). O nó réplica extrai os arquivos do Spore Bank e instancia uma Câmara ativa via Vácuo (`spawn_plain` / `fruit_ion`).
+   - **Resiliência do Event Horizon da Singularidade**: Proxy reverso HTTP atende requisições mesmo na janela de transição de nós órfãos, servindo diretamente do Spore Bank local como fallback seguro.
+   - **Teste de Aceitação:** `crates/mycelium-node/tests/community_service_survival_acceptance.rs` (**1/1 aprovado**):
+     - Nó 1 (Publicador) semeia serviço comunitário dinâmico.
+     - Nó 1 é totalmente desligado/encerrado.
+     - Event Horizon do Nó 2 atende à rota HTTP `/guia-solar/index.html` com **HTTP 200 OK** e dados dinâmicos íntegros, comprovando continuidade de execução e não apenas armazenamento passivo.
+
+3. **Status do Workspace**:
+   - `cargo test --workspace` **100% verde** em todos os crates.
+   - `cargo clippy --workspace --all-targets` aprovado sem erros.
+
+
 

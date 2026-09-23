@@ -31,8 +31,8 @@ pub use relay_mesh::{
     RelayAdvertisement, RelayHealth, RelayMesh, RELAY_DHT_PREFIX, RELAY_MESH_TOPIC,
 };
 pub use store_forward::{
-    ack_key, is_expired, mailbox_key, mailbox_prefix, make_ack, make_message, MailboxAck,
-    MailboxContentType, MailboxMessage, MAILBOX_DHT_PREFIX,
+    ack_key, is_expired, mailbox_key, mailbox_prefix, make_ack, make_message, DtnBundle,
+    DtnBundleStore, MailboxAck, MailboxContentType, MailboxMessage, MAILBOX_DHT_PREFIX,
 };
 pub use webrtc_ice::{
     webrtc_available, webrtc_listen_addr, WebrtcIceConfig, PUBLIC_STUN_SERVERS,
@@ -167,6 +167,11 @@ pub enum HyphaEvent {
     SporocarpCircuit {
         src: PeerId,
         dst: PeerId,
+    },
+    /// Bundle DTN unicast recebido para este nó ou em trânsito.
+    DtnBundleReceived {
+        from: PeerId,
+        bundle: DtnBundle,
     },
 }
 
@@ -304,6 +309,8 @@ pub struct HyphaeNode {
     /// Allowlist de peers licenciados (feature `license`); ver [`HyphaeConfig::licensed_peers`].
     #[cfg(feature = "license")]
     licensed_peers: Option<std::collections::HashSet<PeerId>>,
+    /// Armazém local de bundles DTN (store-and-forward tolerante a atrasos/intermitência).
+    dtn_store: DtnBundleStore,
 }
 
 impl HyphaeNode {
@@ -466,6 +473,13 @@ impl HyphaeNode {
             .subscribe(&relay_mesh_topic)
             .map_err(|e| HyphaeError::Germination(e.to_string()))?;
 
+        let dtn_topic = gossipsub::IdentTopic::new(format!("/mycelium/dtn/{}", swarm.local_peer_id()));
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&dtn_topic)
+            .map_err(|e| HyphaeError::Germination(e.to_string()))?;
+
         let listen = if config.listen.is_empty() {
             let has_v6 = config.announce_ip6.is_some() || detect_global_ipv6();
             default_listen_addrs(config.membrane, has_v6)
@@ -545,6 +559,7 @@ impl HyphaeNode {
             blocked_peers: config.blocked_peers.clone(),
             #[cfg(feature = "license")]
             licensed_peers: config.licensed_peers.clone(),
+            dtn_store: DtnBundleStore::new(),
         };
 
         // Bootstrap: IPv6 primeiro (SeedBook já ordena; reordena por segurança).
@@ -660,6 +675,119 @@ impl HyphaeNode {
         // de puts de peers. Aqui publicamos interesse via get do próprio prefixo.
         let key = mailbox_key(&self.peer_id(), "_poll");
         let _ = self.dht_get(key);
+    }
+
+    /// Envia um bundle DTN unicast para o próximo salto direto.
+    pub fn send_unicast_dtn(
+        &mut self,
+        next_hop: PeerId,
+        bundle: DtnBundle,
+    ) -> Result<String, HyphaeError> {
+        let topic = gossipsub::IdentTopic::new(format!("/mycelium/dtn/{}", next_hop));
+        let payload = serde_json::to_vec(&bundle).map_err(|e| HyphaeError::Gossip(e.to_string()))?;
+        match self.publish(topic, payload)? {
+            true => Ok(bundle.bundle_id),
+            false => Err(HyphaeError::Gossip(format!("peer {} não subscrito no canal dtn", next_hop))),
+        }
+    }
+
+    /// Armazena bundle no DTN bundle store local (para retransmissão após atraso/reconexão).
+    pub fn dtn_store_bundle(&mut self, bundle: DtnBundle) {
+        self.dtn_store.insert(bundle);
+    }
+
+    /// Referência ao DTN bundle store local.
+    pub fn dtn_store(&mut self) -> &mut DtnBundleStore {
+        &mut self.dtn_store
+    }
+
+    /// Referência imutável ao DTN bundle store local.
+    pub fn dtn_store_ref(&self) -> &DtnBundleStore {
+        &self.dtn_store
+    }
+
+    /// Encaminha o bundle para o próximo salto mais próximo (XOR) ou armazena se inacessível.
+    /// Retorna `true` se enviado imediatamente, `false` se armazenado no DTN store.
+    pub fn forward_or_store_dtn(&mut self, mut bundle: DtnBundle) -> Result<bool, HyphaeError> {
+        bundle.hops += 1;
+        if bundle.hops > bundle.max_hops {
+            tracing::warn!(id = %bundle.bundle_id, "DTN bundle excedeu max_hops — descartado");
+            return Ok(false);
+        }
+        let target_peer = bundle.dst_peer.parse::<PeerId>().ok();
+        let connected = self.connected_peer_ids();
+
+        // Se o destino é vizinho direto conectado, entrega direta
+        if let Some(target) = target_peer {
+            if connected.contains(&target) {
+                if self.send_unicast_dtn(target, bundle.clone()).is_ok() {
+                    return Ok(true);
+                }
+            }
+        }
+
+        // Caso contrário, busca vizinho conectado (que não seja a fonte)
+        // que seja ESTRITAMENTE mais próximo do destino do que nós mesmos (métrica XOR)
+        if let Some(target) = target_peer {
+            let target_bytes = target.to_bytes();
+            let self_bytes = self.peer_id().to_bytes();
+            let mut self_dist = 0u64;
+            for (b1, b2) in self_bytes.iter().zip(target_bytes.iter()) {
+                self_dist = (self_dist << 8) | ((*b1 ^ *b2) as u64);
+            }
+
+            let src_peer_opt = bundle.src_peer.parse::<PeerId>().ok();
+            let mut candidates: Vec<PeerId> = connected
+                .into_iter()
+                .filter(|p| Some(*p) != src_peer_opt)
+                .collect();
+
+            if !candidates.is_empty() {
+                candidates.sort_by_key(|p| {
+                    let pb = p.to_bytes();
+                    let mut dist = 0u64;
+                    for (b1, b2) in pb.iter().zip(target_bytes.iter()) {
+                        dist = (dist << 8) | ((*b1 ^ *b2) as u64);
+                    }
+                    dist
+                });
+                let best = candidates[0];
+                let best_bytes = best.to_bytes();
+                let mut best_dist = 0u64;
+                for (b1, b2) in best_bytes.iter().zip(target_bytes.iter()) {
+                    best_dist = (best_dist << 8) | ((*b1 ^ *b2) as u64);
+                }
+
+                // Só avança se o salto for estritamente mais próximo do destino do que nós
+                if best_dist < self_dist {
+                    if self.send_unicast_dtn(best, bundle.clone()).is_ok() {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+
+        // Se não há salto conectado viável mais próximo, guarda no bundle store DTN (store-and-forward)
+        self.dtn_store.insert(bundle);
+        Ok(false)
+    }
+
+    /// Despeja bundles pendentes no DTN store para peers que acabaram de reconectar.
+    pub fn flush_dtn_bundles(&mut self) -> usize {
+        let pending = self.dtn_store.all_bundles();
+        let mut delivered = 0;
+        let connected = self.connected_peer_ids();
+        for bundle in pending {
+            if let Ok(dst) = bundle.dst_peer.parse::<PeerId>() {
+                if connected.contains(&dst) {
+                    if self.send_unicast_dtn(dst, bundle.clone()).is_ok() {
+                        self.dtn_store.remove(&bundle.bundle_id);
+                        delivered += 1;
+                    }
+                }
+            }
+        }
+        delivered
     }
 
     pub fn peer_id(&self) -> PeerId {
@@ -1135,6 +1263,9 @@ impl HyphaeNode {
     /// Avança o organismo: processa o próximo evento do swarm.
     pub async fn pulse(&mut self) -> Option<HyphaEvent> {
         self.decay_idle_links();
+        if !self.dtn_store.is_empty() {
+            self.flush_dtn_bundles();
+        }
         loop {
             let event = self.swarm.select_next_some().await;
             match event {
@@ -1144,7 +1275,7 @@ impl HyphaeNode {
                     }
                     return Some(HyphaEvent::Rooted { address });
                 }
-                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                     // Isolamento de topologia: se o peer está bloqueado, desconecta imediatamente.
                     if self.blocked_peers.contains(&peer_id) {
                         tracing::warn!(%peer_id, "topologia: peer bloqueado — desconectando");
@@ -1164,6 +1295,13 @@ impl HyphaeNode {
                             return Some(HyphaEvent::Atrophy { peer: peer_id });
                         }
                     }
+                    let remote_addr = endpoint.get_remote_address().clone();
+                    if !self.blocked_peers.contains(&peer_id) {
+                        self.swarm
+                            .behaviour_mut()
+                            .kademlia
+                            .add_address(&peer_id, remote_addr);
+                    }
                     let link = self.links.entry(peer_id).or_default();
                     link.connected = true;
                     link.strengthen(1);
@@ -1176,6 +1314,7 @@ impl HyphaeNode {
                         .behaviour_mut()
                         .kademlia
                         .set_mode(Some(kad::Mode::Server));
+                    self.flush_dtn_bundles();
                     return Some(HyphaEvent::Anastomosis { peer: peer_id });
                 }
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
@@ -1251,6 +1390,11 @@ impl HyphaeNode {
                     });
                 }
                 SwarmEvent::Behaviour(SubstrateBehaviourEvent::Gossipsub(
+                    gossipsub::Event::Subscribed { .. },
+                )) => {
+                    self.flush_dtn_bundles();
+                }
+                SwarmEvent::Behaviour(SubstrateBehaviourEvent::Gossipsub(
                     gossipsub::Event::Message { message, .. },
                 )) => {
                     self.metrics.messages_in += 1;
@@ -1260,6 +1404,14 @@ impl HyphaeNode {
                         link.strengthen(1);
                     }
                     let topic = message.topic.as_str();
+                    if topic.starts_with("/mycelium/dtn/") {
+                        if let Ok(bundle) = serde_json::from_slice::<DtnBundle>(&message.data) {
+                            return Some(HyphaEvent::DtnBundleReceived {
+                                from: message.source.unwrap_or_else(|| self.peer_id()),
+                                bundle,
+                            });
+                        }
+                    }
                     if topic == LATTICE_TOPIC {
                         return Some(HyphaEvent::LatticeReceived {
                             from: message.source,
@@ -1288,10 +1440,29 @@ impl HyphaeNode {
                     kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(
                         peer_record,
                     ))) => {
-                        return Some(HyphaEvent::RecordFound {
-                            key: peer_record.record.key.to_vec(),
-                            value: peer_record.record.value,
-                        });
+                        let key = peer_record.record.key.to_vec();
+                        let value = peer_record.record.value;
+                        if key.starts_with(MAILBOX_DHT_PREFIX) {
+                            if let Ok(msg) = serde_json::from_slice::<MailboxMessage>(&value) {
+                                if !is_expired(&msg) && msg.to == self.peer_id().to_string() {
+                                    if msg.content_type == MailboxContentType::DtnBundle {
+                                        if let Ok(bundle) =
+                                            serde_json::from_slice::<DtnBundle>(&msg.payload)
+                                        {
+                                            let from_peer = msg
+                                                .from
+                                                .parse::<PeerId>()
+                                                .unwrap_or_else(|_| self.peer_id());
+                                            return Some(HyphaEvent::DtnBundleReceived {
+                                                from: from_peer,
+                                                bundle,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return Some(HyphaEvent::RecordFound { key, value });
                     }
                     kad::QueryResult::GetRecord(Err(e)) => {
                         let key = match &e {
@@ -1309,6 +1480,44 @@ impl HyphaeNode {
                     }
                     _ => {}
                 },
+                SwarmEvent::Behaviour(SubstrateBehaviourEvent::Kademlia(
+                    kad::Event::InboundRequest { request },
+                )) => {
+                    match request {
+                        kad::InboundRequest::PutRecord { source, record, .. } => {
+                            if let Some(rec) = record {
+                                let key = rec.key.to_vec();
+                                let value = rec.value;
+                                if key.starts_with(MAILBOX_DHT_PREFIX) {
+                                    if let Ok(msg) =
+                                        serde_json::from_slice::<MailboxMessage>(&value)
+                                    {
+                                        if !is_expired(&msg)
+                                            && msg.to == self.peer_id().to_string()
+                                        {
+                                            if msg.content_type == MailboxContentType::DtnBundle {
+                                                if let Ok(bundle) =
+                                                    serde_json::from_slice::<DtnBundle>(
+                                                        &msg.payload,
+                                                    )
+                                                {
+                                                    return Some(
+                                                        HyphaEvent::DtnBundleReceived {
+                                                            from: source,
+                                                            bundle,
+                                                        },
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                return Some(HyphaEvent::RecordFound { key, value });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 _ => {}
             }
         }

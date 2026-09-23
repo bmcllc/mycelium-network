@@ -201,6 +201,12 @@ pub enum Request {
         #[serde(default)]
         output_dir: Option<String>,
     },
+    /// Materializa e ativa ativamente um serviço comunitário a partir de um Plot em Chamber viva.
+    MaterializeService {
+        ion: String,
+        #[serde(default)]
+        plot: Option<String>,
+    },
     /// Lista repositórios anunciados via gossipsub por peers da rede.
     Repos,
     /// Verifica uma licença VOID-00 (ML-DSA-87 + device binding).

@@ -37,14 +37,18 @@ async fn test_community_service_content_survival_after_publisher_shutdown() {
     let sock_2 = home_2.join("mycelium.sock");
 
     // 1. Inicia Nó 1 (Publicador Comunitário)
-    let mut opts_1 = DaemonOptions::default();
-    opts_1.listen = vec!["/ip4/127.0.0.1/tcp/0".to_string()];
-    opts_1.horizon_port = 0; // Efêmero / sem gateway externo obrigatório
-    opts_1.no_mdns = true;
+    let opts_1 = DaemonOptions {
+        listen: vec!["/ip4/127.0.0.1/tcp/0".to_string()],
+        horizon_port: 0, // Efêmero / sem gateway externo obrigatório
+        no_mdns: true,
+        ..Default::default()
+    };
 
     let h1_clone = home_1.clone();
     let daemon_1_task = tokio::spawn(async move {
-        let _ = run_daemon(h1_clone, opts_1).await;
+        if let Err(e) = run_daemon(h1_clone, opts_1).await {
+            eprintln!("DAEMON 1 ERROR: {e:?}");
+        }
     });
     wait_for_sock(&sock_1).await;
 
@@ -63,26 +67,31 @@ async fn test_community_service_content_survival_after_publisher_shutdown() {
     }
     let addrs_json = std::fs::read_to_string(&listen_addrs_file).expect("ler listen_addrs Nó 1");
     let addrs: Vec<String> = serde_json::from_str(&addrs_json).expect("parse listen_addrs");
-    let node_1_addr = addrs
+    let node_1_tcp = addrs
         .into_iter()
         .find(|a| a.contains("/tcp/") && !a.contains("/quic"))
         .expect("Endereço TCP do Nó 1");
+    let node_1_addr = node_1_tcp;
 
     // 2. Inicia Nó 2 (Réplica / Custodiante Comunitário) conectado ao Nó 1
-    let mut opts_2 = DaemonOptions::default();
-    opts_2.listen = vec!["/ip4/127.0.0.1/tcp/0".to_string()];
-    opts_2.bootstrap = vec![node_1_addr];
-    opts_2.horizon_port = 0;
-    opts_2.no_mdns = true;
+    let opts_2 = DaemonOptions {
+        listen: vec!["/ip4/127.0.0.1/tcp/0".to_string()],
+        bootstrap: vec![node_1_addr],
+        horizon_port: 0,
+        no_mdns: true,
+        ..Default::default()
+    };
 
     let h2_clone = home_2.clone();
     let daemon_2_task = tokio::spawn(async move {
-        let _ = run_daemon(h2_clone, opts_2).await;
+        if let Err(e) = run_daemon(h2_clone, opts_2).await {
+            eprintln!("DAEMON 2 ERROR: {e:?}");
+        }
     });
     wait_for_sock(&sock_2).await;
 
     // Aguarda anastomose entre Nó 1 e Nó 2
-    let connect_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let connect_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let mut connected = false;
     while tokio::time::Instant::now() < connect_deadline {
         if let Ok(Response::Status(s2)) = call(&sock_2, Request::Status).await {
@@ -177,7 +186,39 @@ async fn test_community_service_content_survival_after_publisher_shutdown() {
         "Conteúdo servido pela réplica deve ser idêntico ao publicado originalmente"
     );
 
-    // 8. Encerramento limpo do Nó 2
+    // 8. CONTINUIDADE REAL DE SERVIÇO HTTP (GATE B):
+    // Nó 2 mantém e serve o serviço ativo no seu Event Horizon local.
+    // Uma requisição HTTP real ao endpoint do Event Horizon do Nó 2 deve retornar HTTP 200 OK.
+    let status_2 = call(&sock_2, Request::Status).await.expect("Status Nó 2");
+    let horizon_2_url = match status_2 {
+        Response::Status(s) => s.event_horizon,
+        other => panic!("Esperado Status, obtido {:?}", other),
+    };
+
+    let http_client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let service_endpoint = format!("{}/guia-solar/index.html", horizon_2_url);
+
+    let http_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut http_served = false;
+    let mut dynamic_body = String::new();
+    while tokio::time::Instant::now() < http_deadline {
+        if let Ok(resp) = http_client.get(&service_endpoint).send().await {
+            if resp.status().is_success() {
+                dynamic_body = resp.text().await.unwrap_or_default();
+                http_served = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    assert!(http_served, "Nó 2 deve servir a requisição HTTP dinamicamente no Event Horizon com HTTP 200");
+    assert_eq!(
+        dynamic_body, service_html,
+        "Resposta HTTP servida pelo Nó 2 deve ser idêntica ao serviço publicado originalmente"
+    );
+
+    // 9. Encerramento limpo do Nó 2
     let shutdown_2 = call(&sock_2, Request::Shutdown).await.expect("Shutdown Nó 2");
     assert!(matches!(shutdown_2, Response::Ok { .. }));
     let _ = tokio::time::timeout(Duration::from_secs(3), daemon_2_task).await;

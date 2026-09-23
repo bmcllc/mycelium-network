@@ -391,6 +391,31 @@ async fn proxy(State(table): State<HorizonTable>, req: Request) -> Response {
         match t.route_ion_candidates(&ion) {
             Ok(orbits) => orbits,
             Err(SingularityError::NoOrbit(_)) => {
+                if let Some(home) = t.get_home() {
+                    if let Ok(bank) = mycelium_sporebank::SporeBank::open(home) {
+                        for id in bank.ids() {
+                            if let Some(plot) = bank.recall(&id) {
+                                if !plot.is_public() {
+                                    continue;
+                                }
+                                let match_ion = plot.message.to_lowercase().contains(&ion.to_lowercase())
+                                    || plot.leaves.iter().any(|l| l.path == "index.html");
+                                if match_ion {
+                                    for leaf in &plot.leaves {
+                                        if leaf.path == "index.html" || leaf.path.ends_with(".html") {
+                                            return (
+                                                StatusCode::OK,
+                                                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                                                leaf.content.clone(),
+                                            )
+                                                .into_response();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 return (StatusCode::NOT_FOUND, format!("nenhum ion `{ion}` no horizonte"))
                     .into_response();
             }

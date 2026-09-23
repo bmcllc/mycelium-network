@@ -202,3 +202,17 @@ mycelium recall-code \
   --plot <CID_DO_PLOT> \
   --output ./servico_restaurado
 ```
+
+## 7. Roteamento Unicast & DTN (Gate A) e Continuidade de Execução Ativa (Gate B)
+
+### 7.1 Roteamento Unicast Direcionado e DTN Store-and-Forward (Gate A)
+A malha nativa do Mycelium (`mycelium-hyphae`) evoluiu para além do broadcast pubsub (Gossipsub):
+- **Canais Privativos DTN**: Cada nó escuta exclusivamente no tópico `/mycelium/dtn/<peer_id>`. Enlaces multissalto direcionados A→B→C transmitem o dado sem vazar para nós não envolvidos (comprovado com nó observador D sem qualquer vazamento de telemetria ou carga).
+- **Métrica XOR Greedy**: O nó intermediário B analisa a distância XOR de seus pares conectados em relação ao destino final; avança o pacote se e somente se houver vizinho estritamente mais próximo do que ele próprio.
+- **Store-and-Forward DTN**: Se o destino C estiver temporariamente offline, o pacote é retido com segurança no `DtnBundleStore` do nó intermediário. Quando C reconecta (`Anastomosis`), o bundle é descarregado automaticamente (*flush*), garantindo tolerância a redes intermitentes e desconectadas.
+
+### 7.2 Continuidade Real de Execução de Serviços Comunitários (Gate B)
+A sobrevivência de serviços comunitários não se limita a arquivos inertes no disco:
+- **Materialização Autônoma de Câmaras**: No `Organism`, quando um serviço perde todos os seus publicadores/executores (`HyphaEvent::Atrophy`), o nó réplica detecta o estado órfão e materializa dinamicamente a Câmara correspondente através do Vácuo (`vacuum`).
+- **Resiliência do Event Horizon**: O proxy HTTP reverso do nó réplica serve o serviço dinamicamente com status `HTTP 200 OK`, preservando a experiência web comunitária mesmo após o desligamento total do publicador original.
+

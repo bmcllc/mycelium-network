@@ -16,6 +16,74 @@ pub const MAX_MAILBOX_BYTES: usize = 64 * 1024;
 pub enum MailboxContentType {
     Generic,
     IsotopeAtom,
+    DtnBundle,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DtnBundle {
+    pub bundle_id: String,
+    pub src_peer: String,
+    pub dst_peer: String,
+    pub created_at: u64,
+    pub ttl_secs: u64,
+    pub hops: u32,
+    pub max_hops: u32,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DtnBundleStore {
+    bundles: std::collections::HashMap<String, DtnBundle>,
+}
+
+impl DtnBundleStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, bundle: DtnBundle) {
+        if self.bundles.len() < 1000 {
+            self.bundles.insert(bundle.bundle_id.clone(), bundle);
+        }
+    }
+
+    pub fn get(&self, bundle_id: &str) -> Option<&DtnBundle> {
+        self.bundles.get(bundle_id)
+    }
+
+    pub fn remove(&mut self, bundle_id: &str) -> Option<DtnBundle> {
+        self.bundles.remove(bundle_id)
+    }
+
+    pub fn drain_for_peer(&mut self, peer_id: &str) -> Vec<DtnBundle> {
+        let matching: Vec<String> = self.bundles.iter()
+            .filter(|(_, b)| b.dst_peer == peer_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut out = Vec::new();
+        for id in matching {
+            if let Some(b) = self.bundles.remove(&id) {
+                out.push(b);
+            }
+        }
+        out
+    }
+
+    pub fn all_bundles(&self) -> Vec<DtnBundle> {
+        self.bundles.values().cloned().collect()
+    }
+
+    pub fn prune_expired(&mut self, now: u64) {
+        self.bundles.retain(|_, b| now.saturating_sub(b.created_at) < b.ttl_secs);
+    }
+
+    pub fn len(&self) -> usize {
+        self.bundles.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bundles.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
