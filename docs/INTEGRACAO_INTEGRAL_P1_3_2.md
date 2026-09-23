@@ -123,6 +123,9 @@ Para manter fidelidade absoluta entre o código real e as capacidades em campo, 
     3. `connected_peer_ids()` de A e C comprovam que **não há enlace direto** entre eles.
     4. Mensagens publicadas por A no tópico Gossipsub `/mycelium/lattice/1.0.0` chegam a C com integridade verificada através do encaminhamento de B.
     5. A queda do Nó B interrompe a entrega, comprovando que o tráfego dependia exclusivamente do salto intermediário.
+- **Fronteira e Interpretação Técnica**:
+  > [!IMPORTANT]
+  > O teste comprova o encaminhamento multissalto de pubsub (Lattice Gossipsub) através de B na malha. Ele **não equivale ainda** a um roteador unicast geral ponto a ponto, DTN completo ou escolha dinâmica de rotas em malha heterogênea.
 
 ### 4.4 Entrega 4: Primeiro Serviço Comunitário Nativo
 - **Publicação e Sobrevivência Sem Ponto Central**:
@@ -136,6 +139,9 @@ Para manter fidelidade absoluta entre o código real e as capacidades em campo, 
     3. **Nó 1 é desligado e fica 100% offline** (processo terminado e socket fechado).
     4. **Nó 2 atende à restauração** (`RecallCode`), materializando os arquivos do serviço de forma íntegra no disco.
     5. A verificação byte a byte prova que a comunidade continua consumindo o serviço de forma descentralizada.
+- **Fronteira e Interpretação Técnica**:
+  > [!IMPORTANT]
+  > O teste comprova a **sobrevivência e restauração do conteúdo** numa réplica autônoma; ele **não comprova ainda** que um processo/serviço HTTP ativo continue atendendo requisições dinâmicas automaticamente após a queda do processo original (próxima etapa de orquestração de processos/Chamber).
 
 ---
 

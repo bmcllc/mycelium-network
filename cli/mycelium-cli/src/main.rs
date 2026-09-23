@@ -27,6 +27,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     Sprout {
         #[arg(long, default_value = "1cpu,1gb,10gb")]
@@ -401,6 +402,7 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum VeilCmd {
     /// Consulta o estado da sessão e do proxy VEIL Ω.
     Status,

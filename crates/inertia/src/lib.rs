@@ -198,18 +198,28 @@ impl Flywheel {
 
 /// Verifica se o runtime isolado Bubblewrap está disponível no host.
 pub fn is_sandbox_available() -> bool {
-    std::env::var_os("PATH")
-        .and_then(|paths| {
-            std::env::split_paths(&paths).find_map(|dir| {
-                let full = dir.join("bwrap");
-                if full.is_file() {
-                    Some(full)
-                } else {
-                    None
-                }
-            })
-        })
-        .is_some()
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let has_bin = std::env::var_os("PATH").map_or(false, |paths| {
+            std::env::split_paths(&paths).any(|dir| dir.join("bwrap").is_file())
+        });
+        if !has_bin {
+            return false;
+        }
+        // Testa se o bwrap realmente consegue criar namespaces no ambiente atual
+        // (em contêineres e CIs sem privilégios de unshare/user namespace, o binário existe mas falha).
+        match std::process::Command::new("bwrap")
+            .arg("--ro-bind")
+            .arg("/usr")
+            .arg("/usr")
+            .arg("--")
+            .arg("true")
+            .output()
+        {
+            Ok(output) => output.status.success(),
+            Err(_) => false,
+        }
+    })
 }
 
 /// Constrói comando isolado em sandbox Bubblewrap para builds/testes.

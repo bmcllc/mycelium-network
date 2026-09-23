@@ -418,7 +418,10 @@ async fn proxy(State(table): State<HorizonTable>, req: Request) -> Response {
         .query()
         .map(|q| format!("?{q}"))
         .unwrap_or_default();
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap_or_default();
     let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes())
         .unwrap_or(reqwest::Method::GET);
 

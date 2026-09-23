@@ -227,7 +227,7 @@ mod tests {
             )
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(600));
-        let mut p = mgr.get_mut(id).unwrap();
+        let p = mgr.get_mut(id).unwrap();
         let out = String::from_utf8_lossy(&p.drain()).to_string();
         assert!(out.contains("hello-from-launcher"), "output: {out}");
         assert!(out.contains("done"), "output: {out}");

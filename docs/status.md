@@ -285,9 +285,17 @@ Executada a sequência de entregas imediatas sob a regra de soberania (operaçã
 3. **Entrega 3: Malha Independente A-B-C sem Internet Convencional**
    - Implementado suporte a `blocked_peers` em `HyphaeConfig` e `HyphaeNode` para isolamento de enlaces diretos.
    - Teste de aceitação `tests/multihop_topology_acceptance.rs` (**verde**): nós A e C sem conexão direta física/lógica; B atua como roteador/anastomose; tráfego Gossipsub (Lattice) chega com integridade comprovada; queda de B interrompe o fluxo.
+   - *Fronteira técnica*: Comprova o encaminhamento multissalto pubsub (Gossipsub) via intermediário; não equivale ainda a um roteador unicast geral, DTN completo ou escolha dinâmica de rotas.
 
 4. **Entrega 4: Primeiro Serviço Comunitário Nativo**
    - Teste de aceitação `tests/community_service_survival_acceptance.rs` (**verde**): Nó 1 semeia serviço público no Spore Bank; Nó 2 absorve via Lattice Gossipsub; Nó 1 é desligado completamente (offline); Nó 2 atende à solicitação `RecallCode` e materializa os arquivos de forma 100% íntegra (verificação byte a byte).
+   - *Fronteira técnica*: Comprova sobrevivência e restauração de conteúdo numa réplica; não comprova ainda continuidade de execução automática de processos HTTP ativos.
+
+5. **Correção do CI e Sanity Check**:
+   - `inertia`: `is_sandbox_available()` aprimorado com sonda ativa do `bwrap` (impede falhas de namespace em CIs e contêineres sem privilégios `CLONE_NEWUSER`).
+   - `singularity` e `mycelium-node`: clientes `reqwest` internos e de teste configurados com `.no_proxy()` para evitar interceptação espúria de tráfego de loopback por variáveis de ambiente de proxy.
+   - `cargo test --workspace` e `cargo clippy --workspace --all-targets` 100% verdes.
 
 **Documentação Técnica:** gerado `docs/INTEGRACAO_INTEGRAL_P1_3_2.md`.
+
 

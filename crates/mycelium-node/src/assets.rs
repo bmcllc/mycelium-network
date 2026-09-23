@@ -181,7 +181,7 @@ impl AssetRegistry {
 mod tests {
     use super::*;
 
-    fn reg(home: &Path) -> AssetRegistry {
+    fn reg(_home: &Path) -> AssetRegistry {
         let mut r = AssetRegistry::default();
         r.register(AssetRecord {
             id: "estudio-x".into(),

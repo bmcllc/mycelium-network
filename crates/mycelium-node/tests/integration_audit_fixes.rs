@@ -104,7 +104,7 @@ async fn test_event_horizon_private_plot_and_security_headers() {
     let handle = serve_horizon(bind, table).await.expect("horizon bind");
     let base_url = format!("http://{}", handle.bind);
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
 
     // 1. Acesso a /health com verificação de security headers
     let health_resp = client.get(format!("{base_url}/health")).send().await.unwrap();
@@ -185,7 +185,7 @@ async fn test_proxy_read_fallback_to_surviving_replica() {
         });
     }
     let horizon = serve_horizon("127.0.0.1:0".parse().unwrap(), table).await.unwrap();
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let root = format!("http://{}", horizon.bind);
     let read = client.get(format!("{root}/resilient/")).send().await.unwrap();
     assert_eq!(read.status(), reqwest::StatusCode::OK);
