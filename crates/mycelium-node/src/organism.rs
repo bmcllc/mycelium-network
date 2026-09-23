@@ -4174,7 +4174,17 @@ impl Organism {
         let store_home = self.home.clone();
         let store_horizon = self.horizon.clone();
         tokio::spawn(async move {
-            let store_router = mycelium_store::create_store_router(&store_home, store_catalog);
+            let store_token = std::env::var("MYCELIUM_CONTROL_TOKEN")
+                .ok()
+                .filter(|t| !t.trim().is_empty())
+                .or_else(|| {
+                    let p = store_home.join("control.token");
+                    std::fs::read_to_string(p)
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                });
+            let store_router = mycelium_store::create_store_router_with_auth(&store_home, store_catalog, store_token);
             let ui_router = mycelium_store::create_store_ui_router(&store_home);
             let app = store_router.merge(ui_router);
             let store_bind: std::net::SocketAddr = "127.0.0.1:0"

@@ -4,7 +4,7 @@
 //! TheField, Inertia, Vacuum e Plasma — com estado em disco e plano de
 //! controle via Unix socket.
 
-mod assets;
+pub mod assets;
 mod control;
 mod organism;
 mod protocol;
@@ -189,19 +189,31 @@ pub async fn run_daemon(home: PathBuf, opts: DaemonOptions) -> Result<(), Organi
         token = Some(match std::fs::read_to_string(&path) {
             Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
             _ => {
-                let material = format!(
-                    "mycelium-control|{}|{}",
-                    home.display(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos())
-                        .unwrap_or(0)
-                );
-                let t = mycelium_core::ContentId::of(material.as_bytes()).to_string();
-                let _ = std::fs::write(&path, &t);
+                let mut random_bytes = [0u8; 32];
+                let mut rng = rand::thread_rng();
+                rand::RngCore::fill_bytes(&mut rng, &mut random_bytes);
+                let t = hex::encode(random_bytes);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open(&path)
+                    {
+                        use std::io::Write;
+                        let _ = f.write_all(t.as_bytes());
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = std::fs::write(&path, &t);
+                }
                 tracing::warn!(
                     token_file = %path.display(),
-                    "MYCELIUM_CONTROL_TOKEN ausente — gerado em control.token"
+                    "MYCELIUM_CONTROL_TOKEN ausente — gerado via CSPRNG em control.token (0600)"
                 );
                 t
             }

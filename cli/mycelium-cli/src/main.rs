@@ -264,6 +264,7 @@ enum Commands {
         #[arg(long, default_value_t = 30)]
         timeout: u64,
     },
+    #[command(alias = "stop")]
     Shutdown,
     /// Mostra balance local + de peers.
     Balance,
@@ -2433,9 +2434,135 @@ fn print_response(resp: Response) -> Result<(), String> {
             }
             Ok(())
         }
+        Response::StoreCaps { caps } => {
+            println!("\n⚡ === MYCELIUM STORE — Capacidades de Emulação Host === ⚡\n");
+            println!(" ⚙️ QEMU Emulators:");
+            for (arch, has) in &caps.has_qemu {
+                println!("    • qemu-system-{:<8}: {}", arch, if *has { "✅ Instalado" } else { "❌ Ausente" });
+            }
+            println!(" ⚙️ RetroArch (Libretro): {}", if caps.has_retroarch { "✅ Instalado" } else { "❌ Ausente" });
+            println!("    Cores encontrados: {:?}", caps.available_libretro_cores);
+            println!(" ⚙️ MAME Arcade: {}", if caps.has_mame { "✅ Instalado" } else { "❌ Ausente" });
+            println!(" ⚙️ Bubblewrap Sandbox (bwrap): {}\n", if caps.has_bwrap_sandbox { "✅ Disponível" } else { "❌ Não encontrado" });
+            Ok(())
+        }
+        Response::StoreList { spores } => {
+            if spores.is_empty() {
+                println!("[🍄] Nenhum spore cadastrado no catálogo.");
+            } else {
+                println!("\n🎮 === MYCELIUM APP STORE — Catálogo P2P Retro ({}) === 🎮\n", spores.len());
+                for spore in spores {
+                    println!("🔹 ID: {}", spore.id);
+                    println!("   Título: {}", spore.title);
+                    println!("   Plataforma: {}", spore.platform.display_name());
+                    println!("   Ano: {}", spore.release_year);
+                    println!("   Licença: {}", spore.license.display_name());
+                    println!("   Recomendado: {:?}", spore.execution_matrix.recommended);
+                    println!("   Categorias/Tags: {:?}", spore.tags);
+                    println!("   ContentId: {}", hex::encode(spore.content_id.0));
+                    println!("------------------------------------------------------------");
+                }
+            }
+            Ok(())
+        }
+        Response::StoreLaunched { spore_id, engine, message } => {
+            println!("[🍄 Store] Spore '{spore_id}' iniciado via {engine}: {message}");
+            Ok(())
+        }
+        Response::RepoPublished { cid, leaves, bytes } => {
+            println!("[🍄 Repo] ✅ Publicado com sucesso!");
+            println!("    ContentId : {cid}");
+            println!("    Arquivos  : {leaves}");
+            println!("    Tamanho   : {bytes} bytes");
+            Ok(())
+        }
+        Response::RepoCloneResult { message, leaves } => {
+            println!("[🍄 Repo] {message} ({} arquivos)", leaves.len());
+            Ok(())
+        }
+        Response::InertiaRunResult {
+            input_cid,
+            build_attestation_cid,
+            test_attestation_cid,
+            artifact_cid,
+            success,
+        } => {
+            println!("[🍄 Inertia] CID de entrada       : {input_cid}");
+            println!("[🍄 Inertia] Atestação de build  : {build_attestation_cid}");
+            if let Some(cid) = test_attestation_cid {
+                println!("[🍄 Inertia] Atestação de teste  : {cid}");
+            }
+            if let Some(cid) = artifact_cid {
+                println!("[🍄 Inertia] Artefato             : {cid}");
+            }
+            if success {
+                println!("[🍄 Inertia] ✅ Build e testes aprovados");
+            } else {
+                println!("[🍄 Inertia] ❌ Falha no build ou testes");
+            }
+            Ok(())
+        }
+        Response::InertiaAttestationResult { cid, attestation } => {
+            println!("[🍄 Inertia] Atestação {cid}:");
+            println!("    Executor: {}", attestation.payload.executor);
+            println!("    Signer  : {}", attestation.signer);
+            println!("    Sucesso : {}", attestation.payload.success);
+            println!("    Log CID : {}", attestation.payload.log_digest);
+            Ok(())
+        }
+        Response::TransferResult { tx_id, kind, nutrient, amount, to } => {
+            println!("[🍄] Transferência confirmada: {tx_id}");
+            println!("    Nutriente : {nutrient} ({kind})");
+            println!("    Quantidade: {amount}");
+            println!("    Destino   : {to}");
+            Ok(())
+        }
+        Response::LedgerReport { pubkey, balances, history, transfers } => {
+            println!("[🍄] Ledger Local");
+            println!("    Chave pública: {pubkey}");
+            println!("    Saldos       :");
+            for (k, v) in balances {
+                println!("      {:?}: {}", k, v);
+            }
+            println!("    Histórico de trocas        : {} entradas", history.len());
+            println!("    Transferências registradas : {} transferências", transfers.len());
+            Ok(())
+        }
+        Response::AssetListResult { assets } => {
+            if assets.is_empty() {
+                println!("[🍄] Nenhum ativo cadastrado.");
+            } else {
+                println!("[🍄] Ativos registrados ({}):", assets.len());
+                for a in assets {
+                    println!("    • [{}] {} ({} cotas a {} ATP)", a.id, a.name, a.shares_total, a.price_per_share);
+                }
+            }
+            Ok(())
+        }
+        Response::AssetSharesResult { asset, holdings } => {
+            println!("[🍄] Cotas do ativo {asset}:");
+            for h in holdings {
+                println!("    • Holder {}: {} cotas", hex::encode(h.holder), h.shares);
+            }
+            Ok(())
+        }
         Response::Err { message } => Err(message),
-        _ => Err("resposta não suportada".into()),
     }
+}
+
+async fn chamber_headers_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut resp = next.run(req).await;
+    let pid = std::process::id().to_string();
+    if let Ok(val) = axum::http::HeaderValue::from_str(&pid) {
+        resp.headers_mut().insert("x-chamber-pid", val);
+    }
+    if let Ok(val) = axum::http::HeaderValue::from_str("dynamic-process") {
+        resp.headers_mut().insert("x-chamber-mode", val);
+    }
+    resp
 }
 
 async fn chamber_serve(port: u16, ion: String, root: PathBuf) -> Result<(), String> {
@@ -2468,6 +2595,23 @@ async fn chamber_serve(port: u16, ion: String, root: PathBuf) -> Result<(), Stri
         )
         .route("/health", get(|| async { Json(json!({"ok": true})) }))
         .route(
+            "/status",
+            get({
+                let ion = ion_name.clone();
+                move || {
+                    let ion = ion.clone();
+                    let pid = std::process::id();
+                    async move {
+                        Json(json!({
+                            "chamber_pid": pid,
+                            "status": "active",
+                            "ion": ion,
+                        }))
+                    }
+                }
+            }),
+        )
+        .route(
             "/index.html",
             get({
                 let ion = ion_name;
@@ -2494,7 +2638,8 @@ async fn chamber_serve(port: u16, ion: String, root: PathBuf) -> Result<(), Stri
                     }
                 }
             }),
-        );
+        )
+        .layer(axum::middleware::from_fn(chamber_headers_middleware));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr)

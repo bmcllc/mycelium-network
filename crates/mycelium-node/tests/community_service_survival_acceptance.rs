@@ -219,12 +219,14 @@ async fn test_community_service_content_survival_after_publisher_shutdown() {
             if resp.status().is_success() {
                 if let Some(pid_hdr) = resp.headers().get("x-chamber-pid") {
                     if let Ok(pid_str) = pid_hdr.to_str() {
-                        chamber_pid_val = pid_str.parse().ok();
+                        if let Ok(pid) = pid_str.parse::<u32>() {
+                            chamber_pid_val = Some(pid);
+                            dynamic_body = resp.text().await.unwrap_or_default();
+                            http_served = true;
+                            break;
+                        }
                     }
                 }
-                dynamic_body = resp.text().await.unwrap_or_default();
-                http_served = true;
-                break;
             }
         }
         tokio::time::sleep(Duration::from_millis(150)).await;

@@ -38,14 +38,46 @@ pub struct StoreAppState {
     pub catalog: Arc<Mutex<StoreCatalog>>,
     pub processes: Arc<Mutex<ProcessManager>>,
     pub home: PathBuf,
+    pub control_token: Option<String>,
 }
 
-/// Cria o router HTTP Axum para a Mycelium Store integrar ao Singularity Event Horizon
+/// Verifica se a requisição possui autorização válida quando um token de controle é exigido.
+fn is_authorized(headers: &axum::http::HeaderMap, expected: Option<&str>) -> bool {
+    let expected = match expected {
+        Some(t) if !t.trim().is_empty() => t.trim(),
+        _ => return true,
+    };
+    if let Some(val) = headers.get("x-control-token").and_then(|v| v.to_str().ok()) {
+        if val.trim() == expected {
+            return true;
+        }
+    }
+    if let Some(val) = headers.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+        if let Some(token) = val.strip_prefix("Bearer ") {
+            if token.trim() == expected {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Cria o router HTTP Axum para a Mycelium Store integrar ao Singularity Event Horizon (sem token exigido).
 pub fn create_store_router(home: impl AsRef<Path>, catalog: Arc<Mutex<StoreCatalog>>) -> Router {
+    create_store_router_with_auth(home, catalog, None)
+}
+
+/// Cria o router HTTP Axum para a Mycelium Store com token de controle opcional para proteger execução de processos.
+pub fn create_store_router_with_auth(
+    home: impl AsRef<Path>,
+    catalog: Arc<Mutex<StoreCatalog>>,
+    control_token: Option<String>,
+) -> Router {
     let state = StoreAppState {
         catalog,
         processes: Arc::new(Mutex::new(ProcessManager::new())),
         home: home.as_ref().to_path_buf(),
+        control_token,
     };
 
     Router::new()
@@ -123,8 +155,16 @@ async fn get_spore_handler(
 
 async fn launch_spore_handler(
     State(state): State<StoreAppState>,
+    headers: axum::http::HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> impl IntoResponse {
+    if !is_authorized(&headers, state.control_token.as_deref()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(axum::http::header::CONTENT_TYPE, "application/json; charset=utf-8")],
+            json!({"error": "autorização necessária para controle e execução de processos"}).to_string(),
+        );
+    }
     let spore = {
         let catalog = state.catalog.lock().unwrap();
         match catalog.get_spore(&id) {
@@ -264,9 +304,13 @@ async fn process_output_handler(
 
 async fn process_input_handler(
     State(state): State<StoreAppState>,
+    headers: axum::http::HeaderMap,
     AxumPath(id): AxumPath<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    if !is_authorized(&headers, state.control_token.as_deref()) {
+        return process_json_err(StatusCode::UNAUTHORIZED, "autorização necessária para enviar input".into());
+    }
     let id: u64 = match id.parse() {
         Ok(v) => v,
         Err(_) => return process_json_err(StatusCode::BAD_REQUEST, "id de processo inválido".into()),
@@ -291,8 +335,12 @@ async fn process_input_handler(
 
 async fn process_stop_handler(
     State(state): State<StoreAppState>,
+    headers: axum::http::HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> impl IntoResponse {
+    if !is_authorized(&headers, state.control_token.as_deref()) {
+        return process_json_err(StatusCode::UNAUTHORIZED, "autorização necessária para encerrar processo".into());
+    }
     let id: u64 = match id.parse() {
         Ok(v) => v,
         Err(_) => return process_json_err(StatusCode::BAD_REQUEST, "id de processo inválido".into()),
