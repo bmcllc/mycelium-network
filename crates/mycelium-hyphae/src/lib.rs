@@ -106,6 +106,8 @@ pub struct HyphaeConfig {
     pub nostr_home: Option<std::path::PathBuf>,
     /// Relay Nostr WSS (default damus).
     pub nostr_relay: Option<String>,
+    /// Peers bloqueados para conexões diretas (isolamento de topologia multissalto).
+    pub blocked_peers: Vec<PeerId>,
     /// **Gate de licença VOID-00**: se `Some(peers)`, apenas PeerIds listados
     /// são admitidos como vizinhos (fabrica de peers licenciados). Se `None`,
     /// o gate está desligado (admissão aberta). Requer feature `license`.
@@ -132,6 +134,7 @@ impl Default for HyphaeConfig {
             enable_nostr_transport: false,
             nostr_home: None,
             nostr_relay: None,
+            blocked_peers: Vec::new(),
             #[cfg(feature = "license")]
             licensed_peers: None,
         }
@@ -296,6 +299,8 @@ pub struct HyphaeNode {
     nostr_home: Option<std::path::PathBuf>,
     #[cfg(feature = "nostr-transport")]
     nostr_relay: Option<String>,
+    /// Peers bloqueados para conexões diretas (isolamento de topologia multissalto).
+    blocked_peers: Vec<PeerId>,
     /// Allowlist de peers licenciados (feature `license`); ver [`HyphaeConfig::licensed_peers`].
     #[cfg(feature = "license")]
     licensed_peers: Option<std::collections::HashSet<PeerId>>,
@@ -537,6 +542,7 @@ impl HyphaeNode {
             nostr_home: config.nostr_home.clone(),
             #[cfg(feature = "nostr-transport")]
             nostr_relay: config.nostr_relay.clone(),
+            blocked_peers: config.blocked_peers.clone(),
             #[cfg(feature = "license")]
             licensed_peers: config.licensed_peers.clone(),
         };
@@ -684,6 +690,21 @@ impl HyphaeNode {
     #[cfg(feature = "license")]
     pub fn licensed_peers(&self) -> Option<&std::collections::HashSet<PeerId>> {
         self.licensed_peers.as_ref()
+    }
+
+    /// Bloqueia conexões diretas com um peer (para isolamento e testes multissalto).
+    pub fn block_peer(&mut self, peer: PeerId) {
+        if !self.blocked_peers.contains(&peer) {
+            self.blocked_peers.push(peer);
+        }
+        let _ = self.swarm.disconnect_peer_id(peer);
+        self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer);
+        self.swarm.behaviour_mut().kademlia.remove_peer(&peer);
+    }
+
+    /// Lista de peers bloqueados para conexões diretas.
+    pub fn blocked_peers(&self) -> &[PeerId] {
+        &self.blocked_peers
     }
 
     pub fn links(&self) -> &HashMap<PeerId, HyphaLink> {
@@ -902,6 +923,9 @@ impl HyphaeNode {
     pub fn reach(&mut self, addr: Multiaddr) -> Result<(), HyphaeError> {
         // Extrai PeerId se presente e registra no Kademlia.
         if let Some(peer) = peer_from_multiaddr(&addr) {
+            if self.blocked_peers.contains(&peer) {
+                return Err(HyphaeError::Germination(format!("peer {peer} bloqueado por topologia")));
+            }
             self.swarm
                 .behaviour_mut()
                 .kademlia
@@ -1121,6 +1145,13 @@ impl HyphaeNode {
                     return Some(HyphaEvent::Rooted { address });
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                    // Isolamento de topologia: se o peer está bloqueado, desconecta imediatamente.
+                    if self.blocked_peers.contains(&peer_id) {
+                        tracing::warn!(%peer_id, "topologia: peer bloqueado — desconectando");
+                        self.metrics.total_atrophies += 1;
+                        let _ = self.swarm.disconnect_peer_id(peer_id);
+                        return Some(HyphaEvent::Atrophy { peer: peer_id });
+                    }
                     // Gate de admissão licenciada (VOID-00): se habilitado, só
                     // vizinhos com PeerId na allowlist são aceitos; os demais
                     // são desconectados imediatamente (rede privada por licença).
@@ -1186,11 +1217,13 @@ impl HyphaeNode {
                 SwarmEvent::Behaviour(SubstrateBehaviourEvent::Identify(
                     identify::Event::Received { peer_id, info, .. },
                 )) => {
-                    for addr in info.listen_addrs {
-                        self.swarm
-                            .behaviour_mut()
-                            .kademlia
-                            .add_address(&peer_id, addr);
+                    if !self.blocked_peers.contains(&peer_id) {
+                        for addr in info.listen_addrs {
+                            self.swarm
+                                .behaviour_mut()
+                                .kademlia
+                                .add_address(&peer_id, addr);
+                        }
                     }
                     // Endereço observado pelo peer remoto — útil para NAT / relay.
                     self.swarm.add_external_address(info.observed_addr);

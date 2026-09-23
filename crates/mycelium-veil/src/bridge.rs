@@ -190,6 +190,12 @@ pub struct EntryPool {
     handshake_timeout: Duration,
     /// Índice da entrada que funcionou por último (ordem preferencial).
     active: StdMutex<Option<usize>>,
+    /// Entrada que autenticou com o Guard na última chamada bem-sucedida.
+    last_successful: StdMutex<Option<String>>,
+    /// Número de entradas que falharam antes do sucesso (ou até esgotar) na última chamada.
+    last_failover_attempts: StdMutex<usize>,
+    /// Motivos de falha por entrada/estágio da última chamada (observabilidade p/ status).
+    last_failures: StdMutex<Vec<String>>,
 }
 
 impl Default for EntryPool {
@@ -201,7 +207,14 @@ impl Default for EntryPool {
 impl EntryPool {
     /// Pool vazio (use [`EntryPool::push`] para registrar as entradas).
     pub fn new() -> Self {
-        Self { entries: Vec::new(), handshake_timeout: ENTRY_HANDSHAKE_TIMEOUT, active: StdMutex::new(None) }
+        Self {
+            entries: Vec::new(),
+            handshake_timeout: ENTRY_HANDSHAKE_TIMEOUT,
+            active: StdMutex::new(None),
+            last_successful: StdMutex::new(None),
+            last_failover_attempts: StdMutex::new(0),
+            last_failures: StdMutex::new(Vec::new()),
+        }
     }
 
     /// Ajusta o tempo limite do handshake autenticado por tentativa de entrada.
@@ -253,15 +266,22 @@ impl EntryPool {
                 Ok(stream) => {
                     let entry_id = entry.id().to_string();
                     *self.active.lock().unwrap() = Some(idx);
+                    *self.last_successful.lock().unwrap() = Some(entry_id.clone());
+                    *self.last_failover_attempts.lock().unwrap() = failures.len();
+                    *self.last_failures.lock().unwrap() = failures.clone();
                     tracing::info!(entry = %entry_id, guard = %guard_endpoint, "entrada de transporte estabelecida");
                     return Ok(EntryConnection { stream, entry_id });
                 }
                 Err(e) => {
                     tracing::warn!(entry = %entry.id(), error = %e, "entrada de transporte falhou; tentando próxima");
-                    failures.push(format!("{}: {e}", entry.id()));
+                    failures.push(format!("{}(TCP): {e}", entry.id()));
                 }
             }
         }
+
+        *self.last_successful.lock().unwrap() = None;
+        *self.last_failover_attempts.lock().unwrap() = failures.len();
+        *self.last_failures.lock().unwrap() = failures.clone();
 
         Err(VeilError::Circuit(format!(
             "fail-closed: todas as {} entradas de transporte inacessíveis — circuito abortado \
@@ -321,6 +341,9 @@ impl EntryPool {
             match tokio::time::timeout(self.handshake_timeout, handshake(stream)).await {
                 Ok(Ok(result)) => {
                     *self.active.lock().unwrap() = Some(idx);
+                    *self.last_successful.lock().unwrap() = Some(attempted_id.clone());
+                    *self.last_failover_attempts.lock().unwrap() = failures.len();
+                    *self.last_failures.lock().unwrap() = failures.clone();
                     tracing::info!(entry = %attempted_id, guard = %guard_endpoint, "entrada autenticada com o Guard");
                     return Ok((result, attempted_id));
                 }
@@ -336,12 +359,34 @@ impl EntryPool {
             }
         }
 
+        *self.last_successful.lock().unwrap() = None;
+        *self.last_failover_attempts.lock().unwrap() = failures.len();
+        *self.last_failures.lock().unwrap() = failures.clone();
+
         Err(VeilError::Circuit(format!(
             "fail-closed: todas as {} entradas falharam no TCP ou no handshake autenticado — \
              circuito abortado sem fallback direto ao destino (falhas: {})",
             self.entries.len(),
             failures.join("; ")
         )))
+    }
+
+    /// Identificador da entrada que autenticou com o Guard na última chamada
+    /// bem-sucedida (observabilidade: "bridge selecionada" no status).
+    pub fn last_successful_entry(&self) -> Option<String> {
+        self.last_successful.lock().unwrap().clone()
+    }
+
+    /// Quantas entradas falharam antes do sucesso na última chamada (ou o total
+    /// de falhas quando todas falharam). Observabilidade de failover.
+    pub fn last_failover_attempts(&self) -> usize {
+        *self.last_failover_attempts.lock().unwrap()
+    }
+
+    /// Motivos de falha por entrada/estágio da última chamada
+    /// (ex.: `"bridge-1 (handshake): ..."`). Vazio quando a primeira entrada vence.
+    pub fn last_failure_reasons(&self) -> Vec<String> {
+        self.last_failures.lock().unwrap().clone()
     }
 }
 

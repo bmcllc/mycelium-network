@@ -140,6 +140,16 @@ enum Commands {
         /// observa o IP da tradução, não este bind.
         #[arg(long = "veil-egress-bind")]
         veil_egress_bind: Option<std::net::IpAddr>,
+        /// Pontes de entrada VEIL (repetível, ex.: 127.0.0.1:9001). Quando presente,
+        /// o cliente usa somente bridges — NUNCA insere entrada direta ao Guard.
+        #[arg(long = "veil-bridge")]
+        veil_bridges: Vec<String>,
+        /// Endereço de escuta da bridge (papel bridge).
+        #[arg(long = "veil-bridge-listen")]
+        veil_bridge_listen: Option<String>,
+        /// Endereço do Guard para o qual a bridge repassa o fluxo cru (papel bridge).
+        #[arg(long = "veil-bridge-target")]
+        veil_bridge_target: Option<String>,
     },
     Status,
     Sow {
@@ -402,10 +412,10 @@ enum VeilCmd {
         /// Porta local SOCKS5 (default: 1080).
         #[arg(long, default_value_t = 1080)]
         port: u16,
-        /// Papel do nó: client, relay, exit, all.
+        /// Papel do nó: client, relay, exit, bridge, all.
         #[arg(long)]
         role: Option<String>,
-        /// Endereço de escuta para relay/exit.
+        /// Endereço de escuta para relay/exit/bridge.
         #[arg(long)]
         listen: Option<String>,
         /// Pinning de identidade de produção: "<nome>:<hex_identity_pubkey>" por salto.
@@ -423,6 +433,15 @@ enum VeilCmd {
         /// IP de origem explícito do egresso do Exit (multi-homing).
         #[arg(long)]
         egress_bind: Option<std::net::IpAddr>,
+        /// Pontes de entrada VEIL (repetível, ex.: 127.0.0.1:9001).
+        #[arg(long = "bridge")]
+        bridges: Vec<String>,
+        /// Endereço de escuta da bridge (papel bridge).
+        #[arg(long = "bridge-listen")]
+        bridge_listen: Option<String>,
+        /// Endereço do Guard para o qual a bridge repassa o fluxo cru (papel bridge).
+        #[arg(long = "bridge-target")]
+        bridge_target: Option<String>,
     },
     /// Encerra o serviço VEIL Ω e desliga o SOCKS5 proxy.
     Stop,
@@ -669,6 +688,9 @@ fn main() {
             veil_identity,
             veil_rotate_identity,
             veil_egress_bind,
+            veil_bridges,
+            veil_bridge_listen,
+            veil_bridge_target,
         } => {
             #[cfg(not(feature = "license"))]
             let _ = licensed_peers;
@@ -719,6 +741,9 @@ fn main() {
                 veil_identity,
                 veil_rotate_identity,
                 veil_egress_bind,
+                veil_bridges,
+                veil_bridge_listen,
+                veil_bridge_target,
             },
             upnp,
             ))
@@ -2360,6 +2385,10 @@ fn print_response(resp: Response) -> Result<(), String> {
             mac_address,
             kill_switch,
             active_layers,
+            entrada_ativa,
+            entradas,
+            tentativas_failover,
+            motivos_falha,
         } => {
             println!("[🛡️] Mycelium VEIL Ω");
             println!("    estado     : {}", if active { "ativo 🟢" } else { "inativo ⚪" });
@@ -2384,6 +2413,18 @@ fn print_response(resp: Response) -> Result<(), String> {
             println!("    kill_switch: {kill_switch}");
             println!("    camadas    : {active_layers}/7 ativas");
             println!("    tráfego    : {bytes_routed} bytes");
+            if let Some(ea) = entrada_ativa {
+                println!("    ponte ativa: {ea}");
+            }
+            if !entradas.is_empty() {
+                println!("    pontes     : {}", entradas.join(", "));
+            }
+            if tentativas_failover > 0 {
+                println!("    failovers  : {tentativas_failover}");
+            }
+            if !motivos_falha.is_empty() {
+                println!("    falhas     : {}", motivos_falha.join("; "));
+            }
             if let Some(d) = descriptor {
                 println!("    descritor  : (use 'mycelium veil descriptor' para ver completo)");
                 let _ = d; // silencia unused
@@ -2757,7 +2798,20 @@ async fn veil_cmd(home: &PathBuf, action: VeilCmd) -> Result<(), String> {
         VeilCmd::Status => {
             print_response(call(&sock, Request::VeilStatus).await?)
         }
-        VeilCmd::Start { mode, port, role, listen, trust, advertise, identity, rotate_identity, egress_bind } => {
+        VeilCmd::Start {
+            mode,
+            port,
+            role,
+            listen,
+            trust,
+            advertise,
+            identity,
+            rotate_identity,
+            egress_bind,
+            bridges,
+            bridge_listen,
+            bridge_target,
+        } => {
             print_response(call(&sock, Request::VeilStart {
                 mode: Some(mode),
                 socks5_port: Some(port),
@@ -2768,6 +2822,9 @@ async fn veil_cmd(home: &PathBuf, action: VeilCmd) -> Result<(), String> {
                 identity: identity.map(|p| p.display().to_string()),
                 rotate_identity,
                 egress_bind: egress_bind.map(|ip| ip.to_string()),
+                bridges,
+                bridge_listen,
+                bridge_target,
             }).await?)
         }
         VeilCmd::Stop => {

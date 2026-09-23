@@ -82,6 +82,14 @@ pub struct DaemonOptions {
     /// IP de origem explícito para o egresso do Exit (hosts multi-homing).
     /// Sob NAT, o destino observa o IP da tradução, não este bind.
     pub veil_egress_bind: Option<std::net::IpAddr>,
+    /// Pontes de entrada VEIL (repetível, ex.: `127.0.0.1:9001`). Quando presente,
+    /// o cliente constrói um [`EntryPool`] somente-bridges e NUNCA insere entrada
+    /// direta ao Guard implicitamente.
+    pub veil_bridges: Vec<String>,
+    /// Endereço de escuta da bridge (papel `bridge`).
+    pub veil_bridge_listen: Option<String>,
+    /// Endereço do Guard para o qual a bridge repassa o fluxo cru (papel `bridge`).
+    pub veil_bridge_target: Option<String>,
 }
 
 impl Default for DaemonOptions {
@@ -120,6 +128,9 @@ impl Default for DaemonOptions {
             veil_identity: None,
             veil_rotate_identity: false,
             veil_egress_bind: None,
+            veil_bridges: Vec::new(),
+            veil_bridge_listen: None,
+            veil_bridge_target: None,
         }
     }
 }
@@ -164,6 +175,9 @@ pub async fn run_daemon(home: PathBuf, opts: DaemonOptions) -> Result<(), Organi
         veil_identity_path: opts.veil_identity,
         veil_rotate_identity: opts.veil_rotate_identity,
         veil_egress_bind: opts.veil_egress_bind,
+        veil_bridges: opts.veil_bridges,
+        veil_bridge_listen: opts.veil_bridge_listen,
+        veil_bridge_target: opts.veil_bridge_target,
     })?;
     let sock = organism.home().join("mycelium.sock");
     let mut token = std::env::var("MYCELIUM_CONTROL_TOKEN")

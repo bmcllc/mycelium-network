@@ -176,6 +176,9 @@ mod veil_tests {
                 identity: None,
                 rotate_identity: false,
                 egress_bind: None,
+                bridges: vec![],
+                bridge_listen: None,
+                bridge_target: None,
             },
         )
         .await

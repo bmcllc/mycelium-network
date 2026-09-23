@@ -116,6 +116,14 @@ pub struct OrganismConfig {
     /// IP de origem explícito para o egresso do Exit (hosts multi-homing).
     /// Sob NAT, o destino observa o IP da tradução, não este bind.
     pub veil_egress_bind: Option<std::net::IpAddr>,
+    /// Pontes de entrada VEIL (repetível, ex.: `127.0.0.1:9001`). Quando presente,
+    /// o cliente constrói um [`EntryPool`] somente-bridges e NUNCA insere entrada
+    /// direta ao Guard implicitamente.
+    pub veil_bridges: Vec<String>,
+    /// Endereço de escuta da bridge (papel `bridge`).
+    pub veil_bridge_listen: Option<String>,
+    /// Endereço do Guard para o qual a bridge repassa o fluxo cru (papel `bridge`).
+    pub veil_bridge_target: Option<String>,
 }
 
 pub struct Organism {
@@ -150,6 +158,7 @@ pub struct Organism {
     physarum: PhysarumNetwork,
     physarum_phase: MyceliumPhase,
     enable_nostr_transport: bool,
+    #[allow(dead_code)]
     nostr_relay: String,
     #[cfg(feature = "nostr-transport")]
     nostr_dialed: HashMap<String, std::time::Instant>,
@@ -189,11 +198,40 @@ pub struct Organism {
     #[cfg(feature = "veil")]
     veil_egress_bind: Option<std::net::IpAddr>,
     #[cfg(feature = "veil")]
+    veil_bridges: Vec<String>,
+    #[cfg(feature = "veil")]
+    veil_bridge_listen: Option<String>,
+    #[cfg(feature = "veil")]
+    veil_bridge_target: Option<String>,
+    #[cfg(feature = "veil")]
     veil_local_descriptor: Option<String>,
     #[cfg(feature = "veil")]
     veil_enabled: bool,
     #[cfg(feature = "veil")]
     veil_router_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Handles das bridges de entrada ativas (P1.3.2). No papel `bridge`, cada
+    /// elemento corresponde a um [`BridgeHandle`] de um relay de bridge em execução;
+    /// o drop drena e encerra todos.
+    #[cfg(feature = "veil")]
+    veil_bridge_handles: Vec<mycelium_veil::bridge::BridgeHandle>,
+    /// Pool de entradas somente-bridges do modo client (P1.3.2). Nunca contém
+    /// entrada direta ao Guard. `None` = cliente com origens diretas (legado).
+    #[cfg(feature = "veil")]
+    veil_entry_pool: Option<mycelium_veil::bridge::EntryPool>,
+    /// Id da bridge que autenticou com o Guard na última chamada bem-sucedida
+    /// (observabilidade do status; vazio se nenhuma entrou ainda).
+    #[cfg(feature = "veil")]
+    veil_active_entry: Option<String>,
+    /// Ids registradas no pool de entradas (somente bridges) do modo client.
+    #[cfg(feature = "veil")]
+    veil_registered_entries: Vec<String>,
+    /// Quantas entradas falharam antes do sucesso (ou até esgotar) na última
+    /// inicialização do circuito (observabilidade do failover).
+    #[cfg(feature = "veil")]
+    veil_failover_attempts: usize,
+    /// Motivos de falha por entrada/estágio da última inicialização do circuito.
+    #[cfg(feature = "veil")]
+    veil_failure_reasons: Vec<String>,
     ion_hosts: HashMap<String, String>,
     catalog: std::sync::Arc<std::sync::Mutex<mycelium_store::StoreCatalog>>,
     home: PathBuf,
@@ -370,6 +408,7 @@ impl Organism {
             enable_nostr_transport,
             nostr_home: Some(config.home.clone()),
             nostr_relay: config.nostr_relay.clone(),
+            blocked_peers: Vec::new(),
             #[cfg(feature = "license")]
             licensed_peers: config.licensed_peers.as_ref().map(|pids| {
                 pids.iter()
@@ -501,11 +540,29 @@ impl Organism {
             #[cfg(feature = "veil")]
             veil_egress_bind: config.veil_egress_bind,
             #[cfg(feature = "veil")]
+            veil_bridges: config.veil_bridges,
+            #[cfg(feature = "veil")]
+            veil_bridge_listen: config.veil_bridge_listen,
+            #[cfg(feature = "veil")]
+            veil_bridge_target: config.veil_bridge_target,
+            #[cfg(feature = "veil")]
             veil_local_descriptor: None,
             #[cfg(feature = "veil")]
             veil_enabled: config.veil_enabled,
             #[cfg(feature = "veil")]
             veil_router_handles: Vec::new(),
+            #[cfg(feature = "veil")]
+            veil_bridge_handles: Vec::new(),
+            #[cfg(feature = "veil")]
+            veil_entry_pool: None,
+            #[cfg(feature = "veil")]
+            veil_active_entry: None,
+            #[cfg(feature = "veil")]
+            veil_registered_entries: Vec::new(),
+            #[cfg(feature = "veil")]
+            veil_failover_attempts: 0,
+            #[cfg(feature = "veil")]
+            veil_failure_reasons: Vec::new(),
             ion_hosts: HashMap::new(),
             catalog: std::sync::Arc::new(std::sync::Mutex::new(catalog)),
             home: config.home.clone(),
@@ -2554,6 +2611,31 @@ impl Organism {
                 }
                 Ok(actual_addr)
             }
+            "bridge" => {
+                // Expect exactly one bridge address (listen) and a target Guard.
+                // O operador deve informar `--veil-bridge <listen>` (repetível) e
+                // `--veil-bridge-target <guard>` (endereço Guard). Opcional: `--veil-bridge-listen`
+                // para sobrescrever o endereço de escuta se desejar. Por enquanto usamos
+                // o primeiro bridge da lista.
+                let listen_addr_str = match self.veil_bridge_listen.as_ref().or_else(|| self.veil_bridges.get(0)) {
+                    Some(l) => l.clone(),
+                    None => return Err(OrganismError::Msg("Modo bridge requer ao menos um endereço de escuta via --veil-bridge ou --veil-bridge-listen".into())),
+                };
+                let listen_addr: std::net::SocketAddr = listen_addr_str.parse().map_err(|e| OrganismError::Msg(format!("listen bridge inválido: {e}")))?;
+                let target = match &self.veil_bridge_target {
+                    Some(t) => t.clone(),
+                    None => return Err(OrganismError::Msg("Modo bridge requer --veil-bridge-target <guard>".into())),
+                };
+                let target_addr: std::net::SocketAddr = target.parse().map_err(|e| OrganismError::Msg(format!("target bridge inválido: {e}")))?;
+                // Convert VeilError to OrganismError for proper ? propagation
+                let handle = mycelium_veil::BridgeRelay::spawn(listen_addr, target_addr).await
+                    .map_err(|e| OrganismError::Msg(e.to_string()))?;
+                let actual = handle.listen_addr();
+                self.veil_listen = Some(actual);
+                self.veil_bridge_handles.push(handle);
+                self.veil_enabled = true;
+                Ok(actual)
+            },
             "exit" => {
                 let listen_addr = self.veil_listen.unwrap_or_else(|| {
                     "0.0.0.0:9051".parse().expect("valid exit listen addr")
@@ -2631,7 +2713,22 @@ impl Organism {
 
                 // Modo produção: se houver pinning de identidade configurado, o cliente exige
                 // que cada salto apresente exatamente a identidade fixada (anti-substituição).
-                let circuit_client = if !self.veil_trust.is_empty() {
+                // Se bridges configuradas, usamos EntryPool (modo Test) sem pinning.
+                let circuit_client = if !self.veil_bridges.is_empty() {
+                    // Constrói pool de bridges
+                    let mut pool = mycelium_veil::bridge::EntryPool::new();
+                    for (i, bridge_addr) in self.veil_bridges.iter().enumerate() {
+                        let addr: std::net::SocketAddr = bridge_addr.parse().map_err(|e| OrganismError::Msg(format!("bridge address inválido: {e}")))?;
+                        let entry = mycelium_veil::BridgeEntry::new(format!("bridge-{}", i + 1), addr);
+                        pool.push(std::sync::Arc::new(entry));
+                    }
+                    self.veil_registered_entries = pool.entries().iter().map(|e| e.id().to_string()).collect();
+                    let client = LiveCircuitClient::connect_via_entries(101, hops, &pool)
+                        .await
+                        .map_err(|e| OrganismError::Msg(format!("Falha no handshake Veil (via bridges): {e}")))?;
+                    self.veil_entry_pool = Some(pool);
+                    Arc::new(client)
+                } else if !self.veil_trust.is_empty() {
                     if self.veil_trust.len() != parsed_descriptors.len() {
                         return Err(OrganismError::Msg(format!(
                             "Modo produção (--veil-trust) exige uma identidade por salto: {} saltos, {} pins",
@@ -2671,7 +2768,15 @@ impl Organism {
                     )
                 };
 
+                // Atualiza observabilidade após tentativa de handshake via pool (se houver)
+                if let Some(pool) = &self.veil_entry_pool {
+                    self.veil_active_entry = pool.last_successful_entry();
+                    self.veil_failover_attempts = pool.last_failover_attempts();
+                    self.veil_failure_reasons = pool.last_failure_reasons();
+                }
+
                 let server = Socks5Server::new(socks_addr);
+                // Remove duplicated bind call
                 let listener = server
                     .bind()
                     .await
@@ -2826,6 +2931,7 @@ impl Organism {
         for handle in self.veil_router_handles.drain(..) {
             handle.abort();
         }
+        self.veil_bridge_handles.clear();
         if let Some(engine) = self.veil_engine.take() {
             engine.stop_session();
         }
@@ -3705,7 +3811,7 @@ impl Organism {
                     Err(e) => Response::Err { message: format!("invoice BOLT11 parse: {e}") },
                 }
             }
-            Request::VeilStart { mode, socks5_port, role, listen, trust, advertise, identity, rotate_identity, egress_bind } => {
+            Request::VeilStart { mode, socks5_port, role, listen, trust, advertise, identity, rotate_identity, egress_bind, bridges, bridge_listen, bridge_target } => {
                 #[cfg(feature = "veil")]
                 {
                     if let Some(port) = socks5_port {
@@ -3742,6 +3848,16 @@ impl Organism {
                             }
                         }
                     }
+                    // Bridge configuration (role == "bridge")
+                    if !bridges.is_empty() {
+                        self.veil_bridges = bridges;
+                    }
+                    if let Some(bl) = bridge_listen {
+                        self.veil_bridge_listen = Some(bl);
+                    }
+                    if let Some(bt) = bridge_target {
+                        self.veil_bridge_target = Some(bt);
+                    }
                     match self.start_veil_service().await {
                         Ok(bound) => Response::Ok {
                             message: format!("VEIL Ω iniciado: escutando em {bound}"),
@@ -3753,7 +3869,7 @@ impl Organism {
                 }
                 #[cfg(not(feature = "veil"))]
                 {
-                    let _ = (mode, socks5_port, role, listen, trust, advertise, identity, rotate_identity, egress_bind);
+                    let _ = (mode, socks5_port, role, listen, trust, advertise, identity, rotate_identity, egress_bind, bridges, bridge_listen, bridge_target);
                     Response::Err {
                         message: "recompile mycelium-node com --features veil".into(),
                     }
@@ -3850,6 +3966,10 @@ impl Organism {
                         mac_address,
                         kill_switch,
                         active_layers,
+                        entrada_ativa: self.veil_active_entry.clone(),
+                        entradas: self.veil_registered_entries.clone(),
+                        tentativas_failover: self.veil_failover_attempts,
+                        motivos_falha: self.veil_failure_reasons.clone(),
                     }
                 }
                 #[cfg(not(feature = "veil"))]

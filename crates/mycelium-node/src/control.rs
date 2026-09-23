@@ -261,6 +261,16 @@ pub enum Request {
         /// observa o IP da tradução, não este bind.
         #[serde(default)]
         egress_bind: Option<String>,
+        /// Pontes de entrada VEIL (repetível, ex.: `127.0.0.1:9001`). Quando presente,
+        /// o cliente usa somente bridges — NUNCA insere entrada direta ao Guard.
+        #[serde(default)]
+        bridges: Vec<String>,
+        /// Endereço de escuta da bridge (papel `bridge`).
+        #[serde(default)]
+        bridge_listen: Option<String>,
+        /// Endereço do Guard para o qual a bridge repassa o fluxo cru (papel `bridge`).
+        #[serde(default)]
+        bridge_target: Option<String>,
     },
     /// Encerra o serviço VEIL Ω.
     VeilStop,
@@ -338,6 +348,18 @@ pub enum Response {
         mac_address: Option<String>,
         kill_switch: String,
         active_layers: usize,
+        /// Entrada de transporte que autenticou com o Guard (id da bridge selecionada).
+        #[serde(default)]
+        entrada_ativa: Option<String>,
+        /// Entradas registradas no pool (somente bridges no modo somente-bridges).
+        #[serde(default)]
+        entradas: Vec<String>,
+        /// Quantas entradas falharam antes do sucesso (failover) na inicialização do circuito.
+        #[serde(default)]
+        tentativas_failover: usize,
+        /// Motivos de falha por entrada/estágio da última inicialização do circuito.
+        #[serde(default)]
+        motivos_falha: Vec<String>,
     },
 }
 

@@ -265,3 +265,29 @@ recall do nó 3 **baixou o plot via rede**; **5 layers recuperadas via DHT** por
 **2 spore prints absorvidos** fora do nó editor; `mycelium_overlay_routes=1` e 4 eventos
 `get_closest_peers` (rótulo passou). O caminho DHT-direto domina em malha totalmente conectada;
 o forwarding multi-salto do `LayerNeed` é exercitado quando o DHT-direto não alcança (rede reduzida).
+
+---
+
+## Concluído nesta sessão (Plano de Integração Integral — P1.3.2, Malha Nativa e Serviços Comunitários)
+Executada a sequência de entregas imediatas sob a regra de soberania (operação nativa sem internet convencional, sem carteira cripto, sem gateway público e sem circuito VEIL obrigatório):
+
+1. **Entrega 1: Reconciliação do Scaffold P1.3.2 sobre `407582f`**
+   - Scaffold prévio inventariado no artefato `entrega_1_inventario_scaffold.md` e em patch `/tmp/scaffold_407582f.patch`.
+   - Reconciliação de flags em `DaemonOptions`, `Request::VeilStart` e `Response::VeilStatusResult`.
+   - Compilação limpa do workspace com e sem a feature `veil` (0 erros, 0 warnings).
+
+2. **Entrega 2: VEIL P1.3.2 (Bridges, Ciclo de Vida e Observabilidade)**
+   - Flags `--veil-bridge`, `--veil-bridge-listen`, `--veil-bridge-target` no CLI e daemon.
+   - `EntryPool` conectado à operação de circuitos de produção do daemon com telemetria em tempo real (`entrada_ativa`, `entradas`, `tentativas_failover`, `motivos_falha`).
+   - Papel dedicado `bridge` (`BridgeRelay`) com encerramento limpo via `Request::VeilStop`.
+   - 4 testes de aceitação automatizados em `tests/veil_p1_3_2_acceptance.rs` (**4/4 verdes**): conexão única, failover transparente, fail-closed anti-leak estrito e lifecycle de bridge. Homologação WAN mantida em status trial local.
+
+3. **Entrega 3: Malha Independente A-B-C sem Internet Convencional**
+   - Implementado suporte a `blocked_peers` em `HyphaeConfig` e `HyphaeNode` para isolamento de enlaces diretos.
+   - Teste de aceitação `tests/multihop_topology_acceptance.rs` (**verde**): nós A e C sem conexão direta física/lógica; B atua como roteador/anastomose; tráfego Gossipsub (Lattice) chega com integridade comprovada; queda de B interrompe o fluxo.
+
+4. **Entrega 4: Primeiro Serviço Comunitário Nativo**
+   - Teste de aceitação `tests/community_service_survival_acceptance.rs` (**verde**): Nó 1 semeia serviço público no Spore Bank; Nó 2 absorve via Lattice Gossipsub; Nó 1 é desligado completamente (offline); Nó 2 atende à solicitação `RecallCode` e materializa os arquivos de forma 100% íntegra (verificação byte a byte).
+
+**Documentação Técnica:** gerado `docs/INTEGRACAO_INTEGRAL_P1_3_2.md`.
+

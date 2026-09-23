@@ -1046,6 +1046,22 @@ impl LiveCircuitClient {
         Self::connect_internal(circuit_id, hops, DeploymentMode::Production, trusted, Some(entries)).await
     }
 
+    /// Estabelece circuito em modo `Test` usando o [`EntryPool`] como transporte de
+    /// entrada (P1.3.2).
+    ///
+    /// Analogamente a [`LiveCircuitClient::connect_production_via_entries`], porém em modo
+    /// **Test** (TOFU) — sem exigência de pinning de identidade. Usado pelos testes de
+    /// aceitação do daemon para exercitar o failover de bridges sem `--veil-trust`;
+    /// o pool continua **somente-bridges** (nunca insere entrada direta ao Guard) e
+    /// falha fechado se todas as entradas estiverem inacessíveis.
+    pub async fn connect_via_entries(
+        circuit_id: u32,
+        hops: Vec<CircuitHopNode>,
+        entries: &EntryPool,
+    ) -> Result<Self, VeilError> {
+        Self::connect_internal(circuit_id, hops, DeploymentMode::Test, &[], Some(entries)).await
+    }
+
     async fn connect_internal(
         circuit_id: u32,
         hops: Vec<CircuitHopNode>,
