@@ -50,6 +50,20 @@ pub struct DaemonOptions {
     /// `None` = auto (folha/floresta); `Some` = forçar on/off.
     pub nostr_transport: Option<bool>,
     pub nostr_relay: Option<String>,
+    /// Endpoint HTTP local compatível com Ethereum JSON-RPC (ex.: 127.0.0.1:8545).
+    pub rpc_gateway_addr: Option<std::net::SocketAddr>,
+    /// Upstream de um Base node local quando este nó atua como provider.
+    pub rpc_provider_upstream: Option<String>,
+    /// NodeId do provider explícito usado pelo gateway (P1/P2; discovery automático vem no P3).
+    pub rpc_target_node: Option<String>,
+    /// Chave pública ML-KEM-1024 hex do provider explícito.
+    pub rpc_target_kem: Option<String>,
+    /// Chain ID aceito pelo serviço RPC.
+    pub rpc_chain_id: u64,
+    /// Permite eth_sendRawTransaction/eth_sendTransaction. False por padrão.
+    pub rpc_allow_write: bool,
+    /// TTL máximo de cada chamada RPC em milissegundos.
+    pub rpc_ttl_ms: u64,
     /// Allowlist de peers licenciados (VOID-00); ativa o gate de admissão
     /// licenciada. Req. feature `license`.
     #[cfg(feature = "license")]
@@ -114,6 +128,13 @@ impl Default for DaemonOptions {
             webrtc_port: 4002,
             nostr_transport: None,
             nostr_relay: None,
+            rpc_gateway_addr: None,
+            rpc_provider_upstream: None,
+            rpc_target_node: None,
+            rpc_target_kem: None,
+            rpc_chain_id: mycelium_rpc::BASE_MAINNET_CHAIN_ID,
+            rpc_allow_write: false,
+            rpc_ttl_ms: mycelium_rpc::DEFAULT_RPC_TTL_MS,
             #[cfg(feature = "license")]
             licensed_peers: None,
             veil_enabled: false,
@@ -140,6 +161,8 @@ impl Default for DaemonOptions {
 pub async fn run_daemon(home: PathBuf, opts: DaemonOptions) -> Result<(), OrganismError> {
     let sporocarp = opts.sporocarp;
     let enable_relay = opts.enable_relay || sporocarp;
+    let rpc_gateway_addr = opts.rpc_gateway_addr;
+    let rpc_ttl_ms = opts.rpc_ttl_ms;
 
     let organism = Organism::awaken(OrganismConfig {
         home: home.clone(),
@@ -161,6 +184,13 @@ pub async fn run_daemon(home: PathBuf, opts: DaemonOptions) -> Result<(), Organi
         webrtc_port: opts.webrtc_port,
         nostr_transport: opts.nostr_transport,
         nostr_relay: opts.nostr_relay,
+        rpc_gateway_addr: opts.rpc_gateway_addr,
+        rpc_provider_upstream: opts.rpc_provider_upstream,
+        rpc_target_node: opts.rpc_target_node,
+        rpc_target_kem: opts.rpc_target_kem,
+        rpc_chain_id: opts.rpc_chain_id,
+        rpc_allow_write: opts.rpc_allow_write,
+        rpc_ttl_ms: opts.rpc_ttl_ms,
         #[cfg(feature = "license")]
         licensed_peers: opts.licensed_peers,
         veil_enabled: opts.veil_enabled,
@@ -221,6 +251,19 @@ pub async fn run_daemon(home: PathBuf, opts: DaemonOptions) -> Result<(), Organi
         });
     }
     let (tx, rx) = mpsc::channel(32);
+    let (rpc_tx, rpc_rx) = mpsc::channel(64);
+    // Mantém o canal vivo mesmo quando não há gateway HTTP configurado.
+    let _rpc_tx_guard = rpc_tx.clone();
+
+    let _rpc_gateway_handle = if let Some(bind) = rpc_gateway_addr {
+        let handle = rpc_gateway::serve_rpc_gateway(bind, rpc_tx, rpc_ttl_ms)
+            .await
+            .map_err(OrganismError::Msg)?;
+        tracing::info!(bind = %handle.bind, "Mycelium Base RPC gateway ativo");
+        Some(handle)
+    } else {
+        None
+    };
 
     let serve_sock = sock.clone();
     tokio::spawn(async move {
@@ -231,5 +274,5 @@ pub async fn run_daemon(home: PathBuf, opts: DaemonOptions) -> Result<(), Organi
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    organism.run(rx).await
+    organism.run(rx, rpc_rx).await
 }
