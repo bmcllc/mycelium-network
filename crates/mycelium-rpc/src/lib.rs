@@ -404,7 +404,7 @@ pub fn seal_request(
         RpcEncryptedRequest {
             request_id: request.request_id,
             provider,
-            kem_ciphertext: enc.ciphertext,
+            kem_ciphertext: enc.ciphertext.clone(),
             nonce,
             ciphertext,
         },
