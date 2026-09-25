@@ -6,6 +6,7 @@ pub const MAX_LAYER_NEED_HOPS: u8 = 4;
 
 use crate::control::{ControlMsg, Request, Response, StatusReport};
 use crate::protocol::Envelope;
+use crate::rpc_gateway::{load_or_create_rpc_identity, now_ms, RpcGatewayMsg};
 use crate::store::{IonRecord, NodeStore, OrganismState, StoreError};
 use giggs::{Leaf, Plot, RefStore, RefUpdate, SignedRefUpdate};
 use inertia::{
@@ -19,6 +20,11 @@ use mycelium_hyphae::{
     MAILBOX_DHT_PREFIX, RELAY_DHT_PREFIX,
 };
 use mycelium_nutrients::Ledger;
+use mycelium_rpc::{
+    json_rpc_error, open_request, open_response, seal_request, seal_response, LocalBaseProvider,
+    RpcEncryptedRequest, RpcEncryptedResponse, RpcKemIdentity, RpcMeshRequest, RpcMeshResponse,
+    RpcPolicy, DEFAULT_MAX_RPC_BODY_BYTES,
+};
 use mycelium_pheromones::{Gland, Trail};
 use mycelium_sporebank::{
     content_id_from_layer_dht_key, dht_key, layer_dht_key, SporeBank,
@@ -31,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thefield::{Proposal, SignalState};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use vacuum::{
     Chamber, ChamberProcess, FruitOptions, Isolation, LayerArchive, LayerStore, Void,
 };
@@ -90,6 +96,13 @@ pub struct OrganismConfig {
     /// `None` = auto (folha/floresta); `Some(true/false)` = forçar.
     pub nostr_transport: Option<bool>,
     pub nostr_relay: Option<String>,
+    pub rpc_gateway_addr: Option<std::net::SocketAddr>,
+    pub rpc_provider_upstream: Option<String>,
+    pub rpc_target_node: Option<String>,
+    pub rpc_target_kem: Option<String>,
+    pub rpc_chain_id: u64,
+    pub rpc_allow_write: bool,
+    pub rpc_ttl_ms: u64,
     /// Allowlist de peers licenciados (VOID-00). Se `Some`, o gate de admissão
     /// licenciada é ativado: apenas estes PeerIds se conectam. Req. feature `license`.
     #[cfg(feature = "license")]
@@ -169,6 +182,14 @@ pub struct Organism {
     known_zones_ts: HashMap<NodeId, u64>,
     /// Quantas vezes resolveu rota DHT (`ClosestPeers`) no overlay de zonas.
     routing_hits: u64,
+    /// Configuração e estado do Mycelium Base RPC.
+    rpc_gateway_addr: Option<std::net::SocketAddr>,
+    rpc_provider: Option<LocalBaseProvider>,
+    rpc_provider_kem: Option<RpcKemIdentity>,
+    rpc_target: Option<RpcTarget>,
+    rpc_policy: RpcPolicy,
+    rpc_pending: HashMap<[u8; 32], PendingRpc>,
+    rpc_seen: HashSet<[u8; 32]>,
     #[cfg(feature = "veil")]
     veil_engine: Option<std::sync::Arc<mycelium_veil::VeilEngine>>,
     #[cfg(feature = "veil")]
@@ -262,6 +283,31 @@ pub struct Organism {
     known_repos: HashMap<String, (String, String, String, NodeId)>,
     /// Migrações aceitas pendentes de IonMigrate (autenticação de fluxo).
     pending_accepted_migrations: HashSet<String>,
+}
+
+struct RpcTarget {
+    node: NodeId,
+    kem_public_key: Vec<u8>,
+}
+
+struct PendingRpc {
+    provider: NodeId,
+    deadline_ms: u64,
+    response_identity: RpcKemIdentity,
+    reply: oneshot::Sender<Result<Vec<u8>, String>>,
+}
+
+struct RpcProviderResult {
+    target: NodeId,
+    packet: RpcEncryptedResponse,
+}
+
+fn envelope_is_live_rpc(env: &Envelope) -> bool {
+    match env {
+        Envelope::RpcRequest { .. } | Envelope::RpcResponse { .. } => true,
+        Envelope::Direct { inner, .. } => envelope_is_live_rpc(inner),
+        _ => false,
+    }
 }
 
 fn ensure_repo_publishable(plot: &Plot) -> Result<(), OrganismError> {
@@ -475,6 +521,54 @@ impl Organism {
         let assets = crate::assets::AssetRegistry::open(&config.home)
             .map_err(|e| OrganismError::Msg(e.to_string()))?;
         let ghost = ghost_for_node(gland.seed());
+
+        let rpc_policy = RpcPolicy {
+            chain_id: config.rpc_chain_id,
+            allow_write: config.rpc_allow_write,
+            allow_unsafe: false,
+            ttl_ms: config.rpc_ttl_ms.max(250),
+            max_body_bytes: DEFAULT_MAX_RPC_BODY_BYTES,
+        };
+        let rpc_provider = match config.rpc_provider_upstream.as_ref() {
+            Some(upstream) => Some(
+                LocalBaseProvider::new(upstream.clone(), rpc_policy.clone())
+                    .map_err(|e| OrganismError::Msg(format!("rpc-provider: {e}")))?,
+            ),
+            None => None,
+        };
+        let rpc_provider_kem = if rpc_provider.is_some() {
+            Some(
+                load_or_create_rpc_identity(&config.home.join("rpc-kem.key"))
+                    .map_err(OrganismError::Msg)?,
+            )
+        } else {
+            None
+        };
+        let rpc_target = match (&config.rpc_target_node, &config.rpc_target_kem) {
+            (Some(node), Some(kem_hex)) => {
+                let node = node
+                    .parse::<NodeId>()
+                    .map_err(|e| OrganismError::Msg(format!("rpc-provider-node inválido: {e}")))?;
+                let kem_public_key = hex::decode(kem_hex)
+                    .map_err(|e| OrganismError::Msg(format!("rpc-provider-kem inválida: {e}")))?;
+                Some(RpcTarget {
+                    node,
+                    kem_public_key,
+                })
+            }
+            (None, None) => None,
+            _ => {
+                return Err(OrganismError::Msg(
+                    "rpc gateway exige --rpc-provider-node e --rpc-provider-kem juntos".into(),
+                ))
+            }
+        };
+        if config.rpc_gateway_addr.is_some() && rpc_target.is_none() {
+            return Err(OrganismError::Msg(
+                "--rpc-gateway exige provider explícito no P1/P2: --rpc-provider-node + --rpc-provider-kem".into(),
+            ));
+        }
+
         let mut org = Self {
             store,
             gland,
@@ -512,6 +606,13 @@ impl Organism {
             known_zones: HashMap::new(),
             known_zones_ts: HashMap::new(),
             routing_hits: 0,
+            rpc_gateway_addr: config.rpc_gateway_addr,
+            rpc_provider,
+            rpc_provider_kem,
+            rpc_target,
+            rpc_policy,
+            rpc_pending: HashMap::new(),
+            rpc_seen: HashSet::new(),
             #[cfg(feature = "veil")]
             veil_engine: None,
             #[cfg(feature = "veil")]
