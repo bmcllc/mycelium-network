@@ -215,3 +215,114 @@ Somente após P0-P4:
 ## Estado desta branch
 
 Este corte implementa apenas P0. Não declarar a malha RPC operacional até P1-P3 estarem integrados e testados em pelo menos dois hosts reais.
+
+
+## P1/P2 experimental — gateway LIVE implementado
+
+A branch `feature/mycelium-base-rpc-pqc` agora contém o primeiro caminho ponta a ponta:
+
+1. `127.0.0.1:8545` recebe JSON-RPC HTTP.
+2. O gateway valida a policy local e cria `RpcMeshRequest` com TTL.
+3. O corpo é cifrado ponta a ponta para o provider com ML-KEM-1024 + ChaCha20-Poly1305.
+4. O envelope segue por unicast Mycelium usando `forward_dtn_now`.
+5. Nenhum nó — origem ou intermediário — persiste RPC para entrega tardia.
+6. O provider decifra, aplica novamente a policy e consulta seu Base node local.
+7. A resposta é cifrada para uma chave ML-KEM efêmera exclusiva daquele pedido.
+8. O gateway entrega o JSON-RPC original ao cliente local.
+
+O P1/P2 ainda usa provider explícito. Discovery/quorum automático pertence ao P3.
+
+### Provider
+
+O Base node deve expor RPC apenas localmente, por exemplo em `127.0.0.1:9545`.
+
+```bash
+mycelium --home /tmp/rpc-provider daemon \
+  --listen /ip4/0.0.0.0/tcp/4001 \
+  --rpc-provider http://127.0.0.1:9545 \
+  --rpc-chain-id 8453
+```
+
+Depois:
+
+```bash
+mycelium --home /tmp/rpc-provider status
+```
+
+Copie do status:
+
+- `NodeId`
+- `PeerId` / endereço de bootstrap
+- `rpc_kem_pub`
+
+A chave `rpc_kem_pub` é pública. A chave privada fica em `{home}/rpc-kem.key` e, em Unix, é criada com modo 0600.
+
+### Cliente/gateway
+
+```bash
+mycelium --home /tmp/rpc-client daemon \
+  --bootstrap /ip4/IP_DO_PROVIDER/tcp/4001/p2p/PEERID_DO_PROVIDER \
+  --rpc-gateway 127.0.0.1:8545 \
+  --rpc-provider-node NODEID_DO_PROVIDER \
+  --rpc-provider-kem RPC_KEM_PUB_HEX \
+  --rpc-chain-id 8453 \
+  --rpc-ttl-ms 3000
+```
+
+Teste:
+
+```bash
+curl -sS \
+  -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' \
+  http://127.0.0.1:8545
+```
+
+Esperado para Base Mainnet:
+
+```json
+{"jsonrpc":"2.0","id":1,"result":"0x2105"}
+```
+
+Depois:
+
+```bash
+export BASE_RPC_URL=http://127.0.0.1:8545
+```
+
+e o S1 pode usar o gateway como um endpoint Ethereum normal.
+
+### Escrita permanece opt-in
+
+Sem flag adicional, `eth_sendRawTransaction` e `eth_sendTransaction` são recusados.
+
+Somente depois da homologação de leitura:
+
+```bash
+--rpc-allow-write
+```
+
+A chave privada EVM continua no S1. O Mycelium transporta somente a transação já assinada.
+
+### Gates antes de promover P1/P2
+
+```bash
+cargo fmt --all --check
+cargo test -p mycelium-rpc --locked
+cargo test -p mycelium-node --locked
+cargo clippy -p mycelium-rpc -p mycelium-node --all-targets -- -D warnings
+cargo build --workspace --locked
+```
+
+Também é obrigatório um teste com dois homes/processos reais, comprovando:
+
+- `eth_chainId` ponta a ponta;
+- adulteração AEAD rejeitada;
+- provider offline retorna erro/timeout e não cria bundle persistente;
+- resposta após TTL é descartada;
+- método de escrita é negado sem `--rpc-allow-write`;
+- `BASE_RPC_URL=http://127.0.0.1:8545` funciona no S1.
+
+### Limite de segurança atual
+
+A confidencialidade do payload RPC é pós-quântica via ML-KEM-1024. A autenticação global da identidade do nó ainda depende parcialmente de Ed25519/PeerBinding. Portanto P1/P2 **não** deve ser descrito como identidade 100% pós-quântica até P4 (Ed25519 + ML-DSA-87).
