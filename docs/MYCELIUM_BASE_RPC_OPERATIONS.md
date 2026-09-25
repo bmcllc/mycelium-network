@@ -214,3 +214,57 @@ bash scripts/check-rpc-pr.sh
 ```
 
 Se o filesystem do target tiver menos de 10 GiB livres, o script falha antes do build. Defina `CARGO_TARGET_DIR` para um volume com espaço suficiente.
+
+
+## Modo final — operação mainnet
+
+O launcher operacional é:
+
+```bash
+scripts/rpc-mainnet.sh provider
+scripts/rpc-mainnet.sh gateway
+```
+
+Sem variável de armamento, ambos sobem em modo read-only.
+
+### Provider
+
+```bash
+export MYCELIUM_BIN=/caminho/para/mycelium
+export BASE_UPSTREAM_RPC=http://127.0.0.1:9545
+export MYCELIUM_PROVIDER_HOME=/var/lib/mycelium-base-provider
+
+scripts/rpc-mainnet.sh provider
+```
+
+Depois obtenha do `mycelium status` o NodeId, PeerId/bootstrap e `rpc_kem_pub`.
+
+### Gateway
+
+```bash
+export MYCELIUM_BIN=/caminho/para/mycelium
+export MYCELIUM_BOOTSTRAP='/ip4/IP/tcp/4101/p2p/PEER_ID'
+export MYCELIUM_PROVIDER_NODE='NODE_ID'
+export MYCELIUM_PROVIDER_KEM='RPC_KEM_PUBLIC_HEX'
+export MYCELIUM_GATEWAY_HOME="$HOME/.local/share/mycelium-s1-gateway"
+
+scripts/rpc-mainnet.sh gateway
+```
+
+O S1 usa:
+
+```bash
+export BASE_RPC_URL=http://127.0.0.1:8545
+```
+
+### Armar broadcast
+
+O transporte só libera `eth_sendRawTransaction` quando provider **e** gateway forem iniciados com:
+
+```bash
+export S1_MAINNET_WRITE=YES_I_ACCEPT_MAINNET_BROADCAST
+```
+
+A flag não cria nem assina transações. Ela apenas permite que uma transação já assinada pelo S1 atravesse o transporte. As políticas econômicas, chain ID, code hash, nonce/replay e demais travas continuam pertencendo ao S1/Risk Kernel.
+
+Se nenhuma rota superar premium + custo + margem + lucro mínimo, o estado operacional esperado é **nenhuma transmissão**.
