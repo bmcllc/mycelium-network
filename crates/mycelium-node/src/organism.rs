@@ -23,7 +23,7 @@ use mycelium_nutrients::Ledger;
 use mycelium_rpc::{
     json_rpc_error, open_request, open_response, seal_request, seal_response, LocalBaseProvider,
     RpcEncryptedRequest, RpcEncryptedResponse, RpcKemIdentity, RpcMeshRequest, RpcMeshResponse,
-    RpcPolicy, DEFAULT_MAX_RPC_BODY_BYTES,
+    RpcPolicy, RpcResponseKey, DEFAULT_MAX_RPC_BODY_BYTES,
 };
 use mycelium_pheromones::{Gland, Trail};
 use mycelium_sporebank::{
@@ -294,7 +294,7 @@ struct RpcTarget {
 struct PendingRpc {
     provider: NodeId,
     deadline_ms: u64,
-    response_identity: RpcKemIdentity,
+    response_key: RpcResponseKey,
     reply: oneshot::Sender<Result<Vec<u8>, String>>,
 }
 
@@ -1616,7 +1616,7 @@ impl Organism {
         }
         let deadline_ms = mesh.expires_at_ms;
         let request_id = mesh.request_id;
-        let (packet, response_identity) =
+        let (packet, response_key) =
             match seal_request(target.node, &target.kem_public_key, mesh) {
                 Ok(v) => v,
                 Err(e) => {
@@ -1630,7 +1630,7 @@ impl Organism {
             PendingRpc {
                 provider: target.node,
                 deadline_ms,
-                response_identity,
+                response_key,
                 reply: msg.reply,
             },
         );
@@ -1706,7 +1706,7 @@ impl Organism {
         let requester = opened.request.requester;
         let expires_at_ms = opened.request.expires_at_ms;
         let raw = opened.request.body;
-        let response_kem_public_key = opened.response_kem_public_key;
+        let response_key = opened.response_key;
         let provider_node = self.gland.node_id();
         let chain_id = self.rpc_policy.chain_id;
 
@@ -1731,7 +1731,7 @@ impl Organism {
                 observed_block: None,
                 body,
             };
-            match seal_response(&response_kem_public_key, response) {
+            match seal_response(&response_key, response) {
                 Ok(packet) => {
                     let _ = result_tx
                         .send(RpcProviderResult {
@@ -1758,7 +1758,7 @@ impl Organism {
             return;
         }
         match open_response(
-            &pending.response_identity,
+            &pending.response_key,
             pending.provider,
             self.rpc_policy.chain_id,
             &packet,
