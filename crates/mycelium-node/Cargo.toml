@@ -14,6 +14,7 @@ mycelium-ghostid = { workspace = true }
 mycelium-sporebank = { workspace = true }
 mycelium-tropical = { workspace = true }
 mycelium-store = { workspace = true }
+mycelium-rpc = { workspace = true }
 giggs = { workspace = true }
 thefield = { workspace = true }
 inertia = { workspace = true }
