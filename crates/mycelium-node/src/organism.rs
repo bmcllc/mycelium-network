@@ -4509,8 +4509,13 @@ impl Organism {
         }
     }
 
-    pub async fn run(mut self, mut control_rx: mpsc::Receiver<ControlMsg>) -> Result<(), OrganismError> {
+    pub async fn run(
+        mut self,
+        mut control_rx: mpsc::Receiver<ControlMsg>,
+        mut rpc_rx: mpsc::Receiver<RpcGatewayMsg>,
+    ) -> Result<(), OrganismError> {
         self.store.write_pid()?;
+        let (rpc_provider_tx, mut rpc_provider_rx) = mpsc::channel::<RpcProviderResult>(64);
 
         let bind_str = std::env::var("MYCELIUM_HORIZON_BIND")
             .unwrap_or_else(|_| format!("127.0.0.1:{}", self.state.horizon_port));
@@ -4687,6 +4692,7 @@ impl Organism {
         let mut scale_tick = tokio::time::interval(Duration::from_secs(45));
         let mut overlay_tick = tokio::time::interval(Duration::from_secs(90));
         let mut seedwebhook_tick = tokio::time::interval(Duration::from_secs(30));
+        let mut rpc_tick = tokio::time::interval(Duration::from_millis(250));
         // Primeiro tick imediato já foi coberto na germinação; atrasa o próximo.
         seed_tick.tick().await;
         // DuckDNS: espera um pouco para ter listen addrs.
@@ -4699,6 +4705,7 @@ impl Organism {
         scale_tick.tick().await;
         overlay_tick.tick().await;
         seedwebhook_tick.tick().await;
+        rpc_tick.tick().await;
 
         if self.sporocarp {
             tracing::info!("sporocarp ativo — relay + DNS (se DUCKDNS_*) — sem UPnP");
@@ -4742,6 +4749,35 @@ impl Organism {
                         }
                         None => break,
                     }
+                }
+
+                msg = rpc_rx.recv() => {
+                    if let Some(msg) = msg {
+                        self.begin_rpc_gateway_call(msg);
+                    }
+                }
+
+                result = rpc_provider_rx.recv() => {
+                    if let Some(result) = result {
+                        match self.send_direct_live(
+                            result.target,
+                            Envelope::RpcResponse {
+                                packet: result.packet,
+                            },
+                            self.rpc_policy.ttl_ms,
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => tracing::debug!(
+                                target = %result.target.short(),
+                                "RpcResponse sem rota LIVE — descartado, nunca armazenado"
+                            ),
+                            Err(e) => tracing::warn!(error = %e, "falha ao enviar RpcResponse LIVE"),
+                        }
+                    }
+                }
+
+                _ = rpc_tick.tick() => {
+                    self.expire_rpc_pending();
                 }
 
                 _ = persist_tick.tick() => {
@@ -5095,18 +5131,33 @@ impl Organism {
                                 || bundle.dst_peer == self.hyphae.peer_id().to_string();
                             if is_local {
                                 if let Ok(env) = Envelope::decode(&bundle.payload) {
-                                    if let Err(e) = self.handle_envelope(env) {
+                                    if let Err(e) =
+                                        self.dispatch_network_envelope(env, &rpc_provider_tx)
+                                    {
                                         tracing::warn!("envelope dtn: {e}");
                                     }
                                 }
                             } else {
-                                let _ = self.hyphae.forward_or_store_dtn(bundle);
+                                let live_rpc = Envelope::decode(&bundle.payload)
+                                    .map(|env| envelope_is_live_rpc(&env))
+                                    .unwrap_or(false);
+                                if live_rpc {
+                                    if let Ok(false) = self.hyphae.forward_dtn_now(bundle) {
+                                        tracing::debug!(
+                                            "RPC LIVE sem próximo salto — descartado, não persistido"
+                                        );
+                                    }
+                                } else {
+                                    let _ = self.hyphae.forward_or_store_dtn(bundle);
+                                }
                             }
                         }
                         Some(HyphaEvent::LatticeReceived { data, .. }) => {
                             match Envelope::decode(&data) {
                                 Ok(env) => {
-                                    if let Err(e) = self.handle_envelope(env) {
+                                    if let Err(e) =
+                                        self.dispatch_network_envelope(env, &rpc_provider_tx)
+                                    {
                                         tracing::warn!("envelope: {e}");
                                     }
                                 }
