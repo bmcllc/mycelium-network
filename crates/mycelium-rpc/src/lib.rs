@@ -381,9 +381,10 @@ pub fn seal_request(
 ) -> Result<(RpcEncryptedRequest, RpcResponseKey), RpcError> {
     let enc = mlkem_encapsulate(provider_kem_public_key)
         .map_err(|e| RpcError::Crypto(e.to_string()))?;
-    let request_key = derive_request_key(&enc.shared_secret);
+    let mut request_key = derive_request_key(&enc.shared_secret);
     let response_key = RpcResponseKey::from_shared_secret(&enc.shared_secret);
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&request_key));
+    request_key.zeroize();
     let mut nonce = [0u8; 12];
     OsRng.fill_bytes(&mut nonce);
     let plaintext =
@@ -423,10 +424,11 @@ pub fn open_request(
     }
     let mut shared = mlkem_decapsulate(identity.private_bytes(), &packet.kem_ciphertext)
         .map_err(|e| RpcError::Crypto(e.to_string()))?;
-    let request_key = derive_request_key(&shared);
+    let mut request_key = derive_request_key(&shared);
     let response_key = RpcResponseKey::from_shared_secret(&shared);
     shared.zeroize();
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&request_key));
+    request_key.zeroize();
     let aad = request_aad(&packet.request_id, &packet.provider);
     let plaintext = cipher
         .decrypt(
