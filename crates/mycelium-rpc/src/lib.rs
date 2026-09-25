@@ -200,6 +200,8 @@ pub struct RpcMeshRequest {
     pub chain_id: u64,
     pub created_at_ms: u64,
     pub expires_at_ms: u64,
+    /// Nonce CSPRNG para impedir colisão entre requests idênticos no mesmo ms.
+    pub request_nonce: [u8; 16],
     pub body: Vec<u8>,
 }
 
@@ -211,6 +213,26 @@ impl RpcMeshRequest {
         ttl_ms: u64,
         body: Vec<u8>,
     ) -> Self {
+        let mut request_nonce = [0u8; 16];
+        OsRng.fill_bytes(&mut request_nonce);
+        Self::with_nonce(
+            requester,
+            chain_id,
+            created_at_ms,
+            ttl_ms,
+            request_nonce,
+            body,
+        )
+    }
+
+    pub fn with_nonce(
+        requester: NodeId,
+        chain_id: u64,
+        created_at_ms: u64,
+        ttl_ms: u64,
+        request_nonce: [u8; 16],
+        body: Vec<u8>,
+    ) -> Self {
         let expires_at_ms = created_at_ms.saturating_add(ttl_ms);
         let mut h = blake3::Hasher::new();
         h.update(b"mycelium-rpc-request-v1");
@@ -218,6 +240,7 @@ impl RpcMeshRequest {
         h.update(&chain_id.to_be_bytes());
         h.update(&created_at_ms.to_be_bytes());
         h.update(&expires_at_ms.to_be_bytes());
+        h.update(&request_nonce);
         h.update(&body);
         Self {
             request_id: *h.finalize().as_bytes(),
@@ -225,6 +248,7 @@ impl RpcMeshRequest {
             chain_id,
             created_at_ms,
             expires_at_ms,
+            request_nonce,
             body,
         }
     }
@@ -617,23 +641,35 @@ mod tests {
     }
 
     #[test]
-    fn mesh_request_is_deterministic_and_expires() {
+    fn mesh_request_nonce_prevents_collisions_and_expiration_is_enforced() {
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}"#.to_vec();
-        let a = RpcMeshRequest::new(
-            node(b"rpc-test-node"),
+        let requester = node(b"rpc-test-node");
+        let a = RpcMeshRequest::with_nonce(
+            requester,
             BASE_MAINNET_CHAIN_ID,
             1_000,
             3_000,
+            [1u8; 16],
             body.clone(),
         );
-        let b = RpcMeshRequest::new(
-            node(b"rpc-test-node"),
+        let b = RpcMeshRequest::with_nonce(
+            requester,
             BASE_MAINNET_CHAIN_ID,
             1_000,
             3_000,
+            [1u8; 16],
+            body.clone(),
+        );
+        let c = RpcMeshRequest::with_nonce(
+            requester,
+            BASE_MAINNET_CHAIN_ID,
+            1_000,
+            3_000,
+            [2u8; 16],
             body,
         );
         assert_eq!(a.request_id, b.request_id);
+        assert_ne!(a.request_id, c.request_id);
 
         let p = RpcPolicy::default();
         assert!(a.validate_at(3_999, &p).is_ok());
