@@ -159,7 +159,8 @@ status_until "$CLIENT_HOME" 'rpc_gateway' >/dev/null
 # Dá tempo para a anastomose + troca de PeerBinding/assinatura gossipsub.
 for _ in $(seq 1 80); do
   CSTATUS="$("$BIN" --home "$CLIENT_HOME" status 2>/dev/null || true)"
-  if awk -F': ' '/vizinhos/{gsub(/ /,"",$2); if ($2+0 >= 1) exit 0; exit 1}' <<<"$CSTATUS"; then
+  NEIGHBORS="$(awk -F': ' '/vizinhos/{gsub(/ /,"",$2); print $2; exit}' <<<"$CSTATUS")"
+  if [[ "${NEIGHBORS:-0}" -ge 1 ]]; then
     break
   fi
   sleep 0.1
@@ -196,7 +197,11 @@ fi
 echo "[rpc-smoke] PASS write-deny"
 
 count_dtn() {
-  find "$CLIENT_HOME/dtn" -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' '
+  if [[ ! -d "$CLIENT_HOME/dtn" ]]; then
+    echo 0
+    return 0
+  fi
+  find "$CLIENT_HOME/dtn" -type f -name '*.json' -print | wc -l | tr -d ' '
 }
 DTN_BEFORE="$(count_dtn)"
 
