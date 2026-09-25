@@ -285,6 +285,7 @@ pub struct Organism {
     pending_accepted_migrations: HashSet<String>,
 }
 
+#[derive(Clone)]
 struct RpcTarget {
     node: NodeId,
     kem_public_key: Vec<u8>,
@@ -1533,6 +1534,276 @@ impl Organism {
         }
     }
 
+    /// Envia RPC por unicast LIVE: nenhuma persistência DTN e nenhum fallback assíncrono.
+    fn send_direct_live(
+        &mut self,
+        to: NodeId,
+        inner: Envelope,
+        ttl_ms: u64,
+    ) -> Result<bool, OrganismError> {
+        let env = Envelope::Direct {
+            to,
+            inner: Box::new(inner),
+        };
+        let bytes = env
+            .encode()
+            .map_err(|e| OrganismError::Msg(format!("rpc envelope: {e}")))?;
+        let bundle_id = mycelium_core::ContentId::of(&bytes).to_string();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let my_node = self.gland.node_id();
+        let my_peer = self.hyphae.peer_id().to_string();
+        let expires_at = now + 86_400;
+        let sign_msg =
+            mycelium_core::PeerBinding::sign_payload(&my_node, &my_peer, expires_at);
+        let my_binding = mycelium_core::PeerBinding {
+            node_id: my_node,
+            peer_id: my_peer,
+            public_key: self.gland.verifying_key().to_bytes().to_vec(),
+            expires_at,
+            signature: self.gland.sign_bytes(&sign_msg),
+        };
+        let dst_peer = self
+            .hyphae
+            .resolve_peer(&to)
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| to.to_string());
+        let bundle = mycelium_hyphae::DtnBundle {
+            bundle_id,
+            src_peer: self.hyphae.peer_id().to_string(),
+            dst_peer,
+            dst_node: Some(to),
+            binding: Some(my_binding),
+            created_at: now,
+            ttl_secs: (ttl_ms.saturating_add(999) / 1000).max(1),
+            hops: 0,
+            max_hops: 16,
+            payload: bytes,
+        };
+        self.hyphae
+            .forward_dtn_now(bundle)
+            .map_err(OrganismError::from)
+    }
+
+    fn begin_rpc_gateway_call(&mut self, msg: RpcGatewayMsg) {
+        let Some(target) = self.rpc_target.clone() else {
+            let _ = msg
+                .reply
+                .send(Err("nenhum provider RPC configurado".into()));
+            return;
+        };
+        let created_at_ms = now_ms();
+        let mesh = RpcMeshRequest::new(
+            self.gland.node_id(),
+            self.rpc_policy.chain_id,
+            created_at_ms,
+            self.rpc_policy.ttl_ms,
+            msg.raw,
+        );
+        if let Err(e) = mesh.validate_at(created_at_ms, &self.rpc_policy) {
+            let _ = msg.reply.send(Err(e.to_string()));
+            return;
+        }
+        let deadline_ms = mesh.expires_at_ms;
+        let request_id = mesh.request_id;
+        let (packet, response_identity) =
+            match seal_request(target.node, &target.kem_public_key, mesh) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = msg.reply.send(Err(e.to_string()));
+                    return;
+                }
+            };
+
+        self.rpc_pending.insert(
+            request_id,
+            PendingRpc {
+                provider: target.node,
+                deadline_ms,
+                response_identity,
+                reply: msg.reply,
+            },
+        );
+
+        match self.send_direct_live(
+            target.node,
+            Envelope::RpcRequest { packet },
+            self.rpc_policy.ttl_ms,
+        ) {
+            Ok(true) => {
+                tracing::debug!(
+                    request = %hex::encode(&request_id[..8]),
+                    provider = %target.node.short(),
+                    "RPC LIVE enviado"
+                );
+            }
+            Ok(false) => {
+                if let Some(pending) = self.rpc_pending.remove(&request_id) {
+                    let _ = pending
+                        .reply
+                        .send(Err("provider RPC sem rota LIVE; pedido não foi armazenado".into()));
+                }
+            }
+            Err(e) => {
+                if let Some(pending) = self.rpc_pending.remove(&request_id) {
+                    let _ = pending.reply.send(Err(e.to_string()));
+                }
+            }
+        }
+    }
+
+    fn start_rpc_provider_request(
+        &mut self,
+        packet: RpcEncryptedRequest,
+        result_tx: mpsc::Sender<RpcProviderResult>,
+    ) -> Result<(), OrganismError> {
+        let Some(provider) = self.rpc_provider.clone() else {
+            tracing::debug!("RpcRequest recebido em nó que não é provider");
+            return Ok(());
+        };
+        let Some(identity) = self.rpc_provider_kem.as_ref() else {
+            return Err(OrganismError::Msg(
+                "rpc provider sem identidade ML-KEM".into(),
+            ));
+        };
+        let opened = match open_request(
+            identity,
+            self.gland.node_id(),
+            &packet,
+            now_ms(),
+            &self.rpc_policy,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "RpcRequest rejeitado antes do upstream");
+                return Ok(());
+            }
+        };
+
+        let request_id = opened.request.request_id;
+        if self.rpc_seen.contains(&request_id) {
+            tracing::warn!(
+                request = %hex::encode(&request_id[..8]),
+                "RpcRequest replay descartado"
+            );
+            return Ok(());
+        }
+        if self.rpc_seen.len() >= 4096 {
+            self.rpc_seen.clear();
+        }
+        self.rpc_seen.insert(request_id);
+
+        let requester = opened.request.requester;
+        let expires_at_ms = opened.request.expires_at_ms;
+        let raw = opened.request.body;
+        let response_kem_public_key = opened.response_kem_public_key;
+        let provider_node = self.gland.node_id();
+        let chain_id = self.rpc_policy.chain_id;
+
+        tokio::spawn(async move {
+            let body = match provider.execute_raw(&raw).await {
+                Ok(body) => body,
+                Err(e) => json_rpc_error(&raw, -32010, e.to_string()),
+            };
+            let responded_at_ms = now_ms();
+            if responded_at_ms > expires_at_ms {
+                tracing::debug!(
+                    request = %hex::encode(&request_id[..8]),
+                    "resposta RPC ficou velha antes de sair do provider"
+                );
+                return;
+            }
+            let response = RpcMeshResponse {
+                request_id,
+                provider: provider_node,
+                chain_id,
+                responded_at_ms,
+                observed_block: None,
+                body,
+            };
+            match seal_response(&response_kem_public_key, response) {
+                Ok(packet) => {
+                    let _ = result_tx
+                        .send(RpcProviderResult {
+                            target: requester,
+                            packet,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "falha ao cifrar RpcResponse");
+                }
+            }
+        });
+        Ok(())
+    }
+
+    fn finish_rpc_response(&mut self, packet: RpcEncryptedResponse) {
+        let Some(pending) = self.rpc_pending.remove(&packet.request_id) else {
+            tracing::debug!("RpcResponse sem pending local — descartado");
+            return;
+        };
+        if now_ms() > pending.deadline_ms {
+            let _ = pending.reply.send(Err("RpcResponse expirado".into()));
+            return;
+        }
+        match open_response(
+            &pending.response_identity,
+            pending.provider,
+            self.rpc_policy.chain_id,
+            &packet,
+        ) {
+            Ok(response) => {
+                let _ = pending.reply.send(Ok(response.body));
+            }
+            Err(e) => {
+                let _ = pending.reply.send(Err(e.to_string()));
+            }
+        }
+    }
+
+    fn expire_rpc_pending(&mut self) {
+        let now = now_ms();
+        let expired: Vec<[u8; 32]> = self
+            .rpc_pending
+            .iter()
+            .filter_map(|(id, pending)| (now > pending.deadline_ms).then_some(*id))
+            .collect();
+        for id in expired {
+            if let Some(pending) = self.rpc_pending.remove(&id) {
+                let _ = pending
+                    .reply
+                    .send(Err("timeout/TTL do Mycelium RPC".into()));
+            }
+        }
+    }
+
+    fn dispatch_network_envelope(
+        &mut self,
+        env: Envelope,
+        rpc_result_tx: &mpsc::Sender<RpcProviderResult>,
+    ) -> Result<(), OrganismError> {
+        match env {
+            Envelope::Direct { to, inner } => {
+                if to != self.gland.node_id() {
+                    return Ok(());
+                }
+                self.dispatch_network_envelope(*inner, rpc_result_tx)
+            }
+            Envelope::RpcRequest { packet } => {
+                self.start_rpc_provider_request(packet, rpc_result_tx.clone())
+            }
+            Envelope::RpcResponse { packet } => {
+                self.finish_rpc_response(packet);
+                Ok(())
+            }
+            other => self.handle_envelope(other),
+        }
+    }
+
     /// Efeito manada: visita à console ErgotOS semeia localmente um
     /// `ergot-seed` (ion consciência do desktop) que anuncia a si por toda
     /// a rede via `IonAnnounce`. Outros nós recebem o anúncio e brotam o
@@ -1894,6 +2165,12 @@ impl Organism {
                 }
                 tracing::debug!(from_overlay = true, "Direct aberto");
                 return self.handle_envelope(*inner);
+            }
+            // RPC LIVE passa por `dispatch_network_envelope`, que possui o canal
+            // de resultados assíncronos do provider.
+            Envelope::RpcRequest { .. } | Envelope::RpcResponse { .. } => {
+                tracing::warn!("envelope RPC chegou ao dispatcher genérico — descartado");
+                return Ok(());
             }
             Envelope::SporePrint { plot } => {
                 if !plot.is_public() {
