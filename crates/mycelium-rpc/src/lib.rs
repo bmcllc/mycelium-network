@@ -315,10 +315,16 @@ fn derive_aead_key(shared_secret: &[u8]) -> [u8; 32] {
     blake3::derive_key("mycelium-rpc-pq-aead-v1", shared_secret)
 }
 
-fn request_aad(request_id: &[u8; 32], provider: &NodeId) -> Vec<u8> {
+fn request_aad(
+    request_id: &[u8; 32],
+    provider: &NodeId,
+    response_kem_public_key: &[u8],
+) -> Vec<u8> {
     let mut aad = b"mycelium-rpc-request-aad-v1".to_vec();
     aad.extend_from_slice(request_id);
     aad.extend_from_slice(&provider.0);
+    aad.extend_from_slice(&(response_kem_public_key.len() as u32).to_be_bytes());
+    aad.extend_from_slice(response_kem_public_key);
     aad
 }
 
@@ -343,7 +349,11 @@ pub fn seal_request(
     OsRng.fill_bytes(&mut nonce);
     let plaintext =
         serde_json::to_vec(&request).map_err(|e| RpcError::InvalidJsonRpc(e.to_string()))?;
-    let aad = request_aad(&request.request_id, &provider);
+    let aad = request_aad(
+        &request.request_id,
+        &provider,
+        response_identity.public_key(),
+    );
     let ciphertext = cipher
         .encrypt(
             Nonce::from_slice(&nonce),
@@ -381,7 +391,11 @@ pub fn open_request(
         .map_err(|e| RpcError::Crypto(e.to_string()))?;
     let key = derive_aead_key(&shared);
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
-    let aad = request_aad(&packet.request_id, &packet.provider);
+    let aad = request_aad(
+        &packet.request_id,
+        &packet.provider,
+        &packet.response_kem_public_key,
+    );
     let plaintext = cipher
         .decrypt(
             Nonce::from_slice(&packet.nonce),
@@ -680,6 +694,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reopened, response);
+    }
+
+    #[test]
+    fn response_kem_substitution_is_rejected() {
+        let provider = node(b"provider");
+        let requester = node(b"requester");
+        let provider_kem = RpcKemIdentity::generate();
+        let attacker_kem = RpcKemIdentity::generate();
+        let policy = RpcPolicy::default();
+        let mesh = RpcMeshRequest::new(
+            requester,
+            BASE_MAINNET_CHAIN_ID,
+            10_000,
+            policy.ttl_ms,
+            br#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}"#.to_vec(),
+        );
+        let (mut sealed, _) =
+            seal_request(provider, provider_kem.public_key(), mesh).unwrap();
+        sealed.response_kem_public_key = attacker_kem.public_key().to_vec();
+
+        assert!(matches!(
+            open_request(&provider_kem, provider, &sealed, 10_001, &policy),
+            Err(RpcError::Crypto(_))
+        ));
     }
 
     #[test]
