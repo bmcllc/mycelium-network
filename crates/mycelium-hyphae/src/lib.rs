@@ -831,6 +831,20 @@ impl HyphaeNode {
         Ok(false)
     }
 
+    /// Encaminha um bundle somente se existir rota viva agora.
+    ///
+    /// Diferente de `forward_or_store_dtn`, este método NUNCA persiste o
+    /// bundle para entrega tardia. É usado por tráfego sensível a frescor,
+    /// como JSON-RPC financeiro.
+    pub fn forward_dtn_now(&mut self, mut bundle: DtnBundle) -> Result<bool, HyphaeError> {
+        bundle.hops += 1;
+        if bundle.hops > bundle.max_hops {
+            tracing::warn!(id = %bundle.bundle_id, "bundle LIVE excedeu max_hops — descartado");
+            return Ok(false);
+        }
+        self.forward_or_store_dtn_internal(&mut bundle)
+    }
+
     /// Despeja bundles pendentes no DTN store para peers que acabaram de reconectar ou novos saltos.
     pub fn flush_dtn_bundles(&mut self) -> usize {
         let pending = self.dtn_store.all_bundles();
@@ -1661,6 +1675,30 @@ mod tests {
         let a = HyphaeNode::germinate(Some([7u8; 32])).unwrap();
         let b = HyphaeNode::germinate(Some([7u8; 32])).unwrap();
         assert_eq!(a.peer_id(), b.peer_id());
+    }
+
+    #[tokio::test]
+    async fn live_forward_without_route_never_persists_bundle() {
+        let mut node = HyphaeNode::germinate(Some([41u8; 32])).unwrap();
+        let target = mycelium_core::NodeId::derive(b"rpc-live-unreachable");
+        let bundle = DtnBundle {
+            bundle_id: "rpc-live-no-store".into(),
+            src_peer: node.peer_id().to_string(),
+            dst_peer: target.to_string(),
+            dst_node: Some(target),
+            binding: None,
+            created_at: now_secs(),
+            ttl_secs: 3,
+            hops: 0,
+            max_hops: 16,
+            payload: b"rpc".to_vec(),
+        };
+
+        assert!(!node.forward_dtn_now(bundle).unwrap());
+        assert!(
+            node.dtn_store_ref().is_empty(),
+            "tráfego LIVE não pode cair no DTN persistente"
+        );
     }
 
     #[tokio::test]

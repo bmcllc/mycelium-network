@@ -125,6 +125,14 @@ pub enum Envelope {
         commit: String,
         description: String,
     },
+    /// Pedido JSON-RPC cifrado ponta a ponta com ML-KEM-1024.
+    RpcRequest {
+        packet: mycelium_rpc::RpcEncryptedRequest,
+    },
+    /// Resposta JSON-RPC cifrada para a chave KEM efêmera do requester.
+    RpcResponse {
+        packet: mycelium_rpc::RpcEncryptedResponse,
+    },
     /// Overlay de zonas: entrega direcionada — só `to` processa `inner`.
     /// Nós intermediários replicam no gossip mas ignoram o conteúdo.
     Direct {

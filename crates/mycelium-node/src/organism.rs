@@ -6,6 +6,7 @@ pub const MAX_LAYER_NEED_HOPS: u8 = 4;
 
 use crate::control::{ControlMsg, Request, Response, StatusReport};
 use crate::protocol::Envelope;
+use crate::rpc_gateway::{load_or_create_rpc_identity, now_ms, RpcGatewayMsg};
 use crate::store::{IonRecord, NodeStore, OrganismState, StoreError};
 use giggs::{Leaf, Plot, RefStore, RefUpdate, SignedRefUpdate};
 use inertia::{
@@ -19,6 +20,11 @@ use mycelium_hyphae::{
     MAILBOX_DHT_PREFIX, RELAY_DHT_PREFIX,
 };
 use mycelium_nutrients::Ledger;
+use mycelium_rpc::{
+    json_rpc_error, open_request, open_response, seal_request, seal_response, LocalBaseProvider,
+    RpcEncryptedRequest, RpcEncryptedResponse, RpcKemIdentity, RpcMeshRequest, RpcMeshResponse,
+    RpcPolicy, RpcResponseKey, DEFAULT_MAX_RPC_BODY_BYTES,
+};
 use mycelium_pheromones::{Gland, Trail};
 use mycelium_sporebank::{
     content_id_from_layer_dht_key, dht_key, layer_dht_key, SporeBank,
@@ -31,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thefield::{Proposal, SignalState};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use vacuum::{
     Chamber, ChamberProcess, FruitOptions, Isolation, LayerArchive, LayerStore, Void,
 };
@@ -90,6 +96,13 @@ pub struct OrganismConfig {
     /// `None` = auto (folha/floresta); `Some(true/false)` = forçar.
     pub nostr_transport: Option<bool>,
     pub nostr_relay: Option<String>,
+    pub rpc_gateway_addr: Option<std::net::SocketAddr>,
+    pub rpc_provider_upstream: Option<String>,
+    pub rpc_target_node: Option<String>,
+    pub rpc_target_kem: Option<String>,
+    pub rpc_chain_id: u64,
+    pub rpc_allow_write: bool,
+    pub rpc_ttl_ms: u64,
     /// Allowlist de peers licenciados (VOID-00). Se `Some`, o gate de admissão
     /// licenciada é ativado: apenas estes PeerIds se conectam. Req. feature `license`.
     #[cfg(feature = "license")]
@@ -169,6 +182,14 @@ pub struct Organism {
     known_zones_ts: HashMap<NodeId, u64>,
     /// Quantas vezes resolveu rota DHT (`ClosestPeers`) no overlay de zonas.
     routing_hits: u64,
+    /// Configuração e estado do Mycelium Base RPC.
+    rpc_gateway_addr: Option<std::net::SocketAddr>,
+    rpc_provider: Option<LocalBaseProvider>,
+    rpc_provider_kem: Option<RpcKemIdentity>,
+    rpc_target: Option<RpcTarget>,
+    rpc_policy: RpcPolicy,
+    rpc_pending: HashMap<[u8; 32], PendingRpc>,
+    rpc_seen: HashMap<[u8; 32], u64>,
     #[cfg(feature = "veil")]
     veil_engine: Option<std::sync::Arc<mycelium_veil::VeilEngine>>,
     #[cfg(feature = "veil")]
@@ -262,6 +283,32 @@ pub struct Organism {
     known_repos: HashMap<String, (String, String, String, NodeId)>,
     /// Migrações aceitas pendentes de IonMigrate (autenticação de fluxo).
     pending_accepted_migrations: HashSet<String>,
+}
+
+#[derive(Clone)]
+struct RpcTarget {
+    node: NodeId,
+    kem_public_key: Vec<u8>,
+}
+
+struct PendingRpc {
+    provider: NodeId,
+    deadline_ms: u64,
+    response_key: RpcResponseKey,
+    reply: oneshot::Sender<Result<Vec<u8>, String>>,
+}
+
+struct RpcProviderResult {
+    target: NodeId,
+    packet: RpcEncryptedResponse,
+}
+
+fn envelope_is_live_rpc(env: &Envelope) -> bool {
+    match env {
+        Envelope::RpcRequest { .. } | Envelope::RpcResponse { .. } => true,
+        Envelope::Direct { inner, .. } => envelope_is_live_rpc(inner),
+        _ => false,
+    }
 }
 
 fn ensure_repo_publishable(plot: &Plot) -> Result<(), OrganismError> {
@@ -475,6 +522,54 @@ impl Organism {
         let assets = crate::assets::AssetRegistry::open(&config.home)
             .map_err(|e| OrganismError::Msg(e.to_string()))?;
         let ghost = ghost_for_node(gland.seed());
+
+        let rpc_policy = RpcPolicy {
+            chain_id: config.rpc_chain_id,
+            allow_write: config.rpc_allow_write,
+            allow_unsafe: false,
+            ttl_ms: config.rpc_ttl_ms.max(250),
+            max_body_bytes: DEFAULT_MAX_RPC_BODY_BYTES,
+        };
+        let rpc_provider = match config.rpc_provider_upstream.as_ref() {
+            Some(upstream) => Some(
+                LocalBaseProvider::new(upstream.clone(), rpc_policy.clone())
+                    .map_err(|e| OrganismError::Msg(format!("rpc-provider: {e}")))?,
+            ),
+            None => None,
+        };
+        let rpc_provider_kem = if rpc_provider.is_some() {
+            Some(
+                load_or_create_rpc_identity(&config.home.join("rpc-kem.key"))
+                    .map_err(OrganismError::Msg)?,
+            )
+        } else {
+            None
+        };
+        let rpc_target = match (&config.rpc_target_node, &config.rpc_target_kem) {
+            (Some(node), Some(kem_hex)) => {
+                let node = node
+                    .parse::<NodeId>()
+                    .map_err(|e| OrganismError::Msg(format!("rpc-provider-node inválido: {e}")))?;
+                let kem_public_key = hex::decode(kem_hex)
+                    .map_err(|e| OrganismError::Msg(format!("rpc-provider-kem inválida: {e}")))?;
+                Some(RpcTarget {
+                    node,
+                    kem_public_key,
+                })
+            }
+            (None, None) => None,
+            _ => {
+                return Err(OrganismError::Msg(
+                    "rpc gateway exige --rpc-provider-node e --rpc-provider-kem juntos".into(),
+                ))
+            }
+        };
+        if config.rpc_gateway_addr.is_some() && rpc_target.is_none() {
+            return Err(OrganismError::Msg(
+                "--rpc-gateway exige provider explícito no P1/P2: --rpc-provider-node + --rpc-provider-kem".into(),
+            ));
+        }
+
         let mut org = Self {
             store,
             gland,
@@ -512,6 +607,13 @@ impl Organism {
             known_zones: HashMap::new(),
             known_zones_ts: HashMap::new(),
             routing_hits: 0,
+            rpc_gateway_addr: config.rpc_gateway_addr,
+            rpc_provider,
+            rpc_provider_kem,
+            rpc_target,
+            rpc_policy,
+            rpc_pending: HashMap::new(),
+            rpc_seen: HashMap::new(),
             #[cfg(feature = "veil")]
             veil_engine: None,
             #[cfg(feature = "veil")]
@@ -696,6 +798,13 @@ impl Organism {
                 MyceliumPhase::Transport => "transport".into(),
                 MyceliumPhase::Dormant => "dormant".into(),
             },
+            rpc_gateway: self.rpc_gateway_addr.map(|a| format!("http://{a}")),
+            rpc_provider: self.rpc_provider.is_some(),
+            rpc_provider_kem: self
+                .rpc_provider_kem
+                .as_ref()
+                .map(|identity| hex::encode(identity.public_key())),
+            rpc_chain_id: self.rpc_policy.chain_id,
             #[cfg(feature = "veil")]
             veil_socks5: if self.veil_enabled {
                 self.veil_socks5_addr.map(|a| a.to_string())
@@ -1432,6 +1541,280 @@ impl Organism {
         }
     }
 
+    /// Envia RPC por unicast LIVE: nenhuma persistência DTN e nenhum fallback assíncrono.
+    fn send_direct_live(
+        &mut self,
+        to: NodeId,
+        inner: Envelope,
+        ttl_ms: u64,
+    ) -> Result<bool, OrganismError> {
+        let env = Envelope::Direct {
+            to,
+            inner: Box::new(inner),
+        };
+        let bytes = env
+            .encode()
+            .map_err(|e| OrganismError::Msg(format!("rpc envelope: {e}")))?;
+        let bundle_id = mycelium_core::ContentId::of(&bytes).to_string();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let my_node = self.gland.node_id();
+        let my_peer = self.hyphae.peer_id().to_string();
+        let expires_at = now + 86_400;
+        let sign_msg =
+            mycelium_core::PeerBinding::sign_payload(&my_node, &my_peer, expires_at);
+        let my_binding = mycelium_core::PeerBinding {
+            node_id: my_node,
+            peer_id: my_peer,
+            public_key: self.gland.verifying_key().to_bytes().to_vec(),
+            expires_at,
+            signature: self.gland.sign_bytes(&sign_msg),
+        };
+        let dst_peer = self
+            .hyphae
+            .resolve_peer(&to)
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| to.to_string());
+        let bundle = mycelium_hyphae::DtnBundle {
+            bundle_id,
+            src_peer: self.hyphae.peer_id().to_string(),
+            dst_peer,
+            dst_node: Some(to),
+            binding: Some(my_binding),
+            created_at: now,
+            ttl_secs: (ttl_ms.saturating_add(999) / 1000).max(1),
+            hops: 0,
+            max_hops: 16,
+            payload: bytes,
+        };
+        self.hyphae
+            .forward_dtn_now(bundle)
+            .map_err(OrganismError::Hyphae)
+    }
+
+    fn begin_rpc_gateway_call(&mut self, msg: RpcGatewayMsg) {
+        let Some(target) = self.rpc_target.clone() else {
+            let _ = msg
+                .reply
+                .send(Err("nenhum provider RPC configurado".into()));
+            return;
+        };
+        let created_at_ms = now_ms();
+        let mesh = RpcMeshRequest::new(
+            self.gland.node_id(),
+            self.rpc_policy.chain_id,
+            created_at_ms,
+            self.rpc_policy.ttl_ms,
+            msg.raw,
+        );
+        if let Err(e) = mesh.validate_at(created_at_ms, &self.rpc_policy) {
+            let _ = msg.reply.send(Err(e.to_string()));
+            return;
+        }
+        let deadline_ms = mesh.expires_at_ms;
+        let request_id = mesh.request_id;
+        let (packet, response_key) =
+            match seal_request(target.node, &target.kem_public_key, mesh) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = msg.reply.send(Err(e.to_string()));
+                    return;
+                }
+            };
+
+        self.rpc_pending.insert(
+            request_id,
+            PendingRpc {
+                provider: target.node,
+                deadline_ms,
+                response_key,
+                reply: msg.reply,
+            },
+        );
+
+        match self.send_direct_live(
+            target.node,
+            Envelope::RpcRequest { packet },
+            self.rpc_policy.ttl_ms,
+        ) {
+            Ok(true) => {
+                tracing::debug!(
+                    request = %hex::encode(&request_id[..8]),
+                    provider = %target.node.short(),
+                    "RPC LIVE enviado"
+                );
+            }
+            Ok(false) => {
+                if let Some(pending) = self.rpc_pending.remove(&request_id) {
+                    let _ = pending
+                        .reply
+                        .send(Err("provider RPC sem rota LIVE; pedido não foi armazenado".into()));
+                }
+            }
+            Err(e) => {
+                if let Some(pending) = self.rpc_pending.remove(&request_id) {
+                    let _ = pending.reply.send(Err(e.to_string()));
+                }
+            }
+        }
+    }
+
+    fn start_rpc_provider_request(
+        &mut self,
+        packet: RpcEncryptedRequest,
+        result_tx: mpsc::Sender<RpcProviderResult>,
+    ) -> Result<(), OrganismError> {
+        let Some(provider) = self.rpc_provider.clone() else {
+            tracing::debug!("RpcRequest recebido em nó que não é provider");
+            return Ok(());
+        };
+        let Some(identity) = self.rpc_provider_kem.as_ref() else {
+            return Err(OrganismError::Msg(
+                "rpc provider sem identidade ML-KEM".into(),
+            ));
+        };
+        let opened = match open_request(
+            identity,
+            self.gland.node_id(),
+            &packet,
+            now_ms(),
+            &self.rpc_policy,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "RpcRequest rejeitado antes do upstream");
+                return Ok(());
+            }
+        };
+
+        let request_id = opened.request.request_id;
+        let now = now_ms();
+        self.rpc_seen.retain(|_, expires_at| *expires_at >= now);
+        if self
+            .rpc_seen
+            .get(&request_id)
+            .is_some_and(|expires_at| *expires_at >= now)
+        {
+            tracing::warn!(
+                request = %hex::encode(&request_id[..8]),
+                "RpcRequest replay descartado"
+            );
+            return Ok(());
+        }
+
+        let requester = opened.request.requester;
+        let expires_at_ms = opened.request.expires_at_ms;
+        self.rpc_seen.insert(request_id, expires_at_ms);
+        let raw = opened.request.body;
+        let response_key = opened.response_key;
+        let provider_node = self.gland.node_id();
+        let chain_id = self.rpc_policy.chain_id;
+
+        tokio::spawn(async move {
+            let body = match provider.execute_raw(&raw).await {
+                Ok(body) => body,
+                Err(e) => json_rpc_error(&raw, -32010, e.to_string()),
+            };
+            let responded_at_ms = now_ms();
+            if responded_at_ms > expires_at_ms {
+                tracing::debug!(
+                    request = %hex::encode(&request_id[..8]),
+                    "resposta RPC ficou velha antes de sair do provider"
+                );
+                return;
+            }
+            let response = RpcMeshResponse {
+                request_id,
+                provider: provider_node,
+                chain_id,
+                responded_at_ms,
+                observed_block: None,
+                body,
+            };
+            match seal_response(&response_key, response) {
+                Ok(packet) => {
+                    let _ = result_tx
+                        .send(RpcProviderResult {
+                            target: requester,
+                            packet,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "falha ao cifrar RpcResponse");
+                }
+            }
+        });
+        Ok(())
+    }
+
+    fn finish_rpc_response(&mut self, packet: RpcEncryptedResponse) {
+        let Some(pending) = self.rpc_pending.remove(&packet.request_id) else {
+            tracing::debug!("RpcResponse sem pending local — descartado");
+            return;
+        };
+        if now_ms() > pending.deadline_ms {
+            let _ = pending.reply.send(Err("RpcResponse expirado".into()));
+            return;
+        }
+        match open_response(
+            &pending.response_key,
+            pending.provider,
+            self.rpc_policy.chain_id,
+            &packet,
+        ) {
+            Ok(response) => {
+                let _ = pending.reply.send(Ok(response.body));
+            }
+            Err(e) => {
+                let _ = pending.reply.send(Err(e.to_string()));
+            }
+        }
+    }
+
+    fn expire_rpc_pending(&mut self) {
+        let now = now_ms();
+        self.rpc_seen.retain(|_, expires_at| *expires_at >= now);
+        let expired: Vec<[u8; 32]> = self
+            .rpc_pending
+            .iter()
+            .filter_map(|(id, pending)| (now > pending.deadline_ms).then_some(*id))
+            .collect();
+        for id in expired {
+            if let Some(pending) = self.rpc_pending.remove(&id) {
+                let _ = pending
+                    .reply
+                    .send(Err("timeout/TTL do Mycelium RPC".into()));
+            }
+        }
+    }
+
+    fn dispatch_network_envelope(
+        &mut self,
+        env: Envelope,
+        rpc_result_tx: &mpsc::Sender<RpcProviderResult>,
+    ) -> Result<(), OrganismError> {
+        match env {
+            Envelope::Direct { to, inner } => {
+                if to != self.gland.node_id() {
+                    return Ok(());
+                }
+                self.dispatch_network_envelope(*inner, rpc_result_tx)
+            }
+            Envelope::RpcRequest { packet } => {
+                self.start_rpc_provider_request(packet, rpc_result_tx.clone())
+            }
+            Envelope::RpcResponse { packet } => {
+                self.finish_rpc_response(packet);
+                Ok(())
+            }
+            other => self.handle_envelope(other),
+        }
+    }
+
     /// Efeito manada: visita à console ErgotOS semeia localmente um
     /// `ergot-seed` (ion consciência do desktop) que anuncia a si por toda
     /// a rede via `IonAnnounce`. Outros nós recebem o anúncio e brotam o
@@ -1793,6 +2176,12 @@ impl Organism {
                 }
                 tracing::debug!(from_overlay = true, "Direct aberto");
                 return self.handle_envelope(*inner);
+            }
+            // RPC LIVE passa por `dispatch_network_envelope`, que possui o canal
+            // de resultados assíncronos do provider.
+            Envelope::RpcRequest { .. } | Envelope::RpcResponse { .. } => {
+                tracing::warn!("envelope RPC chegou ao dispatcher genérico — descartado");
+                return Ok(());
             }
             Envelope::SporePrint { plot } => {
                 if !plot.is_public() {
@@ -4131,8 +4520,23 @@ impl Organism {
         }
     }
 
-    pub async fn run(mut self, mut control_rx: mpsc::Receiver<ControlMsg>) -> Result<(), OrganismError> {
+    pub async fn run(
+        mut self,
+        mut control_rx: mpsc::Receiver<ControlMsg>,
+        mut rpc_rx: mpsc::Receiver<RpcGatewayMsg>,
+    ) -> Result<(), OrganismError> {
+        if let Some(provider) = self.rpc_provider.as_ref() {
+            provider
+                .verify_chain_id()
+                .await
+                .map_err(|e| OrganismError::Msg(format!("rpc-provider chain gate: {e}")))?;
+            tracing::info!(
+                chain_id = self.rpc_policy.chain_id,
+                "RPC provider upstream chain verificada"
+            );
+        }
         self.store.write_pid()?;
+        let (rpc_provider_tx, mut rpc_provider_rx) = mpsc::channel::<RpcProviderResult>(64);
 
         let bind_str = std::env::var("MYCELIUM_HORIZON_BIND")
             .unwrap_or_else(|_| format!("127.0.0.1:{}", self.state.horizon_port));
@@ -4309,6 +4713,7 @@ impl Organism {
         let mut scale_tick = tokio::time::interval(Duration::from_secs(45));
         let mut overlay_tick = tokio::time::interval(Duration::from_secs(90));
         let mut seedwebhook_tick = tokio::time::interval(Duration::from_secs(30));
+        let mut rpc_tick = tokio::time::interval(Duration::from_millis(250));
         // Primeiro tick imediato já foi coberto na germinação; atrasa o próximo.
         seed_tick.tick().await;
         // DuckDNS: espera um pouco para ter listen addrs.
@@ -4321,6 +4726,7 @@ impl Organism {
         scale_tick.tick().await;
         overlay_tick.tick().await;
         seedwebhook_tick.tick().await;
+        rpc_tick.tick().await;
 
         if self.sporocarp {
             tracing::info!("sporocarp ativo — relay + DNS (se DUCKDNS_*) — sem UPnP");
@@ -4364,6 +4770,35 @@ impl Organism {
                         }
                         None => break,
                     }
+                }
+
+                msg = rpc_rx.recv() => {
+                    if let Some(msg) = msg {
+                        self.begin_rpc_gateway_call(msg);
+                    }
+                }
+
+                result = rpc_provider_rx.recv() => {
+                    if let Some(result) = result {
+                        match self.send_direct_live(
+                            result.target,
+                            Envelope::RpcResponse {
+                                packet: result.packet,
+                            },
+                            self.rpc_policy.ttl_ms,
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => tracing::debug!(
+                                target = %result.target.short(),
+                                "RpcResponse sem rota LIVE — descartado, nunca armazenado"
+                            ),
+                            Err(e) => tracing::warn!(error = %e, "falha ao enviar RpcResponse LIVE"),
+                        }
+                    }
+                }
+
+                _ = rpc_tick.tick() => {
+                    self.expire_rpc_pending();
                 }
 
                 _ = persist_tick.tick() => {
@@ -4717,18 +5152,33 @@ impl Organism {
                                 || bundle.dst_peer == self.hyphae.peer_id().to_string();
                             if is_local {
                                 if let Ok(env) = Envelope::decode(&bundle.payload) {
-                                    if let Err(e) = self.handle_envelope(env) {
+                                    if let Err(e) =
+                                        self.dispatch_network_envelope(env, &rpc_provider_tx)
+                                    {
                                         tracing::warn!("envelope dtn: {e}");
                                     }
                                 }
                             } else {
-                                let _ = self.hyphae.forward_or_store_dtn(bundle);
+                                let live_rpc = Envelope::decode(&bundle.payload)
+                                    .map(|env| envelope_is_live_rpc(&env))
+                                    .unwrap_or(false);
+                                if live_rpc {
+                                    if let Ok(false) = self.hyphae.forward_dtn_now(bundle) {
+                                        tracing::debug!(
+                                            "RPC LIVE sem próximo salto — descartado, não persistido"
+                                        );
+                                    }
+                                } else {
+                                    let _ = self.hyphae.forward_or_store_dtn(bundle);
+                                }
                             }
                         }
                         Some(HyphaEvent::LatticeReceived { data, .. }) => {
                             match Envelope::decode(&data) {
                                 Ok(env) => {
-                                    if let Err(e) = self.handle_envelope(env) {
+                                    if let Err(e) =
+                                        self.dispatch_network_envelope(env, &rpc_provider_tx)
+                                    {
                                         tracing::warn!("envelope: {e}");
                                     }
                                 }

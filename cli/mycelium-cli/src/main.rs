@@ -91,6 +91,27 @@ enum Commands {
         /// Relay Nostr WSS para o transporte (default nos.lol).
         #[arg(long = "nostr-relay", env = "MYCELIUM_NOSTR_RELAY")]
         nostr_relay: Option<String>,
+        /// Expõe endpoint Ethereum JSON-RPC local. Deve ser loopback (ex.: 127.0.0.1:8545).
+        #[arg(long = "rpc-gateway")]
+        rpc_gateway: Option<std::net::SocketAddr>,
+        /// Upstream HTTP de um Base node local quando este nó atua como provider.
+        #[arg(long = "rpc-provider")]
+        rpc_provider: Option<String>,
+        /// NodeId do provider usado pelo gateway (P1/P2 explícito; discovery automático vem no P3).
+        #[arg(long = "rpc-provider-node")]
+        rpc_provider_node: Option<String>,
+        /// Chave pública ML-KEM-1024 hex do provider.
+        #[arg(long = "rpc-provider-kem")]
+        rpc_provider_kem: Option<String>,
+        /// EVM chain ID servido/aceito pelo RPC.
+        #[arg(long = "rpc-chain-id", default_value_t = 8453)]
+        rpc_chain_id: u64,
+        /// Habilita envio de transações. Desligado por padrão.
+        #[arg(long = "rpc-allow-write")]
+        rpc_allow_write: bool,
+        /// TTL máximo de uma chamada RPC LIVE em milissegundos.
+        #[arg(long = "rpc-ttl-ms", default_value_t = 3000)]
+        rpc_ttl_ms: u64,
         /// **Licença VOID-00**: only accept peers com estes PeerIds (virgula,
         /// repetível). Ativa o gate de admissão licenciada. Req. feature `license`.
         #[arg(long = "licensed-peers", value_delimiter = ',')]
@@ -252,7 +273,10 @@ enum Commands {
         message: String,
         #[arg(long, default_value = "build.sh")]
         path: String,
-        #[arg(long, default_value = "#!/bin/sh\nmkdir -p dist\necho ok > dist/index.html\n")]
+        #[arg(
+            long,
+            default_value = "#!/bin/sh\nmkdir -p dist\necho ok > dist/index.html\n"
+        )]
         content: String,
         #[arg(long, default_value = "webapp")]
         ion: String,
@@ -676,6 +700,13 @@ fn main() {
             nostr_transport,
             no_nostr_transport,
             nostr_relay,
+            rpc_gateway,
+            rpc_provider,
+            rpc_provider_node,
+            rpc_provider_kem,
+            rpc_chain_id,
+            rpc_allow_write,
+            rpc_ttl_ms,
             licensed_peers,
             upnp,
             veil,
@@ -725,6 +756,13 @@ fn main() {
                     None
                 },
                 nostr_relay,
+                rpc_gateway_addr: rpc_gateway,
+                rpc_provider_upstream: rpc_provider,
+                rpc_target_node: rpc_provider_node,
+                rpc_target_kem: rpc_provider_kem,
+                rpc_chain_id,
+                rpc_allow_write,
+                rpc_ttl_ms,
                 #[cfg(feature = "license")]
                 licensed_peers: if licensed_peers.is_empty() {
                     None
@@ -2370,6 +2408,15 @@ fn print_response(resp: Response) -> Result<(), String> {
             }
             if let Some(dns) = &s.dns_seed {
                 println!("    dns_seed   : {dns}");
+            }
+            if let Some(gateway) = &s.rpc_gateway {
+                println!("    rpc_gateway : {gateway}");
+            }
+            if s.rpc_provider {
+                println!("    rpc_provider: sim (chain {})", s.rpc_chain_id);
+                if let Some(kem) = &s.rpc_provider_kem {
+                    println!("    rpc_kem_pub : {kem}");
+                }
             }
             if let Some(socks) = &s.veil_socks5 {
                 println!("    veil_socks5: {socks}");

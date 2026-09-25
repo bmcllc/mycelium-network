@@ -29,6 +29,7 @@ members = [
     "crates/cosmic-cli",
     "platforms/cosmoplanck",
     "crates/mycelium-veil",
+    "crates/mycelium-rpc",
 ]
 
 [workspace.package]
@@ -65,6 +66,7 @@ mycelium-store = { path = "crates/mycelium-store" }
 mycelium-zkp = { path = "crates/mycelium-zkp", default-features = false }
 cosmic-cli = { path = "crates/cosmic-cli" }
 mycelium-veil = { path = "crates/mycelium-veil" }
+mycelium-rpc = { path = "crates/mycelium-rpc" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

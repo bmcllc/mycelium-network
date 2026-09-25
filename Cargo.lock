@@ -3147,6 +3147,7 @@ dependencies = [
  "mycelium-nutrients",
  "mycelium-pheromones",
  "mycelium-pqc",
+ "mycelium-rpc",
  "mycelium-sporebank",
  "mycelium-store",
  "mycelium-tropical",
@@ -3261,6 +3262,23 @@ dependencies = [
  "serde_json",
  "shamir_share",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "mycelium-rpc"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "chacha20poly1305",
+ "mycelium-core",
+ "mycelium-pqc",
+ "rand 0.8.7",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]
