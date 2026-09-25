@@ -1592,7 +1592,7 @@ impl Organism {
         };
         self.hyphae
             .forward_dtn_now(bundle)
-            .map_err(OrganismError::from)
+            .map_err(OrganismError::Hyphae)
     }
 
     fn begin_rpc_gateway_call(&mut self, msg: RpcGatewayMsg) {
