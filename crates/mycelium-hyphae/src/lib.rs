@@ -1678,6 +1678,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_forward_without_route_never_persists_bundle() {
+        let mut node = HyphaeNode::germinate(Some([41u8; 32])).unwrap();
+        let target = mycelium_core::NodeId::derive(b"rpc-live-unreachable");
+        let bundle = DtnBundle {
+            bundle_id: "rpc-live-no-store".into(),
+            src_peer: node.peer_id().to_string(),
+            dst_peer: target.to_string(),
+            dst_node: Some(target),
+            binding: None,
+            created_at: now_secs(),
+            ttl_secs: 3,
+            hops: 0,
+            max_hops: 16,
+            payload: b"rpc".to_vec(),
+        };
+
+        assert!(!node.forward_dtn_now(bundle).unwrap());
+        assert!(
+            node.dtn_store_ref().is_empty(),
+            "tráfego LIVE não pode cair no DTN persistente"
+        );
+    }
+
+    #[tokio::test]
     async fn secrete_without_neighbors_is_not_an_error() {
         let mut node = HyphaeNode::germinate(None).unwrap();
         assert_eq!(node.secrete(b"scent".to_vec()).unwrap(), false);
