@@ -427,6 +427,18 @@ pub struct StatusReport {
     /// Fase Physarum (exploratory|transport|dormant).
     #[serde(default)]
     pub physarum_phase: String,
+    /// Endpoint JSON-RPC local do gateway, se ativo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_gateway: Option<String>,
+    /// Este nó possui um upstream Base local e atua como provider.
+    #[serde(default)]
+    pub rpc_provider: bool,
+    /// Chave pública ML-KEM-1024 do provider (hex), necessária no P1/P2 explícito.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_provider_kem: Option<String>,
+    /// Chain ID configurado para o RPC.
+    #[serde(default)]
+    pub rpc_chain_id: u64,
     /// Endereço SOCKS5 Veil ativo, se habilitado.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub veil_socks5: Option<String>,
