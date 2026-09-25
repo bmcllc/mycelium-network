@@ -18,7 +18,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
-use zeroize::ZeroizeOnDrop;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub const BASE_MAINNET_CHAIN_ID: u64 = 8453;
 pub const DEFAULT_RPC_TTL_MS: u64 = 3_000;
@@ -421,10 +421,11 @@ pub fn open_request(
     if packet.provider != expected_provider {
         return Err(RpcError::WrongProvider);
     }
-    let shared = mlkem_decapsulate(identity.private_bytes(), &packet.kem_ciphertext)
+    let mut shared = mlkem_decapsulate(identity.private_bytes(), &packet.kem_ciphertext)
         .map_err(|e| RpcError::Crypto(e.to_string()))?;
     let request_key = derive_request_key(&shared);
     let response_key = RpcResponseKey::from_shared_secret(&shared);
+    shared.zeroize();
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&request_key));
     let aad = request_aad(&packet.request_id, &packet.provider);
     let plaintext = cipher
