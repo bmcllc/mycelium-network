@@ -214,7 +214,14 @@ Somente após P0-P4:
 
 ## Estado desta branch
 
-Este corte implementa apenas P0. Não declarar a malha RPC operacional até P1-P3 estarem integrados e testados em pelo menos dois hosts reais.
+P0, P1 e P2 estão implementados. P1/P2 foram homologados no Debian com testes unitários/integrados, build `--locked`, Clippy estrito no crate novo e smoke de dois nós confirmando:
+
+- `eth_chainId = 0x2105`;
+- write-deny por padrão;
+- provider offline falha fechado;
+- tráfego RPC LIVE não é persistido no DTN.
+
+O próximo gate é o teste com blockchain Base real através do gateway. Discovery/quorum automático e validação de proofs pertencem ao P3.
 
 
 ## P1/P2 experimental — gateway LIVE implementado
@@ -304,15 +311,15 @@ Somente depois da homologação de leitura:
 
 A chave privada EVM continua no S1. O Mycelium transporta somente a transação já assinada.
 
-### Gates antes de promover P1/P2
+### Gate de regressão P1/P2
+
+Use o script escopado ao PR:
 
 ```bash
-cargo fmt --all --check
-cargo test -p mycelium-rpc --locked
-cargo test -p mycelium-node --locked
-cargo clippy -p mycelium-rpc -p mycelium-node --all-targets -- -D warnings
-cargo build --workspace --locked
+bash scripts/check-rpc-pr.sh
 ```
+
+Ele executa `git diff --check` no escopo do PR, testes de `mycelium-rpc`, `mycelium-hyphae` e `mycelium-node`, Clippy estrito no crate novo, build do workspace e smoke de dois nós. O `cargo fmt --all --check` global não é gate deste PR porque o workspace contém dívida histórica de rustfmt fora do escopo funcional do RPC.
 
 Também é obrigatório um teste com dois homes/processos reais, comprovando:
 
