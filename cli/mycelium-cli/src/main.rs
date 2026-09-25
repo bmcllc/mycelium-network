@@ -273,7 +273,10 @@ enum Commands {
         message: String,
         #[arg(long, default_value = "build.sh")]
         path: String,
-        #[arg(long, default_value = "#!/bin/sh\nmkdir -p dist\necho ok > dist/index.html\n")]
+        #[arg(
+            long,
+            default_value = "#!/bin/sh\nmkdir -p dist\necho ok > dist/index.html\n"
+        )]
         content: String,
         #[arg(long, default_value = "webapp")]
         ion: String,
