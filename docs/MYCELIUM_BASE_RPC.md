@@ -223,12 +223,12 @@ A branch `feature/mycelium-base-rpc-pqc` agora contém o primeiro caminho ponta 
 
 1. `127.0.0.1:8545` recebe JSON-RPC HTTP.
 2. O gateway valida a policy local e cria `RpcMeshRequest` com TTL.
-3. O corpo é cifrado ponta a ponta para o provider com ML-KEM-1024 + ChaCha20-Poly1305.
-4. O envelope segue por unicast Mycelium usando `forward_dtn_now`.
+3. O requester faz ML-KEM-1024 com a chave pública fixada do provider e deriva chaves de domínio separado para request/response.
+4. O request é cifrado com ChaCha20-Poly1305 e segue por unicast Mycelium usando `forward_dtn_now`.
 5. Nenhum nó — origem ou intermediário — persiste RPC para entrega tardia.
 6. O provider decifra, aplica novamente a policy e consulta seu Base node local.
-7. A resposta é cifrada para uma chave ML-KEM efêmera exclusiva daquele pedido.
-8. O gateway entrega o JSON-RPC original ao cliente local.
+7. A resposta usa a chave de sessão derivada do mesmo segredo ML-KEM; isso autentica criptograficamente que ela veio de quem decapsulou o request.
+8. Segredos de sessão recebem zeroização; o gateway entrega o JSON-RPC original ao cliente local.
 
 O P1/P2 ainda usa provider explícito. Discovery/quorum automático pertence ao P3.
 
@@ -326,3 +326,31 @@ Também é obrigatório um teste com dois homes/processos reais, comprovando:
 ### Limite de segurança atual
 
 A confidencialidade do payload RPC é pós-quântica via ML-KEM-1024. A autenticação global da identidade do nó ainda depende parcialmente de Ed25519/PeerBinding. Portanto P1/P2 **não** deve ser descrito como identidade 100% pós-quântica até P4 (Ed25519 + ML-DSA-87).
+
+
+### Smoke de dois nós sem full node Base
+
+A branch inclui um mock RPC local para provar o transporte antes de instalar/sincronizar um Base node:
+
+```bash
+bash scripts/rpc-two-node-smoke.sh
+```
+
+O script:
+
+- sobe um mock Base apenas em loopback;
+- sobe um provider Mycelium com identidade ML-KEM persistente;
+- sobe um segundo nó com gateway HTTP local;
+- testa `eth_chainId = 0x2105`;
+- testa que `eth_sendRawTransaction` é recusado por padrão;
+- desliga o provider e confirma fail-closed;
+- compara o diretório DTN antes/depois para comprovar que RPC offline não foi persistido.
+
+Depois desse smoke, substitua `--rpc-provider http://127.0.0.1:<porta-mock>` pelo RPC do Base node real.
+
+### Gates adicionais de segurança implementados
+
+- cada `RpcMeshRequest` contém nonce CSPRNG de 128 bits, evitando colisão entre chamadas idênticas no mesmo milissegundo;
+- replay cache é limitado pelo TTL do pedido, não por limpeza global;
+- o provider chama `eth_chainId` no upstream ao iniciar e falha fechado se a chain não for a configurada;
+- uma resposta forjada por alguém que apenas observou o request não é aceita: o segredo de resposta deriva do segredo ML-KEM que só requester e provider legítimo conhecem.
