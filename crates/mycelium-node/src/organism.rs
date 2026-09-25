@@ -189,7 +189,7 @@ pub struct Organism {
     rpc_target: Option<RpcTarget>,
     rpc_policy: RpcPolicy,
     rpc_pending: HashMap<[u8; 32], PendingRpc>,
-    rpc_seen: HashSet<[u8; 32]>,
+    rpc_seen: HashMap<[u8; 32], u64>,
     #[cfg(feature = "veil")]
     veil_engine: Option<std::sync::Arc<mycelium_veil::VeilEngine>>,
     #[cfg(feature = "veil")]
@@ -613,7 +613,7 @@ impl Organism {
             rpc_target,
             rpc_policy,
             rpc_pending: HashMap::new(),
-            rpc_seen: HashSet::new(),
+            rpc_seen: HashMap::new(),
             #[cfg(feature = "veil")]
             veil_engine: None,
             #[cfg(feature = "veil")]
@@ -1691,20 +1691,23 @@ impl Organism {
         };
 
         let request_id = opened.request.request_id;
-        if self.rpc_seen.contains(&request_id) {
+        let now = now_ms();
+        self.rpc_seen.retain(|_, expires_at| *expires_at >= now);
+        if self
+            .rpc_seen
+            .get(&request_id)
+            .is_some_and(|expires_at| *expires_at >= now)
+        {
             tracing::warn!(
                 request = %hex::encode(&request_id[..8]),
                 "RpcRequest replay descartado"
             );
             return Ok(());
         }
-        if self.rpc_seen.len() >= 4096 {
-            self.rpc_seen.clear();
-        }
-        self.rpc_seen.insert(request_id);
 
         let requester = opened.request.requester;
         let expires_at_ms = opened.request.expires_at_ms;
+        self.rpc_seen.insert(request_id, expires_at_ms);
         let raw = opened.request.body;
         let response_key = opened.response_key;
         let provider_node = self.gland.node_id();
@@ -1774,6 +1777,7 @@ impl Organism {
 
     fn expire_rpc_pending(&mut self) {
         let now = now_ms();
+        self.rpc_seen.retain(|_, expires_at| *expires_at >= now);
         let expired: Vec<[u8; 32]> = self
             .rpc_pending
             .iter()
