@@ -3264,6 +3264,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mycelium-rpc"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "mycelium-core",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
 name = "mycelium-sporebank"
 version = "0.1.0"
 dependencies = [
