@@ -831,6 +831,20 @@ impl HyphaeNode {
         Ok(false)
     }
 
+    /// Encaminha um bundle somente se existir rota viva agora.
+    ///
+    /// Diferente de `forward_or_store_dtn`, este método NUNCA persiste o
+    /// bundle para entrega tardia. É usado por tráfego sensível a frescor,
+    /// como JSON-RPC financeiro.
+    pub fn forward_dtn_now(&mut self, mut bundle: DtnBundle) -> Result<bool, HyphaeError> {
+        bundle.hops += 1;
+        if bundle.hops > bundle.max_hops {
+            tracing::warn!(id = %bundle.bundle_id, "bundle LIVE excedeu max_hops — descartado");
+            return Ok(false);
+        }
+        self.forward_or_store_dtn_internal(&mut bundle)
+    }
+
     /// Despeja bundles pendentes no DTN store para peers que acabaram de reconectar ou novos saltos.
     pub fn flush_dtn_bundles(&mut self) -> usize {
         let pending = self.dtn_store.all_bundles();
