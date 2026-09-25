@@ -8,6 +8,7 @@ pub mod assets;
 mod control;
 mod organism;
 mod protocol;
+mod rpc_gateway;
 mod seeds_ion;
 mod src_ion;
 mod store;
