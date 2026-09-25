@@ -4525,6 +4525,16 @@ impl Organism {
         mut control_rx: mpsc::Receiver<ControlMsg>,
         mut rpc_rx: mpsc::Receiver<RpcGatewayMsg>,
     ) -> Result<(), OrganismError> {
+        if let Some(provider) = self.rpc_provider.as_ref() {
+            provider
+                .verify_chain_id()
+                .await
+                .map_err(|e| OrganismError::Msg(format!("rpc-provider chain gate: {e}")))?;
+            tracing::info!(
+                chain_id = self.rpc_policy.chain_id,
+                "RPC provider upstream chain verificada"
+            );
+        }
         self.store.write_pid()?;
         let (rpc_provider_tx, mut rpc_provider_rx) = mpsc::channel::<RpcProviderResult>(64);
 
