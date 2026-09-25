@@ -550,6 +550,33 @@ impl LocalBaseProvider {
         &self.policy
     }
 
+    /// Confirma que o upstream realmente pertence à chain configurada.
+    pub async fn verify_chain_id(&self) -> Result<(), RpcError> {
+        let raw = br#"{"jsonrpc":"2.0","id":"mycelium-chain-check","method":"eth_chainId","params":[]}"#;
+        let body = self.execute_raw(raw).await?;
+        let value: Value =
+            serde_json::from_slice(&body).map_err(|e| RpcError::Upstream(e.to_string()))?;
+        let result = value
+            .get("result")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::Upstream("eth_chainId sem result hex".into()))?;
+        let got = result
+            .strip_prefix("0x")
+            .or_else(|| result.strip_prefix("0X"))
+            .ok_or_else(|| RpcError::Upstream("eth_chainId não retornou hex 0x".into()))
+            .and_then(|hex| {
+                u64::from_str_radix(hex, 16)
+                    .map_err(|e| RpcError::Upstream(format!("eth_chainId inválido: {e}")))
+            })?;
+        if got != self.policy.chain_id {
+            return Err(RpcError::Upstream(format!(
+                "chain id do upstream é {got}, esperado {}",
+                self.policy.chain_id
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn execute_raw(&self, raw: &[u8]) -> Result<Vec<u8>, RpcError> {
         if raw.len() > self.policy.max_body_bytes {
             return Err(RpcError::BodyTooLarge {
