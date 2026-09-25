@@ -798,6 +798,13 @@ impl Organism {
                 MyceliumPhase::Transport => "transport".into(),
                 MyceliumPhase::Dormant => "dormant".into(),
             },
+            rpc_gateway: self.rpc_gateway_addr.map(|a| format!("http://{a}")),
+            rpc_provider: self.rpc_provider.is_some(),
+            rpc_provider_kem: self
+                .rpc_provider_kem
+                .as_ref()
+                .map(|identity| hex::encode(identity.public_key())),
+            rpc_chain_id: self.rpc_policy.chain_id,
             #[cfg(feature = "veil")]
             veil_socks5: if self.veil_enabled {
                 self.veil_socks5_addr.map(|a| a.to_string())
