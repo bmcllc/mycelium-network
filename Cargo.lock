@@ -3147,6 +3147,7 @@ dependencies = [
  "mycelium-nutrients",
  "mycelium-pheromones",
  "mycelium-pqc",
+ "mycelium-rpc",
  "mycelium-sporebank",
  "mycelium-store",
  "mycelium-tropical",
