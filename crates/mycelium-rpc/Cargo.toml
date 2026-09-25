@@ -17,3 +17,4 @@ tokio = { workspace = true }
 mycelium-pqc = { workspace = true }
 rand = { workspace = true }
 chacha20poly1305 = "0.10"
+zeroize = { version = "1.9", features = ["zeroize_derive"] }
