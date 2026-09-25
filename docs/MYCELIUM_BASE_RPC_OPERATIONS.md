@@ -268,3 +268,27 @@ export S1_MAINNET_WRITE=YES_I_ACCEPT_MAINNET_BROADCAST
 A flag não cria nem assina transações. Ela apenas permite que uma transação já assinada pelo S1 atravesse o transporte. As políticas econômicas, chain ID, code hash, nonce/replay e demais travas continuam pertencendo ao S1/Risk Kernel.
 
 Se nenhuma rota superar premium + custo + margem + lucro mínimo, o estado operacional esperado é **nenhuma transmissão**.
+
+
+## Limite atual de autonomia
+
+Manter provider e gateway ativos **não** torna o S1 autônomo por si só. Estes daemons apenas disponibilizam o transporte RPC.
+
+O S1 ainda precisa de um loop operacional próprio para executar continuamente:
+
+```text
+discover
+  -> policy
+  -> revalidate
+  -> send
+```
+
+Esse loop deve permanecer fail-closed:
+
+- nenhuma promoção sem edge econômico real;
+- nenhuma abertura de keystore antes do opt-in explícito;
+- nenhuma reserva de orçamento antes da validação das condições de envio;
+- nenhuma transmissão sem `BASE_RPC_URL` local e `S1_MAINNET_WRITE=YES_I_ACCEPT_MAINNET_BROADCAST`;
+- se E3 não estiver satisfeito para a oportunidade atual, o estado esperado continua sendo zero broadcast.
+
+Portanto, o estado operacional correto deste corte é: **transporte pronto; estratégia autônoma contínua ainda pertence ao S1 e não é fornecida pelos daemons Mycelium**.
