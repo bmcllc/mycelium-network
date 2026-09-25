@@ -18,6 +18,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
+use zeroize::ZeroizeOnDrop;
 
 pub const BASE_MAINNET_CHAIN_ID: u64 = 8453;
 pub const DEFAULT_RPC_TTL_MS: u64 = 3_000;
@@ -291,7 +292,6 @@ impl RpcKemIdentity {
 pub struct RpcEncryptedRequest {
     pub request_id: [u8; 32],
     pub provider: NodeId,
-    pub response_kem_public_key: Vec<u8>,
     pub kem_ciphertext: Vec<u8>,
     pub nonce: [u8; 12],
     pub ciphertext: Vec<u8>,
@@ -301,30 +301,41 @@ pub struct RpcEncryptedRequest {
 pub struct RpcEncryptedResponse {
     pub request_id: [u8; 32],
     pub provider: NodeId,
-    pub kem_ciphertext: Vec<u8>,
     pub nonce: [u8; 12],
     pub ciphertext: Vec<u8>,
 }
 
+/// Segredo de resposta derivado do mesmo ML-KEM usado no request, mas com
+/// domínio separado. Somente requester e provider legítimo o conhecem.
+#[derive(ZeroizeOnDrop)]
+pub struct RpcResponseKey([u8; 32]);
+
+impl RpcResponseKey {
+    fn from_shared_secret(shared_secret: &[u8]) -> Self {
+        Self(blake3::derive_key(
+            "mycelium-rpc-response-key-v1",
+            shared_secret,
+        ))
+    }
+
+    fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
 pub struct OpenedRpcRequest {
     pub request: RpcMeshRequest,
-    pub response_kem_public_key: Vec<u8>,
+    pub response_key: RpcResponseKey,
 }
 
-fn derive_aead_key(shared_secret: &[u8]) -> [u8; 32] {
-    blake3::derive_key("mycelium-rpc-pq-aead-v1", shared_secret)
+fn derive_request_key(shared_secret: &[u8]) -> [u8; 32] {
+    blake3::derive_key("mycelium-rpc-request-key-v1", shared_secret)
 }
 
-fn request_aad(
-    request_id: &[u8; 32],
-    provider: &NodeId,
-    response_kem_public_key: &[u8],
-) -> Vec<u8> {
+fn request_aad(request_id: &[u8; 32], provider: &NodeId) -> Vec<u8> {
     let mut aad = b"mycelium-rpc-request-aad-v1".to_vec();
     aad.extend_from_slice(request_id);
     aad.extend_from_slice(&provider.0);
-    aad.extend_from_slice(&(response_kem_public_key.len() as u32).to_be_bytes());
-    aad.extend_from_slice(response_kem_public_key);
     aad
 }
 
@@ -339,21 +350,17 @@ pub fn seal_request(
     provider: NodeId,
     provider_kem_public_key: &[u8],
     request: RpcMeshRequest,
-) -> Result<(RpcEncryptedRequest, RpcKemIdentity), RpcError> {
-    let response_identity = RpcKemIdentity::generate();
+) -> Result<(RpcEncryptedRequest, RpcResponseKey), RpcError> {
     let enc = mlkem_encapsulate(provider_kem_public_key)
         .map_err(|e| RpcError::Crypto(e.to_string()))?;
-    let key = derive_aead_key(&enc.shared_secret);
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let request_key = derive_request_key(&enc.shared_secret);
+    let response_key = RpcResponseKey::from_shared_secret(&enc.shared_secret);
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&request_key));
     let mut nonce = [0u8; 12];
     OsRng.fill_bytes(&mut nonce);
     let plaintext =
         serde_json::to_vec(&request).map_err(|e| RpcError::InvalidJsonRpc(e.to_string()))?;
-    let aad = request_aad(
-        &request.request_id,
-        &provider,
-        response_identity.public_key(),
-    );
+    let aad = request_aad(&request.request_id, &provider);
     let ciphertext = cipher
         .encrypt(
             Nonce::from_slice(&nonce),
@@ -368,12 +375,11 @@ pub fn seal_request(
         RpcEncryptedRequest {
             request_id: request.request_id,
             provider,
-            response_kem_public_key: response_identity.public_key().to_vec(),
             kem_ciphertext: enc.ciphertext,
             nonce,
             ciphertext,
         },
-        response_identity,
+        response_key,
     ))
 }
 
@@ -389,13 +395,10 @@ pub fn open_request(
     }
     let shared = mlkem_decapsulate(identity.private_bytes(), &packet.kem_ciphertext)
         .map_err(|e| RpcError::Crypto(e.to_string()))?;
-    let key = derive_aead_key(&shared);
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
-    let aad = request_aad(
-        &packet.request_id,
-        &packet.provider,
-        &packet.response_kem_public_key,
-    );
+    let request_key = derive_request_key(&shared);
+    let response_key = RpcResponseKey::from_shared_secret(&shared);
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&request_key));
+    let aad = request_aad(&packet.request_id, &packet.provider);
     let plaintext = cipher
         .decrypt(
             Nonce::from_slice(&packet.nonce),
@@ -413,18 +416,15 @@ pub fn open_request(
     request.validate_at(now_ms, policy)?;
     Ok(OpenedRpcRequest {
         request,
-        response_kem_public_key: packet.response_kem_public_key.clone(),
+        response_key,
     })
 }
 
 pub fn seal_response(
-    response_kem_public_key: &[u8],
+    response_key: &RpcResponseKey,
     response: RpcMeshResponse,
 ) -> Result<RpcEncryptedResponse, RpcError> {
-    let enc = mlkem_encapsulate(response_kem_public_key)
-        .map_err(|e| RpcError::Crypto(e.to_string()))?;
-    let key = derive_aead_key(&enc.shared_secret);
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(response_key.as_bytes()));
     let mut nonce = [0u8; 12];
     OsRng.fill_bytes(&mut nonce);
     let plaintext =
@@ -442,14 +442,13 @@ pub fn seal_response(
     Ok(RpcEncryptedResponse {
         request_id: response.request_id,
         provider: response.provider,
-        kem_ciphertext: enc.ciphertext,
         nonce,
         ciphertext,
     })
 }
 
 pub fn open_response(
-    response_identity: &RpcKemIdentity,
+    response_key: &RpcResponseKey,
     expected_provider: NodeId,
     expected_chain_id: u64,
     packet: &RpcEncryptedResponse,
@@ -457,10 +456,7 @@ pub fn open_response(
     if packet.provider != expected_provider {
         return Err(RpcError::WrongProvider);
     }
-    let shared = mlkem_decapsulate(response_identity.private_bytes(), &packet.kem_ciphertext)
-        .map_err(|e| RpcError::Crypto(e.to_string()))?;
-    let key = derive_aead_key(&shared);
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(response_key.as_bytes()));
     let aad = response_aad(&packet.request_id, &packet.provider);
     let plaintext = cipher
         .decrypt(
@@ -470,7 +466,7 @@ pub fn open_response(
                 aad: &aad,
             },
         )
-        .map_err(|_| RpcError::Crypto("response adulterado ou chave incorreta".into()))?;
+        .map_err(|_| RpcError::Crypto("response adulterado ou não autenticado".into()))?;
     let response: RpcMeshResponse =
         serde_json::from_slice(&plaintext).map_err(|e| RpcError::InvalidJsonRpc(e.to_string()))?;
     if response.request_id != packet.request_id
@@ -684,24 +680,18 @@ mod tests {
             observed_block: Some(123),
             body: br#"{"jsonrpc":"2.0","id":7,"result":"0x2105"}"#.to_vec(),
         };
-        let sealed_response =
-            seal_response(&opened.response_kem_public_key, response.clone()).unwrap();
-        let reopened = open_response(
-            &response_key,
-            provider,
-            BASE_MAINNET_CHAIN_ID,
-            &sealed_response,
-        )
+        let sealed_response = seal_response(&opened.response_key, response.clone()).unwrap();
+        let reopened =
+            open_response(&response_key, provider, BASE_MAINNET_CHAIN_ID, &sealed_response)
         .unwrap();
         assert_eq!(reopened, response);
     }
 
     #[test]
-    fn response_kem_substitution_is_rejected() {
+    fn forged_response_with_wrong_secret_is_rejected() {
         let provider = node(b"provider");
         let requester = node(b"requester");
         let provider_kem = RpcKemIdentity::generate();
-        let attacker_kem = RpcKemIdentity::generate();
         let policy = RpcPolicy::default();
         let mesh = RpcMeshRequest::new(
             requester,
@@ -710,14 +700,49 @@ mod tests {
             policy.ttl_ms,
             br#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}"#.to_vec(),
         );
-        let (mut sealed, _) =
+        let (sealed, client_response_key) =
             seal_request(provider, provider_kem.public_key(), mesh).unwrap();
-        sealed.response_kem_public_key = attacker_kem.public_key().to_vec();
+        let opened =
+            open_request(&provider_kem, provider, &sealed, 10_001, &policy).unwrap();
+
+        let response = RpcMeshResponse {
+            request_id: sealed.request_id,
+            provider,
+            chain_id: BASE_MAINNET_CHAIN_ID,
+            responded_at_ms: 10_002,
+            observed_block: None,
+            body: br#"{"jsonrpc":"2.0","id":1,"result":"0x2105"}"#.to_vec(),
+        };
+        let wrong_key = RpcResponseKey([0x55; 32]);
+        let forged = seal_response(&wrong_key, response).unwrap();
 
         assert!(matches!(
-            open_request(&provider_kem, provider, &sealed, 10_001, &policy),
+            open_response(
+                &client_response_key,
+                provider,
+                BASE_MAINNET_CHAIN_ID,
+                &forged
+            ),
             Err(RpcError::Crypto(_))
         ));
+
+        // O provider legítimo, que decapsulou o request, possui a chave correta.
+        let legit = RpcMeshResponse {
+            request_id: sealed.request_id,
+            provider,
+            chain_id: BASE_MAINNET_CHAIN_ID,
+            responded_at_ms: 10_003,
+            observed_block: None,
+            body: br#"{"jsonrpc":"2.0","id":1,"result":"0x2105"}"#.to_vec(),
+        };
+        let packet = seal_response(&opened.response_key, legit).unwrap();
+        assert!(open_response(
+            &client_response_key,
+            provider,
+            BASE_MAINNET_CHAIN_ID,
+            &packet
+        )
+        .is_ok());
     }
 
     #[test]
