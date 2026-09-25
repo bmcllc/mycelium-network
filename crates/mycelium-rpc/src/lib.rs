@@ -83,6 +83,10 @@ pub enum RpcMethodClass {
     Unsafe,
 }
 
+fn has_namespace(method: &str, prefixes: &[&str]) -> bool {
+    prefixes.iter().any(|prefix| method.starts_with(prefix))
+}
+
 pub fn classify_method(method: &str) -> RpcMethodClass {
     match method {
         "eth_sendRawTransaction" | "eth_sendTransaction" => RpcMethodClass::Write,
@@ -93,22 +97,22 @@ pub fn classify_method(method: &str) -> RpcMethodClass {
         | "eth_signTypedData_v4"
         | "eth_subscribe"
         | "eth_unsubscribe" => RpcMethodClass::Unsafe,
-        _ if method.starts_with("admin_")
-            || method.starts_with("debug_")
-            || method.starts_with("engine_")
-            || method.starts_with("miner_")
-            || method.starts_with("personal_")
-            || method.starts_with("trace_")
-            || method.starts_with("txpool_") =>
+        _ if has_namespace(
+            method,
+            &[
+                "admin_",
+                "debug_",
+                "engine_",
+                "miner_",
+                "personal_",
+                "trace_",
+                "txpool_",
+            ],
+        ) =>
         {
             RpcMethodClass::Unsafe
         }
-        _ if method.starts_with("eth_")
-            || method.starts_with("net_")
-            || method.starts_with("web3_") =>
-        {
-            RpcMethodClass::Read
-        }
+        _ if has_namespace(method, &["eth_", "net_", "web3_"]) => RpcMethodClass::Read,
         _ => RpcMethodClass::Unsafe,
     }
 }
